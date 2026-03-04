@@ -115,6 +115,7 @@ func main() {
 	searchWeights := flag.String("search-weights", "", "Hybrid weights JSON (overrides preset; keys: text,pagerank,status,impact,priority,recency)")
 	diffSince := flag.String("diff-since", "", "Show changes since historical point (commit SHA, branch, tag, or date)")
 	asOf := flag.String("as-of", "", "View state at point in time (commit SHA, branch, tag, or date)")
+	noCache := flag.Bool("no-cache", false, "Bypass disk cache for robot triage (also: BV_NO_CACHE=1)")
 	forceFullAnalysis := flag.Bool("force-full-analysis", false, "Compute all metrics regardless of graph size (may be slow for large graphs)")
 	profileStartup := flag.Bool("profile-startup", false, "Output detailed startup timing profile for diagnostics")
 	profileJSON := flag.Bool("profile-json", false, "Output profile in JSON format (use with --profile-startup)")
@@ -245,6 +246,11 @@ func main() {
 			os.Exit(1)
 		}
 		os.Setenv(loader.BeadsDBEnvVar, absDB)
+	}
+
+	// Apply --no-cache flag: set BV_NO_CACHE=1 so disk cache is bypassed.
+	if *noCache {
+		os.Setenv("BV_NO_CACHE", "1")
 	}
 
 	// Ensure static export flags are retained even when build tags strip features in some environments.

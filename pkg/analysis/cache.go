@@ -714,7 +714,64 @@ func (b graphStatsCacheBlob) toGraphStats() *GraphStats {
 }
 
 func robotDiskCacheEnabled() bool {
-	return os.Getenv("BV_ROBOT") == "1"
+	return os.Getenv("BV_ROBOT") == "1" && os.Getenv("BV_NO_CACHE") != "1"
+}
+
+// beadsDirModTime returns the most recent modification time of the .beads/
+// directory. This is used as a staleness signal: if the directory has been
+// modified more recently than a cache entry was created, the entry is stale
+// because bead data may have changed (e.g., a bead was closed in br).
+// Returns zero time on any error (which disables the mtime check).
+func beadsDirModTime() time.Time {
+	// Check BEADS_DB first, then BEADS_DIR, then cwd/.beads
+	dbPath := os.Getenv("BEADS_DB")
+	if dbPath != "" {
+		info, err := os.Stat(dbPath)
+		if err == nil {
+			if info.IsDir() {
+				return info.ModTime()
+			}
+			// It's a file -- check its modification time directly
+			return info.ModTime()
+		}
+	}
+
+	beadsDir := os.Getenv("BEADS_DIR")
+	if beadsDir == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return time.Time{}
+		}
+		beadsDir = filepath.Join(cwd, ".beads")
+	}
+
+	info, err := os.Stat(beadsDir)
+	if err != nil {
+		return time.Time{}
+	}
+	if !info.IsDir() {
+		return time.Time{}
+	}
+
+	// Check the directory itself and scan for the most recent file mtime
+	latest := info.ModTime()
+	entries, err := os.ReadDir(beadsDir)
+	if err != nil {
+		return latest
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		finfo, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if finfo.ModTime().After(latest) {
+			latest = finfo.ModTime()
+		}
+	}
+	return latest
 }
 
 func robotAnalysisDiskCachePath(create bool) (string, error) {
@@ -835,6 +892,17 @@ func getRobotDiskCachedStats(fullKey string) (*GraphStats, bool) {
 	entry, ok := cf.Entries[fullKey]
 	if !ok {
 		// Best-effort: persist prunes.
+		_ = writeRobotDiskCacheLocked(f, cf)
+		return nil, false
+	}
+
+	// Mtime-based staleness check: if the .beads/ directory (or any file
+	// inside it) has been modified after this cache entry was created, the
+	// bead data may have changed (e.g., a bead was closed in br). In that
+	// case the cached GraphStats are stale and must be recomputed.
+	dirMtime := beadsDirModTime()
+	if !dirMtime.IsZero() && dirMtime.After(entry.CreatedAt) {
+		delete(cf.Entries, fullKey)
 		_ = writeRobotDiskCacheLocked(f, cf)
 		return nil, false
 	}
