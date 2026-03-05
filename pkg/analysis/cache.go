@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -728,10 +729,6 @@ func beadsDirModTime() time.Time {
 	if dbPath != "" {
 		info, err := os.Stat(dbPath)
 		if err == nil {
-			if info.IsDir() {
-				return info.ModTime()
-			}
-			// It's a file -- check its modification time directly
 			return info.ModTime()
 		}
 	}
@@ -753,24 +750,26 @@ func beadsDirModTime() time.Time {
 		return time.Time{}
 	}
 
-	// Check the directory itself and scan for the most recent file mtime
+	// Scan the directory tree for the most recent file mtime.
+	// We walk subdirectories (e.g. .beads/history/) because modifications
+	// inside them don't always update parent directory mtime.
 	latest := info.ModTime()
-	entries, err := os.ReadDir(beadsDir)
-	if err != nil {
-		return latest
-	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		finfo, err := entry.Info()
+	_ = filepath.WalkDir(beadsDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			continue
+			return nil // skip unreadable entries
+		}
+		if d.IsDir() {
+			return nil // continue into subdirs but don't use dir mtime
+		}
+		finfo, err := d.Info()
+		if err != nil {
+			return nil
 		}
 		if finfo.ModTime().After(latest) {
 			latest = finfo.ModTime()
 		}
-	}
+		return nil
+	})
 	return latest
 }
 
