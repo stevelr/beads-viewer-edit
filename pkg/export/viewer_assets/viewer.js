@@ -1888,6 +1888,7 @@ function filtersFromURL() {
  * Update URL with current filter state (without page reload)
  */
 function syncFiltersToURL(view, filters, sort, searchQuery) {
+  if (window.location.hash.startsWith('#/issue/')) return;
   const paramString = filtersToURL(filters, sort, searchQuery);
   const baseHash = `#/${view}`;
   const newHash = paramString ? `${baseHash}?${paramString}` : baseHash;
