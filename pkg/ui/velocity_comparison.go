@@ -225,7 +225,7 @@ func (m *VelocityComparisonModel) View() string {
 
 	// Separator
 	sepStyle := t.Renderer.NewStyle().Foreground(t.Secondary)
-	separator := strings.Repeat("─", min(len(header)+2, m.width-2))
+	separator := strings.Repeat("─", max(min(len(header)+2, m.width-2), 0))
 	sb.WriteString(sepStyle.Render(separator))
 	sb.WriteString("\n")
 

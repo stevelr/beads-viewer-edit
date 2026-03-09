@@ -1491,7 +1491,7 @@ func (b BoardModel) renderExpandedCard(issue model.Issue, width int, _, _ int) s
 	// SEPARATOR
 	// ══════════════════════════════════════════════════════════════════════════
 	sepStyle := t.Renderer.NewStyle().Foreground(t.Secondary)
-	separator := sepStyle.Render(strings.Repeat("─", width-4))
+	separator := sepStyle.Render(strings.Repeat("─", max(width-4, 0)))
 
 	// ══════════════════════════════════════════════════════════════════════════
 	// DESCRIPTION: First ~8 lines, rendered with glamour if possible

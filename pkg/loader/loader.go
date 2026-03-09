@@ -488,7 +488,7 @@ func stripBOM(b []byte) []byte {
 func normalizeIssueStatus(status model.Status) model.Status {
 	trimmed := strings.TrimSpace(string(status))
 	if trimmed == "" {
-		return status
+		return ""
 	}
 	return model.Status(strings.ToLower(trimmed))
 }

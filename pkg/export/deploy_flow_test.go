@@ -298,6 +298,9 @@ exit 0
 	origPath := os.Getenv("PATH")
 	t.Setenv("PATH", fmt.Sprintf("%s%c%s", binDir, os.PathListSeparator, origPath))
 	t.Setenv("BV_TEST_STATE_DIR", stateDir)
+	// Override HOME so the real machine's wrangler config file isn't found
+	// by checkWranglerConfigFile(), ensuring the stub wrangler binary controls auth.
+	t.Setenv("HOME", t.TempDir())
 
 	_, err := DeployToCloudflarePages(CloudflareDeployConfig{
 		ProjectName:      "proj",
@@ -346,6 +349,8 @@ exit 0
 	origPath := os.Getenv("PATH")
 	t.Setenv("PATH", fmt.Sprintf("%s%c%s", binDir, os.PathListSeparator, origPath))
 	t.Setenv("BV_TEST_STATE_DIR", stateDir)
+	// Override HOME so the real machine's wrangler config file isn't found.
+	t.Setenv("HOME", t.TempDir())
 
 	// Single prompt: authenticate now? (account confirm is skipped when AccountName is empty)
 	withStdin(t, "y\n", func() {
@@ -393,6 +398,8 @@ exit 0
 	origPath := os.Getenv("PATH")
 	t.Setenv("PATH", fmt.Sprintf("%s%c%s", binDir, os.PathListSeparator, origPath))
 	t.Setenv("BV_TEST_STATE_DIR", stateDir)
+	// Override HOME so the real machine's wrangler config file isn't found.
+	t.Setenv("HOME", t.TempDir())
 
 	// Mark as authenticated.
 	if err := os.WriteFile(filepath.Join(stateDir, "wrangler_authed"), []byte("ok"), 0644); err != nil {
@@ -442,6 +449,8 @@ exit 0
 
 	origPath := os.Getenv("PATH")
 	t.Setenv("PATH", fmt.Sprintf("%s%c%s", binDir, os.PathListSeparator, origPath))
+	// Override HOME so the real machine's wrangler config file isn't found.
+	t.Setenv("HOME", t.TempDir())
 
 	bundleDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(bundleDir, "index.html"), []byte("<!doctype html>"), 0644); err != nil {

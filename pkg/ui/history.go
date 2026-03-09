@@ -1657,7 +1657,7 @@ func (h *HistoryModel) renderTimelinePanel(width, height int) string {
 	// Add cycle time summary at bottom if available
 	if hist.CycleTime != nil {
 		b.WriteString("\n")
-		b.WriteString(r.NewStyle().Foreground(t.Border).Render(strings.Repeat("─", width-6)))
+		b.WriteString(r.NewStyle().Foreground(t.Border).Render(strings.Repeat("─", max(width-6, 0))))
 		b.WriteString("\n")
 
 		summaryStyle := r.NewStyle().Foreground(t.Subtext)

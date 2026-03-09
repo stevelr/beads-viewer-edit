@@ -49,6 +49,9 @@ func RenderContextHelp(ctx Context, theme Theme, width, height int) string {
 	if modalWidth > width-4 {
 		modalWidth = width - 4
 	}
+	if modalWidth < 0 {
+		modalWidth = 0
+	}
 
 	// Title
 	titleStyle := r.NewStyle().
@@ -68,7 +71,7 @@ func RenderContextHelp(ctx Context, theme Theme, width, height int) string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Quick Reference"))
 	b.WriteString("\n")
-	b.WriteString(r.NewStyle().Foreground(theme.Border).Render(strings.Repeat("─", modalWidth-4)))
+	b.WriteString(r.NewStyle().Foreground(theme.Border).Render(strings.Repeat("─", max(modalWidth-4, 0))))
 	b.WriteString("\n\n")
 	b.WriteString(contentStyle.Render(content))
 	b.WriteString("\n\n")
