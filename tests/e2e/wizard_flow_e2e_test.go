@@ -413,7 +413,9 @@ func TestWizard_InterruptHandling(t *testing.T) {
 		// Command completed (possibly with error, which is fine)
 	case <-time.After(15 * time.Second):
 		t.Error("wizard did not handle interrupt/empty input within timeout (15s)")
-		cmd.Process.Kill()
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
 	}
 }
 

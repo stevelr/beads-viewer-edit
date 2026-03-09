@@ -215,9 +215,15 @@ func (e *Executor) Summary() string {
 
 // truncate shortens a string to max length with ellipsis
 func truncate(s string, max int) string {
+	if max < 0 {
+		max = 0
+	}
 	runes := []rune(s)
 	if len(runes) <= max {
 		return s
+	}
+	if max <= 3 {
+		return string(runes[:max])
 	}
 	return string(runes[:max-3]) + "..."
 }
