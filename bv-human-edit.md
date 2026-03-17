@@ -23,7 +23,7 @@ All edit hotkeys are **configurable** via `bv-edit.yaml`. Defaults shown. Active
 
 The `ctrl+` prefix keeps edit keys in a separate namespace from view/navigation keys, avoiding conflicts with current and future upstream bindings.
 
-**`O` key smart dispatch:** If `$EDITOR` contains `hx`, `vim`, `vi`, `nvim`, or `nano`, the `O` key uses the new terminal-based markdown edit workflow. Otherwise it falls through to the existing `openInEditor()` GUI editor path (VS Code, gedit, etc.), leaving that behavior completely untouched.
+**`O` key smart dispatch:** If the configured editor (from `editor_path`, `$EDITOR`, or `$VISUAL`) is a terminal editor (hx, vim, vi, nvim, nano, etc.), the `O` key uses the new terminal-based markdown edit workflow. Otherwise it falls through to the existing `openInEditor()` GUI editor path (VS Code, gedit, etc.), leaving that behavior completely untouched.
 
 ---
 
@@ -35,7 +35,7 @@ Loaded from `./bv-edit.yaml` or `~/.config/bv-edit.yaml` (first found wins). Fal
 
 ```yaml
 br_path: "br"
-helix_path: "hx"
+editor_path: "hx"  # defaults to $EDITOR, then $VISUAL, then "vi"
 wezterm_command: "wezterm cli split-pane --bottom --"
 extra_assignees:
   - "alice"
@@ -56,7 +56,7 @@ hotkeys:
 ```go
 type EditConfig struct {
     BrPath         string       `yaml:"br_path"`
-    HelixPath      string       `yaml:"helix_path"`
+    EditorPath     string       `yaml:"editor_path"`
     WeztermCommand string       `yaml:"wezterm_command"`
     Hotkeys        HotkeyConfig `yaml:"hotkeys"`
     ExtraAssignees []string     `yaml:"extra_assignees"`
@@ -198,7 +198,7 @@ See also BD-456.
 
 **Known section tags:** `description`, `design`, `acceptance_criteria`, `notes`. Only these exact tag names are recognized as section delimiters. All other `<` and `>` occurrences (HTML tags, comparisons like `x < 10`, unknown tags) are treated as literal content.
 
-**Blank line before closing tag:** A blank line is emitted before each `</tag>` to prevent markdown LSP formatters (e.g. in helix with format-on-save) from indenting the closing tag. The parser uses `strings.TrimSpace()` on each line before comparing, so indented closing tags parse correctly regardless.
+**Blank line before closing tag:** A blank line is emitted before each `</tag>` to prevent markdown LSP formatters (e.g. format-on-save in helix or other editors) from indenting the closing tag. The parser uses `strings.TrimSpace()` on each line before comparing, so indented closing tags parse correctly regardless.
 
 **Empty sections** are written as `<tag>\n\n</tag>`.
 
@@ -343,9 +343,9 @@ Intercepted in `Update()` before all other key processing when `titleEditState.A
 
 ### 9.1 Smart Dispatch
 
-The `O` key checks `$EDITOR` (then `$VISUAL`, then `editConfig.HelixPath`):
+The `O` key checks `editConfig.EditorPath` (which defaults from `$EDITOR`, `$VISUAL`, or `"vi"`):
 
-- If the editor is a terminal editor (`hx`, `helix`, `vim`, `vi`, `nvim`, `nano`): use the new markdown edit workflow
+- If the editor is a terminal editor (`hx`, `vim`, `vi`, `nvim`, `nano`, `emacs`, `pico`, `joe`, `ne`): use the new markdown edit workflow
 - Otherwise: return `handled=false`, fall through to existing `openInEditor()` GUI path
 
 ### 9.2 Snapshot and Markdown Generation
@@ -365,7 +365,7 @@ The `O` key checks `$EDITOR` (then `$VISUAL`, then `editConfig.HelixPath`):
 2. Append editor path and markdown file path
 3. Spawn process (stdout/stderr discarded)
 4. Set up `PendingEdit` with file-watch polling
-5. Status: "Editing {id} in helix (watching for saves)"
+5. Status: "Editing {id} in {editor} (watching for saves)"
 
 **Synchronous mode** (non-WezTerm):
 
@@ -497,7 +497,7 @@ Ctrl+t    Edit title │ O  Edit issue
 Ctrl+n/g  New issue/sub │ Ctrl+x  Comment
 ```
 
-The **Detail** context help updates the `O` key description from "Open in editor" to "Edit issue (helix/editor)".
+The **Detail** context help updates the `O` key description from "Open in editor" to "Edit issue (terminal editor)".
 
 ---
 
@@ -632,7 +632,7 @@ Some `ctrl+` combinations send the same byte as common keys and cannot be used a
 - BuildUpdateArgv: all fields, empty diff, single field, `--no-auto-import` always present
 - Assignee collection: dedup, sort, extras, empty
 - Label parsing: commas, single, empty, whitespace
-- Editor detection: hx, vim, nvim, vi, nano, helix, code, gedit, paths
+- Editor detection: hx, vim, nvim, vi, nano, emacs, pico, joe, ne, code, gedit, paths
 - YAML escaping: roundtrip for titles with colons, brackets, quotes, dashes, spaces
 - Error extraction: valid JSON envelope, plain text, empty message, malformed JSON
 - Known constants: statuses count, priority labels count

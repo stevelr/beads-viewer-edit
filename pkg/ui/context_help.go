@@ -225,7 +225,7 @@ const contextHelpDetail = `## Detail View
   Tab       Switch to split view
 
 **Actions (from list view)**
-  O         Edit issue (helix/editor)
+  O         Edit issue (terminal editor)
   C         Copy issue ID
 
 **Info Shown**

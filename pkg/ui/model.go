@@ -7650,14 +7650,25 @@ const (
 )
 
 var terminalEditorExecutables = map[string]bool{
-	"vim":   true,
-	"vi":    true,
-	"nvim":  true,
-	"nano":  true,
 	"emacs": true,
-	"pico":  true,
+	"hx":    true,
 	"joe":   true,
+	"kak":   true,
+	"micro": true,
+	"nano":  true,
 	"ne":    true,
+	"nvim":  true,
+	"pico":  true,
+	"vi":    true,
+	"vim":   true,
+}
+
+// IsTerminalEditor returns true if the editor path names a known terminal-based editor.
+func IsTerminalEditor(editor string) bool {
+	if editor == "" {
+		return false
+	}
+	return terminalEditorExecutables[normalizeExecutableBase(editor)]
 }
 
 var forbiddenEditorExecutables = map[string]bool{

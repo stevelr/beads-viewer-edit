@@ -21,7 +21,7 @@ import (
 // EditConfig holds the configuration for the human-edit system.
 type EditConfig struct {
 	BrPath         string       `yaml:"br_path"`
-	HelixPath      string       `yaml:"helix_path"`
+	EditorPath     string       `yaml:"editor_path"`
 	WeztermCommand string       `yaml:"wezterm_command"`
 	Hotkeys        HotkeyConfig `yaml:"hotkeys"`
 	ExtraAssignees []string     `yaml:"extra_assignees"`
@@ -40,10 +40,18 @@ type HotkeyConfig struct {
 }
 
 // DefaultEditConfig returns a config with sensible defaults.
+// EditorPath defaults to $EDITOR, then $VISUAL, then "vi".
 func DefaultEditConfig() EditConfig {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = os.Getenv("VISUAL")
+	}
+	if editor == "" {
+		editor = "vi"
+	}
 	return EditConfig{
 		BrPath:         "br",
-		HelixPath:      "hx",
+		EditorPath:     editor,
 		WeztermCommand: "wezterm cli split-pane --bottom --",
 		Hotkeys: HotkeyConfig{
 			EditPriority:   "ctrl+p",
@@ -103,8 +111,8 @@ func LoadEditConfig() EditConfig {
 		if cfg.BrPath == "" {
 			cfg.BrPath = "br"
 		}
-		if cfg.HelixPath == "" {
-			cfg.HelixPath = "hx"
+		if cfg.EditorPath == "" {
+			cfg.EditorPath = DefaultEditConfig().EditorPath
 		}
 		return cfg
 	}
@@ -234,8 +242,8 @@ func writeSection(b *strings.Builder, tag, content string) {
 		b.WriteString(trimmed)
 		b.WriteString("\n")
 	}
-	// Blank line before closing tag prevents markdown LSP formatters (e.g. in
-	// helix) from indenting the closing tag when format-on-save is enabled.
+	// Blank line before closing tag prevents markdown LSP formatters from
+	// indenting the closing tag when format-on-save is enabled.
 	b.WriteString(fmt.Sprintf("\n</%s>\n", tag))
 }
 
@@ -634,6 +642,11 @@ func CreateIssue(brPath string, parentID *string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// DeleteIssue deletes an issue via br delete.
+func DeleteIssue(brPath, issueID string) error {
+	return RunBrUpdate([]string{brPath, "delete", issueID, "--no-auto-import"})
+}
+
 // --- Snapshot Backup ---
 
 // TakeSnapshot saves a br show JSON snapshot to .beads/snapshots/.
@@ -702,27 +715,17 @@ var PriorityLabels = []string{
 
 // --- Editor detection ---
 
-// isTerminalEditor returns true if the editor name suggests a terminal-based editor.
-func isTerminalEditor(editor string) bool {
-	base := filepath.Base(editor)
-	for _, name := range []string{"hx", "helix", "vim", "vi", "nvim", "nano"} {
-		if base == name || strings.Contains(base, name) {
-			return true
-		}
-	}
-	return false
-}
-
 // --- Pending Edit (async file-watch) ---
 
 // PendingEdit tracks an in-progress async editor session.
 type PendingEdit struct {
-	IssueID     string
-	Original    IssueSnapshot
-	LastApplied IssueSnapshot
-	MdPath      string
-	LastMtime   time.Time
-	ChangedAt   *time.Time
+	IssueID      string
+	Original     IssueSnapshot
+	LastApplied  IssueSnapshot
+	MdPath       string
+	LastMtime    time.Time
+	ChangedAt    *time.Time
+	NewlyCreated bool
 }
 
 // --- Tea Messages ---
@@ -741,11 +744,12 @@ type editNoChangesMsg struct {
 }
 
 type editorFinishedMsg struct {
-	err      error
-	mdPath   string
-	snapshot IssueSnapshot
-	issueID  string
-	brPath   string
+	err          error
+	mdPath       string
+	snapshot     IssueSnapshot
+	issueID      string
+	brPath       string
+	newlyCreated bool
 }
 
 type pollEditMsg struct {
@@ -913,12 +917,8 @@ func (m Model) openIssueInEditor() (Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Smart dispatch: check if $EDITOR is a terminal editor
-	editor := os.Getenv("EDITOR")
-	if editor == "" {
-		editor = os.Getenv("VISUAL")
-	}
-	if !isTerminalEditor(editor) && !isTerminalEditor(m.editConfig.HelixPath) {
+	// Smart dispatch: only proceed if the configured editor is terminal-based
+	if !IsTerminalEditor(m.editConfig.EditorPath) {
 		// Fall through to existing openInEditor (GUI editor path)
 		return m, nil
 	}
@@ -968,18 +968,14 @@ func (m Model) openIssueInEditor() (Model, tea.Cmd) {
 			MdPath:      mdPath,
 			LastMtime:   info.ModTime(),
 		}
-		m.statusMsg = fmt.Sprintf("Editing %s in helix (watching for saves)", issueID)
+		m.statusMsg = fmt.Sprintf("Editing %s in %s (watching for saves)", issueID, filepath.Base(m.editConfig.EditorPath))
 		return m, tea.Tick(250*time.Millisecond, func(t time.Time) tea.Msg {
 			return pollEditMsg{time: t}
 		})
 	}
 
 	// Synchronous mode via tea.ExecProcess
-	editorPath := m.editConfig.HelixPath
-	if isTerminalEditor(editor) {
-		editorPath = editor
-	}
-	editorCmd := exec.Command(editorPath, mdPath)
+	editorCmd := exec.Command(m.editConfig.EditorPath, mdPath)
 	m.statusMsg = fmt.Sprintf("Opening %s in editor...", issueID)
 	return m, tea.ExecProcess(editorCmd, func(err error) tea.Msg {
 		return editorFinishedMsg{
@@ -997,7 +993,7 @@ func launchInWezterm(config *EditConfig, mdPath string) error {
 	if len(parts) == 0 {
 		return fmt.Errorf("empty wezterm_command")
 	}
-	args := append(parts[1:], config.HelixPath, mdPath)
+	args := append(parts[1:], config.EditorPath, mdPath)
 	cmd := exec.Command(parts[0], args...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -1041,15 +1037,9 @@ func (m Model) addComment() (Model, tea.Cmd) {
 	}
 
 	// Determine editor
-	editor := os.Getenv("EDITOR")
-	if editor == "" {
-		editor = os.Getenv("VISUAL")
-	}
-	if editor == "" {
-		editor = m.editConfig.HelixPath
-	}
-	if !isTerminalEditor(editor) {
-		m.statusMsg = "Add comment requires a terminal editor ($EDITOR)"
+	editor := m.editConfig.EditorPath
+	if !IsTerminalEditor(editor) {
+		m.statusMsg = "Add comment requires a terminal editor (set $EDITOR or editor_path)"
 		m.statusIsError = true
 		return m, nil
 	}
@@ -1162,6 +1152,11 @@ func (m Model) handleEditorFinished(msg editorFinishedMsg) (Model, tea.Cmd) {
 
 	diff := DiffSnapshots(msg.snapshot, edited)
 	if diff.IsEmpty() {
+		if msg.newlyCreated {
+			_ = DeleteIssue(msg.brPath, msg.issueID)
+			m.statusMsg = fmt.Sprintf("No changes — deleted empty issue %s", msg.issueID)
+			return m, func() tea.Msg { return FileChangedMsg{} }
+		}
 		m.statusMsg = fmt.Sprintf("No changes detected for %s", msg.issueID)
 		return m, nil
 	}
@@ -1193,6 +1188,13 @@ func (m Model) handleEditPoll() (Model, tea.Cmd) {
 	// Check if file still exists
 	info, err := os.Stat(pe.MdPath)
 	if os.IsNotExist(err) {
+		diff := DiffSnapshots(pe.Original, pe.LastApplied)
+		if pe.NewlyCreated && diff.IsEmpty() {
+			_ = DeleteIssue(m.editConfig.BrPath, pe.IssueID)
+			m.pendingEdit = nil
+			m.statusMsg = fmt.Sprintf("No changes — deleted empty issue %s", pe.IssueID)
+			return m, func() tea.Msg { return FileChangedMsg{} }
+		}
 		m.pendingEdit = nil
 		m.statusMsg = "Editor session ended"
 		return m, nil
@@ -1312,33 +1314,30 @@ func (m Model) handleCreateAndEdit(msg createAndEditMsg) (Model, tea.Cmd) {
 			return m, nil
 		}
 		m.pendingEdit = &PendingEdit{
-			IssueID:     issueID,
-			Original:    original,
-			LastApplied: original,
-			MdPath:      mdPath,
-			LastMtime:   info.ModTime(),
+			IssueID:      issueID,
+			Original:     original,
+			LastApplied:  original,
+			MdPath:       mdPath,
+			LastMtime:    info.ModTime(),
+			NewlyCreated: true,
 		}
-		m.statusMsg = fmt.Sprintf("Created %s — editing in helix", issueID)
+		m.statusMsg = fmt.Sprintf("Created %s — editing in %s", issueID, filepath.Base(m.editConfig.EditorPath))
 		return m, tea.Tick(250*time.Millisecond, func(t time.Time) tea.Msg {
 			return pollEditMsg{time: t}
 		})
 	}
 
 	// Synchronous mode
-	editorPath := m.editConfig.HelixPath
-	editor := os.Getenv("EDITOR")
-	if isTerminalEditor(editor) {
-		editorPath = editor
-	}
-	editorCmd := exec.Command(editorPath, mdPath)
+	editorCmd := exec.Command(m.editConfig.EditorPath, mdPath)
 	m.statusMsg = fmt.Sprintf("Created %s — opening in editor...", issueID)
 	return m, tea.ExecProcess(editorCmd, func(err error) tea.Msg {
 		return editorFinishedMsg{
-			err:      err,
-			mdPath:   mdPath,
-			snapshot: original,
-			issueID:  issueID,
-			brPath:   brPath,
+			err:          err,
+			mdPath:       mdPath,
+			snapshot:     original,
+			issueID:      issueID,
+			brPath:       brPath,
+			newlyCreated: true,
 		}
 	})
 }

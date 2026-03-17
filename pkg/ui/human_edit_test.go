@@ -16,8 +16,8 @@ func TestDefaultEditConfig(t *testing.T) {
 	if cfg.BrPath != "br" {
 		t.Errorf("BrPath = %q, want %q", cfg.BrPath, "br")
 	}
-	if cfg.HelixPath != "hx" {
-		t.Errorf("HelixPath = %q, want %q", cfg.HelixPath, "hx")
+	if cfg.EditorPath == "" {
+		t.Error("EditorPath should not be empty")
 	}
 	if cfg.Hotkeys.EditPriority != "ctrl+p" {
 		t.Errorf("EditPriority = %q, want %q", cfg.Hotkeys.EditPriority, "ctrl+p")
@@ -61,7 +61,7 @@ func TestLoadEditConfig_FromFile(t *testing.T) {
 	defer os.Chdir(origDir) //nolint:errcheck
 
 	configYAML := `br_path: "/usr/local/bin/br"
-helix_path: "/usr/local/bin/hx"
+editor_path: "/usr/local/bin/hx"
 extra_assignees:
   - alice
   - bob
@@ -77,8 +77,8 @@ hotkeys:
 	if cfg.BrPath != "/usr/local/bin/br" {
 		t.Errorf("BrPath = %q, want %q", cfg.BrPath, "/usr/local/bin/br")
 	}
-	if cfg.HelixPath != "/usr/local/bin/hx" {
-		t.Errorf("HelixPath = %q, want %q", cfg.HelixPath, "/usr/local/bin/hx")
+	if cfg.EditorPath != "/usr/local/bin/hx" {
+		t.Errorf("EditorPath = %q, want %q", cfg.EditorPath, "/usr/local/bin/hx")
 	}
 	if cfg.Hotkeys.EditPriority != "ctrl+1" {
 		t.Errorf("EditPriority = %q, want %q", cfg.Hotkeys.EditPriority, "ctrl+1")
@@ -618,9 +618,9 @@ func TestCollectAssignees(t *testing.T) {
 	issues := []model.Issue{
 		{Assignee: "bob"},
 		{Assignee: "alice"},
-		{Assignee: "bob"},  // duplicate
-		{Assignee: ""},     // empty
-		{Assignee: "  "}, // whitespace
+		{Assignee: "bob"}, // duplicate
+		{Assignee: ""},    // empty
+		{Assignee: "  "},  // whitespace
 	}
 	result := CollectAssignees(issues, []string{"charlie", "alice"})
 
@@ -837,8 +837,8 @@ Check if count > 0.`,
 }
 
 func TestParseSections_IndentedClosingTags(t *testing.T) {
-	// Markdown LSP formatters (e.g. in helix) indent closing tags when
-	// there is content. The parser must handle this via TrimSpace.
+	// Markdown LSP formatters may indent closing tags when there is content.
+	// The parser must handle this via TrimSpace.
 	md := `---
 id: BD-1
 title: Test
@@ -889,7 +889,10 @@ func TestIsTerminalEditor(t *testing.T) {
 		{"nvim", true},
 		{"vi", true},
 		{"nano", true},
-		{"helix", true},
+		{"emacs", true},
+		{"pico", true},
+		{"joe", true},
+		{"ne", true},
 		{"code", false},
 		{"gedit", false},
 		{"", false},
@@ -897,9 +900,9 @@ func TestIsTerminalEditor(t *testing.T) {
 		{"/usr/local/bin/nvim", true},
 	}
 	for _, tc := range tests {
-		result := isTerminalEditor(tc.editor)
+		result := IsTerminalEditor(tc.editor)
 		if result != tc.expected {
-			t.Errorf("isTerminalEditor(%q) = %v, want %v", tc.editor, result, tc.expected)
+			t.Errorf("IsTerminalEditor(%q) = %v, want %v", tc.editor, result, tc.expected)
 		}
 	}
 }
