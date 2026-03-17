@@ -502,6 +502,14 @@ type Model struct {
 	// Self-update modal (bv-182)
 	showUpdateModal bool
 	updateModal     UpdateModal
+
+	// --- Human edit fields (fork: human-edit) ---
+	editConfig     EditConfig
+	pendingEdit    *PendingEdit
+	editPicker     EditPickerModal
+	editPickerKind editPickerKind
+	showEditPicker bool
+	titleEditState TitleEditState
 }
 
 // labelCount is a simple label->count pair for display
@@ -1081,6 +1089,8 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		}(),
 		// Tutorial integration (bv-8y31)
 		tutorialModel: NewTutorialModel(theme),
+		// Human edit (fork: human-edit)
+		editConfig: LoadEditConfig(),
 	}
 }
 
@@ -2211,6 +2221,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, WaitForPhase2Cmd(m.analysis))
 		return m, tea.Batch(cmds...)
 
+	// --- Human edit message handlers (fork: human-edit) ---
+	case editAppliedMsg:
+		m = m.handleEditApplied(msg)
+		// Trigger reload after successful edit
+		cmds = append(cmds, func() tea.Msg { return FileChangedMsg{} })
+		return m, tea.Batch(cmds...)
+	case editErrorMsg:
+		m = m.handleEditError(msg)
+	case editNoChangesMsg:
+		m = m.handleEditNoChanges(msg)
+	case editorFinishedMsg:
+		return m.handleEditorFinished(msg)
+	case pollEditMsg:
+		return m.handleEditPoll()
+	case createAndEditMsg:
+		return m.handleCreateAndEdit(msg)
+	case commentEditorFinishedMsg:
+		return m.handleCommentEditorFinished(msg)
+
 	case tea.KeyMsg:
 		// Clear status message on any keypress
 		m.statusMsg = ""
@@ -2700,6 +2729,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Human edit intercepts (fork: human-edit)
+		// Title edit and edit picker must run BEFORE the global key switch,
+		// which has case "esc"/"q"/etc. that would steal keys from the editor.
+		if m.titleEditState.Active {
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			m2, cmd, handled := m.handleTitleEditKey(msg)
+			if handled {
+				// Update status to show current buffer
+				if m2.titleEditState.Active {
+					m2.statusMsg = "Title: " + RenderTitleEdit(m2.titleEditState, m2.width)
+					m2.statusIsError = false
+				}
+				return m2, cmd
+			}
+		}
+		if m.showEditPicker {
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			m.editPicker = m.editPicker.Update(msg)
+			if m.editPicker.Result != PickerPending {
+				m2, cmd := m.handleEditPickerResult()
+				if cmd != nil {
+					return m2, cmd
+				}
+				return m2, nil
+			}
+			return m, nil
+		}
+
 		// Handle keys when not filtering
 		if m.list.FilterState() != list.Filtering {
 			switch msg.String() {
@@ -3100,6 +3161,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focused = focusLabelPicker
 				return m, nil
 
+			}
+
+			// Human edit hotkey dispatch (fork: human-edit)
+			if m2, cmd, handled := m.tryEditKeyHandler(msg.String()); handled {
+				return m2, cmd
 			}
 
 			// Focus-specific key handling
@@ -4452,6 +4518,9 @@ func (m Model) View() string {
 	} else if m.showCassModal {
 		// Cass session preview modal (bv-5bqh)
 		body = m.cassModal.CenterModal(m.width, m.height-1)
+	} else if m.showEditPicker {
+		// Edit picker modal (fork: human-edit)
+		body = m.editPicker.View(m.theme, m.width, m.height-1)
 	} else if m.showUpdateModal {
 		// Self-update modal (bv-182)
 		body = m.updateModal.CenterModal(m.width, m.height-1)
@@ -4885,6 +4954,18 @@ func (m *Model) renderHelpOverlay() string {
 		{"O", "Open in editor"},
 	}
 
+	// fork: human-edit
+	editSection := []struct{ key, desc string }{
+		{"Ctrl+p", "Set priority"},
+		{"Ctrl+o", "Set status"},
+		{"Ctrl+a", "Set assignee"},
+		{"Ctrl+t", "Edit title"},
+		{"O", "Edit in editor"},
+		{"Ctrl+n", "New issue"},
+		{"Ctrl+g", "New sub-issue"},
+		{"Ctrl+x", "Add comment"},
+	}
+
 	statusSection := []struct{ key, desc string }{
 		{"◌ metrics", "Phase 2 metrics computing"},
 		{"⚠ age", "Snapshot getting stale"},
@@ -4906,24 +4987,29 @@ func (m *Model) renderHelpOverlay() string {
 		renderPanel("Status", "🩺", 2, statusSection),
 		renderPanel("History", "📜", 0, historySection),
 		renderPanel("Actions", "⚡", 1, actionsSection),
+		renderPanel("Editing", "✏", 3, editSection), // fork: human-edit
 	}
 
-	// Arrange panels into columns
+	// Arrange panels into columns, balanced by height.
+	// Greedy assignment: place each panel into the shortest column so far.
+	colPanels := make([][]string, numCols)
+	colHeights := make([]int, numCols)
+	for _, panel := range panels {
+		// Find the shortest column
+		minCol := 0
+		for c := 1; c < numCols; c++ {
+			if colHeights[c] < colHeights[minCol] {
+				minCol = c
+			}
+		}
+		colPanels[minCol] = append(colPanels[minCol], panel)
+		colHeights[minCol] += lipgloss.Height(panel)
+	}
 	var columns []string
-	panelsPerCol := (len(panels) + numCols - 1) / numCols
-
-	for col := 0; col < numCols; col++ {
-		start := col * panelsPerCol
-		end := start + panelsPerCol
-		if end > len(panels) {
-			end = len(panels)
+	for _, cp := range colPanels {
+		if len(cp) > 0 {
+			columns = append(columns, lipgloss.JoinVertical(lipgloss.Left, cp...))
 		}
-		if start >= len(panels) {
-			break
-		}
-
-		colPanels := panels[start:end]
-		columns = append(columns, lipgloss.JoinVertical(lipgloss.Left, colPanels...))
 	}
 
 	// Join columns horizontally
