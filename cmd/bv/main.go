@@ -824,7 +824,7 @@ func main() {
 	}
 
 	if *versionFlag {
-		fmt.Printf("bv %s\n", version.Version)
+		fmt.Printf("bv (edit) %s\n", version.Version)
 		os.Exit(0)
 	}
 
