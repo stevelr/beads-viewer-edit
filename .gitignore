@@ -1,4 +1,5 @@
 beads_reference/
+.beads/snapshots
 /bv
 /main
 *.test

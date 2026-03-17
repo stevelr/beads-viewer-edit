@@ -116,7 +116,10 @@ const contextHelpList = `## List View
 
 **Actions**
   U         Self-update bv
-  V         Preview cass sessions`
+  V         Preview cass sessions
+  Ctrl+p/o/a Set priority/status/assignee
+  Ctrl+t    Edit title │ O  Edit issue
+  Ctrl+n/g  New issue/sub │ Ctrl+x  Comment`
 
 const contextHelpGraph = `## Graph View
 
@@ -153,10 +156,7 @@ const contextHelpBoard = `## Board View
 **Grouping**
   s         Cycle: Status/Priority/Type
 
-**Visual Indicators** (card borders)
-  🔴 Red     Has blockers
-  🟡 Yellow  High-impact (blocks others)
-  🟢 Green   Ready to work
+**Cards** 🔴 Blocked 🟡 High-impact 🟢 Ready
 
 **Actions**
   Tab       Toggle detail panel
@@ -164,7 +164,9 @@ const contextHelpBoard = `## Board View
   V         Preview cass sessions
   y         Copy issue ID
   Enter     View issue details
-  Esc       Return to List view`
+  Esc       Return to List view
+
+**Edit** Ctrl+p/o/a/t O Ctrl+n/g/x`
 
 const contextHelpInsights = `## Insights Panel
 
@@ -223,7 +225,7 @@ const contextHelpDetail = `## Detail View
   Tab       Switch to split view
 
 **Actions (from list view)**
-  O         Open in editor
+  O         Edit issue (helix/editor)
   C         Copy issue ID
 
 **Info Shown**
