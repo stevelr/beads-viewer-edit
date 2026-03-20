@@ -345,8 +345,10 @@ Intercepted in `Update()` before all other key processing when `titleEditState.A
 
 The `O` key checks `editConfig.EditorPath` (which defaults from `$EDITOR`, `$VISUAL`, or `"vi"`):
 
-- If the editor is a terminal editor (`hx`, `vim`, `vi`, `nvim`, `nano`, `emacs`, `pico`, `joe`, `ne`): use the new markdown edit workflow
+- If the editor is a terminal editor: use the new markdown edit workflow
 - Otherwise: return `handled=false`, fall through to existing `openInEditor()` GUI path
+
+Detection uses `IsTerminalEditor()` in `model.go`, backed by the `terminalEditorExecutables` map. Recognized executables: `vim`, `vi`, `nvim`, `nano`, `emacs`, `pico`, `joe`, `ne`, `hx`. The function extracts the base name from the configured editor path before lookup.
 
 ### 9.2 Snapshot and Markdown Generation
 
@@ -431,6 +433,10 @@ On any `br update` failure during the full-editor flow:
 ### 10.2 `ctrl+g` — New sub-issue
 
 Same as `ctrl+n` but passes `--parent SELECTED_ISSUE_ID` to `br create`.
+
+### 10.3 Empty Issue Cleanup on Cancel
+
+When creating a new issue (`ctrl+n` / `ctrl+g`), if the user closes the editor without making any changes, the stub issue is automatically deleted via `br delete`. This applies to both synchronous and WezTerm async editor modes. Without this cleanup, cancelled creates would leave empty placeholder issues in the database.
 
 ---
 
@@ -632,7 +638,7 @@ Some `ctrl+` combinations send the same byte as common keys and cannot be used a
 - BuildUpdateArgv: all fields, empty diff, single field, `--no-auto-import` always present
 - Assignee collection: dedup, sort, extras, empty
 - Label parsing: commas, single, empty, whitespace
-- Editor detection: hx, vim, nvim, vi, nano, emacs, pico, joe, ne, code, gedit, paths
+- `IsTerminalEditor()`: hx, vim, nvim, vi, nano, emacs, pico, joe, ne, code, gedit, paths
 - YAML escaping: roundtrip for titles with colons, brackets, quotes, dashes, spaces
 - Error extraction: valid JSON envelope, plain text, empty message, malformed JSON
 - Known constants: statuses count, priority labels count
