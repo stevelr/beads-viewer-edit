@@ -460,7 +460,7 @@ func registerPhaseOneRobotHandlers(registry *RobotRegistry, cfg phaseOneRobotHan
 		FlagPtr:     cfg.VersionFlag,
 		Description: "Show version",
 		Handler: func(ctx RobotContext) error {
-			_, err := fmt.Fprintf(ctx.StdoutOrDefault(), "bv %s\n", version.Version)
+			_, err := fmt.Fprintf(ctx.StdoutOrDefault(), "bv (edit) %s\n", version.Version)
 			if err != nil {
 				return fmt.Errorf("writing version output: %w", err)
 			}
