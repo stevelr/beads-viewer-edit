@@ -67,6 +67,21 @@ func TestFindJSONLPath_PrefersBeadsJSONL(t *testing.T) {
 	}
 }
 
+func TestFindJSONLPath_UsesMetadataJSONLExport(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "metadata.json"), []byte(`{"jsonl_export":"issues.jsonl"}`), 0644)
+	os.WriteFile(filepath.Join(dir, "issues.jsonl"), []byte(`{"id":"canonical"}`), 0644)
+	os.WriteFile(filepath.Join(dir, "beads.jsonl"), []byte(`{"id":"legacy"}`), 0644)
+
+	path, err := loader.FindJSONLPath(dir)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if filepath.Base(path) != "issues.jsonl" {
+		t.Errorf("Expected metadata jsonl_export to select issues.jsonl, got: %s", path)
+	}
+}
+
 func TestFindJSONLPath_FallsBackToIssuesJSONL(t *testing.T) {
 	dir := t.TempDir()
 	// Create issues.jsonl only (no beads.jsonl)
@@ -1301,6 +1316,80 @@ func TestGetBeadsDir_EnvVarEmpty_FallsBack(t *testing.T) {
 	}
 	if result != expected {
 		t.Errorf("Empty BEADS_DIR should fallback: got %s, want %s", result, expected)
+	}
+}
+
+func TestGetBeadsDir_FollowsBRWhereRedirect(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stub uses POSIX sh")
+	}
+
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	repoBeads := filepath.Join(repoPath, ".beads")
+	trackerBeads := filepath.Join(root, "repo.tracker", ".beads")
+	if err := os.MkdirAll(repoBeads, 0o755); err != nil {
+		t.Fatalf("mkdir repo .beads: %v", err)
+	}
+	if err := os.MkdirAll(trackerBeads, 0o755); err != nil {
+		t.Fatalf("mkdir tracker .beads: %v", err)
+	}
+
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	brScript := filepath.Join(binDir, "br")
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" != "where" ] || [ "$2" != "--json" ]; then
+  exit 2
+fi
+cat <<'JSON'
+{"path":%q,"redirected_from":%q,"jsonl_path":%q,"database_path":%q}
+JSON
+`, trackerBeads, repoBeads, filepath.Join(trackerBeads, "issues.jsonl"), filepath.Join(trackerBeads, "beads.db"))
+	if err := os.WriteFile(brScript, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake br: %v", err)
+	}
+
+	t.Setenv(loader.BeadsDBEnvVar, "")
+	t.Setenv(loader.BeadsDirEnvVar, "")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	got, err := loader.GetBeadsDir(repoPath)
+	if err != nil {
+		t.Fatalf("GetBeadsDir() error = %v", err)
+	}
+	if got != trackerBeads {
+		t.Fatalf("GetBeadsDir() = %q, want redirected tracker %q", got, trackerBeads)
+	}
+}
+
+func TestGetBeadsDir_FallsBackToSiblingTracker(t *testing.T) {
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	repoBeads := filepath.Join(repoPath, ".beads")
+	trackerBeads := filepath.Join(root, "repo.tracker", ".beads")
+	if err := os.MkdirAll(repoBeads, 0o755); err != nil {
+		t.Fatalf("mkdir repo .beads: %v", err)
+	}
+	if err := os.MkdirAll(trackerBeads, 0o755); err != nil {
+		t.Fatalf("mkdir tracker .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(trackerBeads, "issues.jsonl"), []byte(`{"id":"T-1"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write tracker issues: %v", err)
+	}
+
+	t.Setenv(loader.BeadsDBEnvVar, "")
+	t.Setenv(loader.BeadsDirEnvVar, "")
+	t.Setenv("PATH", "")
+
+	got, err := loader.GetBeadsDir(repoPath)
+	if err != nil {
+		t.Fatalf("GetBeadsDir() error = %v", err)
+	}
+	if got != trackerBeads {
+		t.Fatalf("GetBeadsDir() = %q, want sibling tracker %q", got, trackerBeads)
 	}
 }
 

@@ -1375,7 +1375,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		cmdArgs := append([]string{"update", msg.issueID}, brArgs...)
-		brCmd := exec.Command("br", cmdArgs...)
+		brCmd := exec.Command(m.editConfig.BrPath, cmdArgs...)
 		output, brErr := brCmd.CombinedOutput()
 		if brErr != nil {
 			m.statusMsg = fmt.Sprintf("❌ br update failed: %v — %s", brErr, strings.TrimSpace(string(output)))
@@ -1385,7 +1385,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		fieldCount := len(brArgs) / 2
 		m.statusMsg = fmt.Sprintf("✅ Updated %d field(s) for %s", fieldCount, msg.issueID)
 		m.statusIsError = false
-		return m, nil
+		if m.backgroundWorker != nil {
+			m.backgroundWorker.ForceRefresh()
+			return m, WaitForBackgroundWorkerMsgCmd(m.backgroundWorker)
+		}
+		return m, func() tea.Msg { return FileChangedMsg{} }
 
 	case ReadyTimeoutMsg:
 		// bv-7wl7: Legacy fallback handler (no longer used).

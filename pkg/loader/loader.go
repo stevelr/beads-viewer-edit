@@ -3,6 +3,7 @@ package loader
 import (
 	"bufio"
 	"bytes"
+	"context"
 	stdjson "encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	json "github.com/goccy/go-json"
 
@@ -18,7 +20,15 @@ import (
 
 // beadsMetadata is the subset of .beads/metadata.json we care about.
 type beadsMetadata struct {
-	Backend string `json:"backend"`
+	Backend     string `json:"backend"`
+	JSONLExport string `json:"jsonl_export"`
+}
+
+type brWhereOutput struct {
+	Path           string `json:"path"`
+	RedirectedFrom string `json:"redirected_from"`
+	JSONLPath      string `json:"jsonl_path"`
+	DatabasePath   string `json:"database_path"`
 }
 
 // BeadsDirEnvVar is the name of the environment variable for custom beads directory
@@ -62,7 +72,7 @@ func GetBeadsDir(repoPath string) (string, error) {
 	// Check for .beads in the given path first
 	beadsDir := filepath.Join(repoPath, ".beads")
 	if _, err := os.Stat(beadsDir); err == nil {
-		return beadsDir, nil
+		return resolveBRRedirectedBeadsDir(repoPath, beadsDir), nil
 	}
 
 	// If not found, check if we're in a git worktree and look in the main repo
@@ -70,13 +80,100 @@ func GetBeadsDir(repoPath string) (string, error) {
 	if err == nil && mainRepoRoot != "" && mainRepoRoot != repoPath {
 		mainBeadsDir := filepath.Join(mainRepoRoot, ".beads")
 		if _, err := os.Stat(mainBeadsDir); err == nil {
-			return mainBeadsDir, nil
+			return resolveBRRedirectedBeadsDir(repoPath, mainBeadsDir), nil
 		}
 	}
 
 	// Return the original path even if .beads doesn't exist
 	// (caller will handle the error)
 	return beadsDir, nil
+}
+
+func resolveBRRedirectedBeadsDir(repoPath, beadsDir string) string {
+	resolved, ok := brWhereBeadsDir(repoPath, beadsDir)
+	if !ok {
+		if trackerDir, trackerOK := siblingTrackerBeadsDir(repoPath, beadsDir); trackerOK {
+			return trackerDir
+		}
+		return beadsDir
+	}
+	return resolved
+}
+
+func brWhereBeadsDir(repoPath, beadsDir string) (string, bool) {
+	if repoPath == "" || beadsDir == "" {
+		return "", false
+	}
+	if _, err := exec.LookPath("br"); err != nil {
+		return "", false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "br", "where", "--json")
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return "", false
+	}
+
+	var where brWhereOutput
+	if err := stdjson.Unmarshal(out, &where); err != nil {
+		return "", false
+	}
+	if strings.TrimSpace(where.Path) == "" {
+		return "", false
+	}
+
+	local := cleanAbsPath(beadsDir)
+	active := cleanAbsPath(where.Path)
+	redirectedFrom := cleanAbsPath(where.RedirectedFrom)
+	if active == "" {
+		return "", false
+	}
+	if redirectedFrom != "" {
+		if redirectedFrom == local {
+			return active, true
+		}
+		return "", false
+	}
+	if active == local {
+		return active, true
+	}
+	return "", false
+}
+
+func cleanAbsPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	return filepath.Clean(path)
+}
+
+func siblingTrackerBeadsDir(repoPath, beadsDir string) (string, bool) {
+	repoPath = cleanAbsPath(repoPath)
+	beadsDir = cleanAbsPath(beadsDir)
+	if repoPath == "" || beadsDir == "" {
+		return "", false
+	}
+	if beadsDir != cleanAbsPath(filepath.Join(repoPath, ".beads")) {
+		return "", false
+	}
+
+	trackerBeadsDir := filepath.Join(repoPath+".tracker", ".beads")
+	info, err := os.Stat(trackerBeadsDir)
+	if err != nil || !info.IsDir() {
+		return "", false
+	}
+	if _, err := FindJSONLPath(trackerBeadsDir); err != nil {
+		return "", false
+	}
+	return trackerBeadsDir, true
 }
 
 // resolveBeadsDB interprets a BEADS_DB value which can be either:
@@ -310,11 +407,13 @@ func FindJSONLPathWithWarnings(beadsDir string, warnFunc func(msg string)) (stri
 	}
 
 	// Priority order for beads files:
-	// Default (br stack): beads.jsonl -> issues.jsonl -> beads.base.jsonl
+	// Default (br stack): metadata.json jsonl_export, then beads.jsonl -> issues.jsonl -> beads.base.jsonl
 	// In bd workspaces: issues.jsonl is the canonical compatibility export
 	preferredNames := PreferredJSONLNames
 	if IsBDWorkspace(beadsDir) {
 		preferredNames = []string{"issues.jsonl", "beads.jsonl", "beads.base.jsonl"}
+	} else if metadataPreferred := metadataJSONLExportName(beadsDir); metadataPreferred != "" {
+		preferredNames = prependPreferredName(metadataPreferred, PreferredJSONLNames)
 	}
 
 	for _, preferred := range preferredNames {
@@ -339,6 +438,39 @@ func FindJSONLPathWithWarnings(beadsDir string, warnFunc func(msg string)) (stri
 
 	// Last resort: return first candidate even if empty
 	return filepath.Join(beadsDir, candidates[0]), nil
+}
+
+func metadataJSONLExportName(beadsDir string) string {
+	data, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
+	if err != nil {
+		return ""
+	}
+	var meta beadsMetadata
+	if err := stdjson.Unmarshal(data, &meta); err != nil {
+		return ""
+	}
+	name := filepath.Clean(strings.TrimSpace(meta.JSONLExport))
+	if name == "." || name == "" || filepath.IsAbs(name) {
+		return ""
+	}
+	if strings.HasPrefix(name, "..") || strings.ContainsAny(name, `/\`) {
+		return ""
+	}
+	if !strings.HasSuffix(name, ".jsonl") {
+		return ""
+	}
+	return name
+}
+
+func prependPreferredName(name string, defaults []string) []string {
+	names := make([]string, 0, len(defaults)+1)
+	names = append(names, name)
+	for _, candidate := range defaults {
+		if candidate != name {
+			names = append(names, candidate)
+		}
+	}
+	return names
 }
 
 // LoadIssues reads issues from the beads directory.

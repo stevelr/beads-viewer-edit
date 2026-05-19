@@ -1612,3 +1612,61 @@ func TestEditorExitMsgWithError(t *testing.T) {
 		t.Fatalf("expected editor error message, got %q", resultModel.statusMsg)
 	}
 }
+
+func TestEditorExitMsgSuccessTriggersReload(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stub uses POSIX sh")
+	}
+
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "br-args.log")
+	binDir := filepath.Join(tmpDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	brScript := filepath.Join(binDir, "br")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shellQuote(logPath) + "\n"
+	if err := os.WriteFile(brScript, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake br: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	issue := model.Issue{ID: "t1", Title: "Test", Status: model.StatusOpen, IssueType: model.TypeTask, Description: "Old description"}
+	original := exportIssueFrontmatter(issue)
+	edited := strings.Replace(original, "Old description", "New description", 1)
+	tmpFile := filepath.Join(tmpDir, "edit.md")
+	if err := os.WriteFile(tmpFile, []byte(edited), 0o644); err != nil {
+		t.Fatalf("write edit file: %v", err)
+	}
+
+	m := NewModel([]model.Issue{issue}, nil, "")
+	result, cmd := m.Update(editorExitMsg{
+		issueID:  "t1",
+		tmpFile:  tmpFile,
+		original: original,
+		err:      nil,
+	})
+	resultModel := result.(Model)
+	if resultModel.statusIsError {
+		t.Fatalf("expected successful update, got %q", resultModel.statusMsg)
+	}
+	if cmd == nil {
+		t.Fatal("expected reload command after successful editor update")
+	}
+	if _, ok := cmd().(FileChangedMsg); !ok {
+		t.Fatalf("expected FileChangedMsg from reload command")
+	}
+	args, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read br args: %v", err)
+	}
+	for _, want := range []string{"update\n", "t1\n", "--description\n", "New description\n"} {
+		if !strings.Contains(string(args), want) {
+			t.Fatalf("br args missing %q:\n%s", want, string(args))
+		}
+	}
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
