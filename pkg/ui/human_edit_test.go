@@ -566,8 +566,11 @@ func TestBuildUpdateArgv_AllFields(t *testing.T) {
 	}
 	argv := BuildUpdateArgv("br", "BD-1", d)
 
-	if argv[0] != "br" || argv[1] != "update" || argv[2] != "BD-1" || argv[3] != "--no-auto-import" {
-		t.Errorf("prefix = %v", argv[:4])
+	if argv[0] != "br" || argv[1] != "update" || argv[2] != "BD-1" {
+		t.Errorf("prefix = %v", argv[:3])
+	}
+	if strings.Contains(strings.Join(argv, " "), "--no-auto-import") {
+		t.Errorf("argv should allow br auto-import/flush, got %v", argv)
 	}
 
 	// Check that all fields are present
@@ -593,9 +596,9 @@ func TestBuildUpdateArgv_AllFields(t *testing.T) {
 func TestBuildUpdateArgv_Empty(t *testing.T) {
 	d := &IssueDiff{}
 	argv := BuildUpdateArgv("br", "BD-1", d)
-	// br update BD-1 --no-auto-import
-	if len(argv) != 4 {
-		t.Errorf("empty diff should produce 4 args, got %d: %v", len(argv), argv)
+	// br update BD-1
+	if len(argv) != 3 {
+		t.Errorf("empty diff should produce 3 args, got %d: %v", len(argv), argv)
 	}
 }
 
@@ -603,12 +606,12 @@ func TestBuildUpdateArgv_PriorityOnly(t *testing.T) {
 	p := 4
 	d := &IssueDiff{Priority: &p}
 	argv := BuildUpdateArgv("br", "BD-1", d)
-	// br update BD-1 --no-auto-import --priority=4
-	if len(argv) != 5 {
-		t.Errorf("expected 5 args, got %d: %v", len(argv), argv)
+	// br update BD-1 --priority=4
+	if len(argv) != 4 {
+		t.Errorf("expected 4 args, got %d: %v", len(argv), argv)
 	}
-	if argv[4] != "--priority=4" {
-		t.Errorf("priority arg = %q", argv[4])
+	if argv[3] != "--priority=4" {
+		t.Errorf("priority arg = %q", argv[3])
 	}
 }
 

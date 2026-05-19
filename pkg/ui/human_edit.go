@@ -528,9 +528,9 @@ func stringSliceEqual(a, b []string) bool {
 // --- Build Update Argv ---
 
 // BuildUpdateArgv constructs the br update command arguments from a diff.
-// Includes --no-auto-import to avoid prefix-mismatch errors in mixed-prefix workspaces.
+// Let br run its default auto-import/auto-flush cycle so DB and JSONL stay in sync.
 func BuildUpdateArgv(brPath, issueID string, d *IssueDiff) []string {
-	argv := []string{brPath, "update", issueID, "--no-auto-import"}
+	argv := []string{brPath, "update", issueID}
 	if d.Title != nil {
 		argv = append(argv, fmt.Sprintf("--title=%s", *d.Title))
 	}
@@ -566,9 +566,9 @@ func BuildUpdateArgv(brPath, issueID string, d *IssueDiff) []string {
 // --- Subprocess Helpers ---
 
 // FetchBrJSON runs `br show ID --json` and returns stdout.
-// Uses --no-auto-import to avoid prefix-mismatch errors in mixed-prefix workspaces.
+// Let br auto-import before reading so the editor snapshot matches the active JSONL state.
 func FetchBrJSON(brPath, issueID string) (string, error) {
-	out, err := exec.Command(brPath, "show", issueID, "--json", "--no-auto-import").Output()
+	out, err := exec.Command(brPath, "show", issueID, "--json").Output()
 	if err != nil {
 		return "", fmt.Errorf("br show %s --json: %w", issueID, err)
 	}
@@ -611,27 +611,27 @@ func extractBrErrorMessage(raw string) string {
 
 // SetPriority sets the priority of an issue via br update.
 func SetPriority(brPath, issueID string, priority int) error {
-	return RunBrUpdate([]string{brPath, "update", issueID, "--no-auto-import", fmt.Sprintf("--priority=%d", priority)})
+	return RunBrUpdate([]string{brPath, "update", issueID, fmt.Sprintf("--priority=%d", priority)})
 }
 
 // SetStatus sets the status of an issue via br update.
 func SetStatus(brPath, issueID, status string) error {
-	return RunBrUpdate([]string{brPath, "update", issueID, "--no-auto-import", fmt.Sprintf("--status=%s", status)})
+	return RunBrUpdate([]string{brPath, "update", issueID, fmt.Sprintf("--status=%s", status)})
 }
 
 // SetAssignee sets the assignee of an issue via br update.
 func SetAssignee(brPath, issueID, assignee string) error {
-	return RunBrUpdate([]string{brPath, "update", issueID, "--no-auto-import", fmt.Sprintf("--assignee=%s", assignee)})
+	return RunBrUpdate([]string{brPath, "update", issueID, fmt.Sprintf("--assignee=%s", assignee)})
 }
 
 // SetTitle sets the title of an issue via br update.
 func SetTitle(brPath, issueID, title string) error {
-	return RunBrUpdate([]string{brPath, "update", issueID, "--no-auto-import", fmt.Sprintf("--title=%s", title)})
+	return RunBrUpdate([]string{brPath, "update", issueID, fmt.Sprintf("--title=%s", title)})
 }
 
 // CreateIssue creates a new issue via br create. Returns the new issue ID.
 func CreateIssue(brPath string, parentID *string) (string, error) {
-	args := []string{brPath, "create", "New Issue", "-p", "2", "-s", "open", "--silent", "--no-auto-import"}
+	args := []string{brPath, "create", "New Issue", "-p", "2", "-s", "open", "--silent"}
 	if parentID != nil {
 		args = append(args, "--parent", *parentID)
 	}
@@ -644,7 +644,7 @@ func CreateIssue(brPath string, parentID *string) (string, error) {
 
 // DeleteIssue deletes an issue via br delete.
 func DeleteIssue(brPath, issueID string) error {
-	return RunBrUpdate([]string{brPath, "delete", issueID, "--no-auto-import"})
+	return RunBrUpdate([]string{brPath, "delete", issueID})
 }
 
 // --- Snapshot Backup ---
@@ -1025,7 +1025,7 @@ func (m Model) createSubIssue() (Model, tea.Cmd) {
 
 // AddBrComment adds a comment to an issue via br comments add, reading from a file.
 func AddBrComment(brPath, issueID, filePath string) error {
-	return RunBrUpdate([]string{brPath, "comments", "add", issueID, "-f", filePath, "--no-auto-import"})
+	return RunBrUpdate([]string{brPath, "comments", "add", issueID, "-f", filePath})
 }
 
 func (m Model) addComment() (Model, tea.Cmd) {
