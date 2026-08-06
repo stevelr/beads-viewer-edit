@@ -31,6 +31,7 @@ type EditConfig struct {
 type HotkeyConfig struct {
 	EditPriority   string `yaml:"edit_priority"`
 	EditStatus     string `yaml:"edit_status"`
+	EditType       string `yaml:"edit_type"`
 	EditAssignee   string `yaml:"edit_assignee"`
 	OpenEditor     string `yaml:"open_editor"`
 	EditTitle      string `yaml:"edit_title"`
@@ -56,6 +57,7 @@ func DefaultEditConfig() EditConfig {
 		Hotkeys: HotkeyConfig{
 			EditPriority:   "ctrl+p",
 			EditStatus:     "ctrl+o",
+			EditType:       "ctrl+y",
 			EditAssignee:   "ctrl+a",
 			OpenEditor:     "O",
 			EditTitle:      "ctrl+t",
@@ -89,6 +91,9 @@ func LoadEditConfig() EditConfig {
 		}
 		if cfg.Hotkeys.EditStatus == "" {
 			cfg.Hotkeys.EditStatus = def.EditStatus
+		}
+		if cfg.Hotkeys.EditType == "" {
+			cfg.Hotkeys.EditType = def.EditType
 		}
 		if cfg.Hotkeys.EditAssignee == "" {
 			cfg.Hotkeys.EditAssignee = def.EditAssignee
@@ -130,16 +135,20 @@ type IssueSnapshot struct {
 	AcceptanceCriteria string
 	Notes              string
 	Status             string
+	IssueType          string
 	Priority           int
 	Assignee           string
 	Labels             []string
 	SourceRepo         string
+	Comments           []*model.Comment
 }
 
 // SnapshotFromIssue builds a snapshot from an in-memory issue.
 func SnapshotFromIssue(issue *model.Issue) IssueSnapshot {
 	labels := make([]string, len(issue.Labels))
 	copy(labels, issue.Labels)
+	comments := make([]*model.Comment, len(issue.Comments))
+	copy(comments, issue.Comments)
 	return IssueSnapshot{
 		ID:                 issue.ID,
 		Title:              issue.Title,
@@ -148,26 +157,30 @@ func SnapshotFromIssue(issue *model.Issue) IssueSnapshot {
 		AcceptanceCriteria: issue.AcceptanceCriteria,
 		Notes:              issue.Notes,
 		Status:             string(issue.Status),
+		IssueType:          string(issue.IssueType),
 		Priority:           issue.Priority,
 		Assignee:           issue.Assignee,
 		Labels:             labels,
 		SourceRepo:         issue.SourceRepo,
+		Comments:           comments,
 	}
 }
 
 // brShowJSON is the struct used to parse `br show --json` output.
 type brShowJSON struct {
-	ID                 string   `json:"id"`
-	Title              string   `json:"title"`
-	Description        string   `json:"description"`
-	Design             string   `json:"design"`
-	AcceptanceCriteria string   `json:"acceptance_criteria"`
-	Notes              string   `json:"notes"`
-	Status             string   `json:"status"`
-	Priority           int      `json:"priority"`
-	Assignee           string   `json:"assignee"`
-	Labels             []string `json:"labels"`
-	SourceRepo         string   `json:"source_repo"`
+	ID                 string           `json:"id"`
+	Title              string           `json:"title"`
+	Description        string           `json:"description"`
+	Design             string           `json:"design"`
+	AcceptanceCriteria string           `json:"acceptance_criteria"`
+	Notes              string           `json:"notes"`
+	Status             string           `json:"status"`
+	IssueType          string           `json:"issue_type"`
+	Priority           int              `json:"priority"`
+	Assignee           string           `json:"assignee"`
+	Labels             []string         `json:"labels"`
+	SourceRepo         string           `json:"source_repo"`
+	Comments           []*model.Comment `json:"comments"`
 }
 
 // SnapshotFromBrJSON parses the JSON output of `br show ID --json`.
@@ -199,10 +212,12 @@ func SnapshotFromBrJSON(jsonStr string) (IssueSnapshot, error) {
 		AcceptanceCriteria: it.AcceptanceCriteria,
 		Notes:              it.Notes,
 		Status:             it.Status,
+		IssueType:          it.IssueType,
 		Priority:           it.Priority,
 		Assignee:           it.Assignee,
 		Labels:             it.Labels,
 		SourceRepo:         it.SourceRepo,
+		Comments:           it.Comments,
 	}, nil
 }
 
@@ -217,6 +232,7 @@ func SnapshotToMarkdown(s IssueSnapshot) string {
 	b.WriteString(fmt.Sprintf("id: %s\n", s.ID))
 	b.WriteString(fmt.Sprintf("title: %s\n", yamlEscapeTitle(s.Title)))
 	b.WriteString(fmt.Sprintf("status: %s\n", s.Status))
+	b.WriteString(fmt.Sprintf("type: %s\n", s.IssueType))
 	b.WriteString(fmt.Sprintf("priority: %d\n", s.Priority))
 	b.WriteString(fmt.Sprintf("assignee: %s\n", s.Assignee))
 	b.WriteString(fmt.Sprintf("labels: %s\n", strings.Join(s.Labels, ", ")))
@@ -231,6 +247,19 @@ func SnapshotToMarkdown(s IssueSnapshot) string {
 	writeSection(&b, "design", s.Design)
 	writeSection(&b, "acceptance_criteria", s.AcceptanceCriteria)
 	writeSection(&b, "notes", s.Notes)
+	for _, comment := range s.Comments {
+		if comment == nil {
+			continue
+		}
+		b.WriteString(fmt.Sprintf("\n<comment date=\"%s\">\n", comment.CreatedAt.Format(time.RFC3339)))
+		if comment.Text != "" {
+			b.WriteString(comment.Text)
+			if !strings.HasSuffix(comment.Text, "\n") {
+				b.WriteString("\n")
+			}
+		}
+		b.WriteString("</comment>\n")
+	}
 
 	return b.String()
 }
@@ -265,13 +294,14 @@ func yamlEscapeTitle(title string) string {
 
 // frontmatterData is used for parsing the YAML frontmatter.
 type frontmatterData struct {
-	ID       string  `yaml:"id"`
-	Title    string  `yaml:"title"`
-	Status   *string `yaml:"status"`
-	Priority *int    `yaml:"priority"`
-	Assignee *string `yaml:"assignee"`
-	Labels   *string `yaml:"labels"`
-	Repo     *string `yaml:"repo"`
+	ID        string  `yaml:"id"`
+	Title     string  `yaml:"title"`
+	Status    *string `yaml:"status"`
+	IssueType *string `yaml:"type"`
+	Priority  *int    `yaml:"priority"`
+	Assignee  *string `yaml:"assignee"`
+	Labels    *string `yaml:"labels"`
+	Repo      *string `yaml:"repo"`
 }
 
 // MarkdownToSnapshot parses a markdown editing file back to an IssueSnapshot.
@@ -306,6 +336,9 @@ func MarkdownToSnapshot(md string) (IssueSnapshot, error) {
 	}
 	if fm.Status != nil {
 		snap.Status = *fm.Status
+	}
+	if fm.IssueType != nil {
+		snap.IssueType = *fm.IssueType
 	}
 	if fm.Priority != nil {
 		snap.Priority = *fm.Priority
@@ -387,6 +420,12 @@ func parseSections(lines []string) map[string]string {
 		}
 
 		// Outside a section: look for an opening tag.
+		if trimmed == "<comment>" || strings.HasPrefix(trimmed, "<comment ") {
+			// Comments are a read-only suffix after <notes>. Ignore the entire
+			// suffix so comment edits (including tag-like text) can never be
+			// interpreted as editable issue fields.
+			break
+		}
 		if strings.HasPrefix(trimmed, "<") && strings.HasSuffix(trimmed, ">") &&
 			!strings.HasPrefix(trimmed, "</") {
 			tag := trimmed[1 : len(trimmed)-1]
@@ -418,6 +457,7 @@ type IssueDiff struct {
 	AcceptanceCriteria *string
 	Notes              *string
 	Status             *string
+	IssueType          *string
 	Priority           *int
 	Assignee           *string
 	Labels             []string // nil = unchanged, non-nil = full replacement
@@ -428,7 +468,7 @@ type IssueDiff struct {
 func (d *IssueDiff) IsEmpty() bool {
 	return d.Title == nil && d.Description == nil && d.Design == nil &&
 		d.AcceptanceCriteria == nil && d.Notes == nil && d.Status == nil &&
-		d.Priority == nil && d.Assignee == nil && d.Labels == nil &&
+		d.IssueType == nil && d.Priority == nil && d.Assignee == nil && d.Labels == nil &&
 		d.SourceRepo == nil
 }
 
@@ -451,6 +491,9 @@ func (d *IssueDiff) FieldCount() int {
 		n++
 	}
 	if d.Status != nil {
+		n++
+	}
+	if d.IssueType != nil {
 		n++
 	}
 	if d.Priority != nil {
@@ -494,6 +537,10 @@ func DiffSnapshots(original, edited IssueSnapshot) IssueDiff {
 	if strings.TrimSpace(original.Status) != strings.TrimSpace(edited.Status) {
 		v := edited.Status
 		d.Status = &v
+	}
+	if strings.TrimSpace(original.IssueType) != strings.TrimSpace(edited.IssueType) {
+		v := edited.IssueType
+		d.IssueType = &v
 	}
 	if original.Priority != edited.Priority {
 		v := edited.Priority
@@ -548,6 +595,9 @@ func BuildUpdateArgv(brPath, issueID string, d *IssueDiff) []string {
 	}
 	if d.Status != nil {
 		argv = append(argv, fmt.Sprintf("--status=%s", *d.Status))
+	}
+	if d.IssueType != nil {
+		argv = append(argv, fmt.Sprintf("--type=%s", *d.IssueType))
 	}
 	if d.Priority != nil {
 		argv = append(argv, fmt.Sprintf("--priority=%d", *d.Priority))
@@ -617,6 +667,11 @@ func SetPriority(brPath, issueID string, priority int) error {
 // SetStatus sets the status of an issue via br update.
 func SetStatus(brPath, issueID, status string) error {
 	return RunBrUpdate([]string{brPath, "update", issueID, fmt.Sprintf("--status=%s", status)})
+}
+
+// SetType sets the type of an issue via br update.
+func SetType(brPath, issueID, issueType string) error {
+	return RunBrUpdate([]string{brPath, "update", issueID, fmt.Sprintf("--type=%s", issueType)})
 }
 
 // SetAssignee sets the assignee of an issue via br update.
@@ -702,6 +757,12 @@ func CollectAssignees(issues []model.Issue, extras []string) []string {
 var KnownStatuses = []string{
 	"open", "in_progress", "blocked", "deferred", "pinned",
 	"hooked", "review", "closed", "tombstone",
+}
+
+// KnownIssueTypes is the preset list shown by the type picker. A selected
+// issue's custom type is appended to a per-picker copy when necessary.
+var KnownIssueTypes = []string{
+	"bug", "chore", "epic", "task", "review", "ofi",
 }
 
 // PriorityLabels for the priority picker.
@@ -799,6 +860,9 @@ func (m Model) tryEditKeyHandler(key string) (Model, tea.Cmd, bool) {
 	case hk.EditStatus:
 		m2, cmd := m.openStatusPicker()
 		return m2, cmd, true
+	case hk.EditType:
+		m2, cmd := m.openTypePicker()
+		return m2, cmd, true
 	case hk.EditAssignee:
 		m2, cmd := m.openAssigneePicker()
 		return m2, cmd, true
@@ -877,6 +941,36 @@ func (m Model) openStatusPicker() (Model, tea.Cmd) {
 	}
 	m.editPicker = NewEditPickerModal("Set Status", KnownStatuses, cursor, issue.ID)
 	m.editPickerKind = editPickerStatus
+	m.showEditPicker = true
+	return m, nil
+}
+
+func (m Model) openTypePicker() (Model, tea.Cmd) {
+	issue := m.getSelectedIssue()
+	if issue == nil {
+		m.statusMsg = "No issue selected"
+		m.statusIsError = true
+		return m, nil
+	}
+
+	items := append([]string(nil), KnownIssueTypes...)
+	current := string(issue.IssueType)
+	cursor := 0
+	found := false
+	for i, issueType := range items {
+		if issueType == current {
+			cursor = i
+			found = true
+			break
+		}
+	}
+	if current != "" && !found {
+		items = append(items, current)
+		cursor = len(items) - 1
+	}
+
+	m.editPicker = NewEditPickerModal("Set Type", items, cursor, issue.ID)
+	m.editPickerKind = editPickerType
 	m.showEditPicker = true
 	return m, nil
 }
@@ -1370,6 +1464,17 @@ func (m Model) handleEditPickerResult() (Model, tea.Cmd) {
 			m.statusMsg = fmt.Sprintf("Setting status %s on %s...", status, issueID)
 			return m, func() tea.Msg {
 				if err := SetStatus(brPath, issueID, status); err != nil {
+					return editErrorMsg{err: err}
+				}
+				return editAppliedMsg{issueID: issueID, nFields: 1}
+			}
+		}
+	case editPickerType:
+		if cursor >= 0 && cursor < len(m.editPicker.Items) {
+			issueType := m.editPicker.Items[cursor]
+			m.statusMsg = fmt.Sprintf("Setting type %s on %s...", issueType, issueID)
+			return m, func() tea.Msg {
+				if err := SetType(brPath, issueID, issueType); err != nil {
 					return editErrorMsg{err: err}
 				}
 				return editAppliedMsg{issueID: issueID, nFields: 1}

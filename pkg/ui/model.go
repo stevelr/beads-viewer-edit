@@ -5465,12 +5465,13 @@ func (m *Model) renderHelpOverlay() string {
 	editSection := []struct{ key, desc string }{
 		{"Ctrl+p", "Set priority"},
 		{"Ctrl+o", "Set status"},
+		{"Ctrl+y", "Set type"},
 		{"Ctrl+a", "Set assignee"},
 		{"Ctrl+t", "Edit title"},
 		{"O", "Edit in editor"},
 		{"Ctrl+n", "New issue"},
 		{"Ctrl+g", "New sub-issue"},
-		{"Ctrl+x", "Add comment"},
+		{"Ctrl+x", "Add comment (editor)"},
 	}
 
 	statusSection := []struct{ key, desc string }{
@@ -7529,10 +7530,11 @@ func (m *Model) updateViewportContent() {
 	sb.WriteString(fmt.Sprintf("# %s %s\n", GetTypeIconMD(string(item.IssueType)), item.Title))
 
 	// Meta Table
-	sb.WriteString("| ID | Status | Priority | Assignee | Created |\n|---|---|---|---|---|\n")
-	sb.WriteString(fmt.Sprintf("| **%s** | **%s** | %s | @%s | %s |\n\n",
+	sb.WriteString("| ID | Status | Type | Priority | Assignee | Created |\n|---|---|---|---|---|---|\n")
+	sb.WriteString(fmt.Sprintf("| **%s** | **%s** | %s | %s | @%s | %s |\n\n",
 		item.ID,
 		strings.ToUpper(string(item.Status)),
+		item.IssueType,
 		GetPriorityIcon(item.Priority),
 		item.Assignee,
 		item.CreatedAt.Format("2006-01-02"),

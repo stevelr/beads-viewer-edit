@@ -117,9 +117,9 @@ const contextHelpList = `## List View
 **Actions**
   U         Self-update bv
   V         Preview cass sessions
-  Ctrl+p/o/a Set priority/status/assignee
+  Ctrl+p/o/y/a Set priority/status/type/assignee
   Ctrl+t    Edit title │ O  Edit issue
-  Ctrl+n/g  New issue/sub │ Ctrl+x  Comment`
+  Ctrl+n/g  New issue/sub │ Ctrl+x  Comment (editor)`
 
 const contextHelpGraph = `## Graph View
 
@@ -166,7 +166,7 @@ const contextHelpBoard = `## Board View
   Enter     View issue details
   Esc       Return to List view
 
-**Edit** Ctrl+p/o/a/t O Ctrl+n/g/x`
+**Edit** Ctrl+p/o/y/a/t O Ctrl+n/g/x (comment editor)`
 
 const contextHelpInsights = `## Insights Panel
 

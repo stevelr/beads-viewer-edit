@@ -15,6 +15,7 @@ const (
 	editPickerPriority editPickerKind = iota
 	editPickerStatus
 	editPickerAssignee
+	editPickerType
 )
 
 // EditPickerResult tracks the modal state.

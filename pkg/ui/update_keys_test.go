@@ -1,12 +1,50 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/version"
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+func TestDetailMetadataShowsTypeBetweenStatusAndPriority(t *testing.T) {
+	m := NewModel([]model.Issue{{
+		ID: "BD-1", Title: "Review me", Status: model.StatusOpen,
+		IssueType: model.IssueType("review"), Priority: 2, Assignee: "alice",
+	}}, nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = updated.(Model)
+	m.updateViewportContent()
+	detail := m.viewport.View()
+
+	statusPos := strings.Index(detail, "Status")
+	typePos := strings.Index(detail, "Type")
+	priorityPos := strings.Index(detail, "Priority")
+	if statusPos < 0 || typePos < 0 || priorityPos < 0 {
+		t.Fatalf("detail metadata headings missing: %q", detail)
+	}
+	if !(statusPos < typePos && typePos < priorityPos) {
+		t.Fatalf("metadata order is not Status, Type, Priority: %q", detail)
+	}
+	if !strings.Contains(detail, "review") {
+		t.Fatalf("detail does not show issue type: %q", detail)
+	}
+}
+
+func TestEditHelpIncludesTypeAndCommentHotkeys(t *testing.T) {
+	m := NewModel(nil, nil, "")
+	m.width = 120
+	m.height = 40
+	help := m.renderHelpOverlay()
+	if !strings.Contains(help, "Ctrl+y") || !strings.Contains(help, "Set type") {
+		t.Fatalf("edit help missing type hotkey: %q", help)
+	}
+	if !strings.Contains(help, "Ctrl+x") || !strings.Contains(help, "Add comment (editor)") {
+		t.Fatalf("edit help missing comment hotkey: %q", help)
+	}
+}
 
 // Cover additional branches in Model.Update for quit/help/tab handling and update notices.
 func TestUpdateHelpQuitAndTabFocus(t *testing.T) {

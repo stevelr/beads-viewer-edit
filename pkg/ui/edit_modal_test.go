@@ -166,6 +166,9 @@ func TestEditPickerKindConstants(t *testing.T) {
 	if editPickerStatus == editPickerAssignee {
 		t.Error("status == assignee")
 	}
+	if editPickerType == editPickerPriority || editPickerType == editPickerStatus || editPickerType == editPickerAssignee {
+		t.Error("type picker kind must be distinct")
+	}
 }
 
 func TestPickerResultConstants(t *testing.T) {

@@ -325,6 +325,8 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"'", "Recipe picker", "Actions", "list"},
 		{"U", "Self-update check", "Actions", "all"},
 		{"V", "Cass sessions", "Actions", "list"},
+		{"ctrl+y", "Set issue type", "Edit", "list,detail,board"},
+		{"ctrl+x", "Add comment (editor)", "Edit", "list,detail,board"},
 
 		// Graph View
 		{"hjkl", "Navigate graph", "Graph", "graph"},

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
@@ -21,6 +22,9 @@ func TestDefaultEditConfig(t *testing.T) {
 	}
 	if cfg.Hotkeys.EditPriority != "ctrl+p" {
 		t.Errorf("EditPriority = %q, want %q", cfg.Hotkeys.EditPriority, "ctrl+p")
+	}
+	if cfg.Hotkeys.EditType != "ctrl+y" {
+		t.Errorf("EditType = %q, want %q", cfg.Hotkeys.EditType, "ctrl+y")
 	}
 	if cfg.Hotkeys.OpenEditor != "O" {
 		t.Errorf("OpenEditor = %q, want %q", cfg.Hotkeys.OpenEditor, "O")
@@ -49,6 +53,9 @@ func TestLoadEditConfig_Defaults(t *testing.T) {
 	}
 	if cfg.Hotkeys.EditStatus != "ctrl+o" {
 		t.Errorf("EditStatus = %q, want %q", cfg.Hotkeys.EditStatus, "ctrl+o")
+	}
+	if cfg.Hotkeys.EditType != "ctrl+y" {
+		t.Errorf("EditType = %q, want fallback %q", cfg.Hotkeys.EditType, "ctrl+y")
 	}
 }
 
@@ -109,10 +116,12 @@ func TestSnapshotFromIssue(t *testing.T) {
 		AcceptanceCriteria: "Criteria",
 		Notes:              "Some notes",
 		Status:             model.StatusOpen,
+		IssueType:          model.TypeBug,
 		Priority:           2,
 		Assignee:           "alice",
 		Labels:             []string{"bug", "ux"},
 		SourceRepo:         "my-repo",
+		Comments:           []*model.Comment{{Text: "existing"}},
 	}
 	snap := SnapshotFromIssue(issue)
 	if snap.ID != "BD-123" {
@@ -127,6 +136,12 @@ func TestSnapshotFromIssue(t *testing.T) {
 	if snap.Priority != 2 {
 		t.Errorf("Priority = %d", snap.Priority)
 	}
+	if snap.IssueType != "bug" {
+		t.Errorf("IssueType = %q", snap.IssueType)
+	}
+	if len(snap.Comments) != 1 || snap.Comments[0].Text != "existing" {
+		t.Errorf("Comments = %#v", snap.Comments)
+	}
 	if len(snap.Labels) != 2 || snap.Labels[0] != "bug" {
 		t.Errorf("Labels = %v", snap.Labels)
 	}
@@ -138,7 +153,7 @@ func TestSnapshotFromIssue(t *testing.T) {
 }
 
 func TestSnapshotFromBrJSON_Object(t *testing.T) {
-	json := `{"id":"BD-1","title":"Test","status":"open","priority":1,"assignee":"bob","labels":["a","b"]}`
+	json := `{"id":"BD-1","title":"Test","status":"open","issue_type":"ofi","priority":1,"assignee":"bob","labels":["a","b"],"comments":[{"id":"c1","issue_id":"BD-1","author":"bob","text":"hello","created_at":"2026-08-06T12:34:56Z"}]}`
 	snap, err := SnapshotFromBrJSON(json)
 	if err != nil {
 		t.Fatal(err)
@@ -151,6 +166,9 @@ func TestSnapshotFromBrJSON_Object(t *testing.T) {
 	}
 	if len(snap.Labels) != 2 {
 		t.Errorf("Labels = %v", snap.Labels)
+	}
+	if snap.IssueType != "ofi" || len(snap.Comments) != 1 || snap.Comments[0].Text != "hello" {
+		t.Errorf("type/comments not parsed: %#v", snap)
 	}
 }
 
@@ -189,6 +207,7 @@ func TestSnapshotToMarkdown(t *testing.T) {
 		ID:                 "BD-42",
 		Title:              "Fix the widget",
 		Status:             "open",
+		IssueType:          "bug",
 		Priority:           2,
 		Assignee:           "alice",
 		Labels:             []string{"bug", "ux"},
@@ -197,6 +216,10 @@ func TestSnapshotToMarkdown(t *testing.T) {
 		AcceptanceCriteria: "Widget works.",
 		Notes:              "See also BD-456.",
 		SourceRepo:         "my-repo",
+		Comments: []*model.Comment{
+			{Text: "First comment", CreatedAt: time.Date(2026, time.August, 6, 12, 34, 56, 0, time.UTC)},
+			{Text: "Second\ncomment", CreatedAt: time.Date(2026, time.August, 7, 1, 2, 3, 0, time.FixedZone("offset", -7*60*60))},
+		},
 	}
 	md := SnapshotToMarkdown(snap)
 
@@ -209,6 +232,9 @@ func TestSnapshotToMarkdown(t *testing.T) {
 	}
 	if !strings.Contains(md, "priority: 2") {
 		t.Error("missing priority field")
+	}
+	if !strings.Contains(md, "status: open\ntype: bug\npriority: 2") {
+		t.Error("missing type field in expected frontmatter order")
 	}
 	if !strings.Contains(md, "labels: bug, ux") {
 		t.Error("missing labels field")
@@ -232,6 +258,17 @@ func TestSnapshotToMarkdown(t *testing.T) {
 	}
 	if !strings.Contains(md, "</notes>") {
 		t.Error("missing </notes> tag")
+	}
+	firstComment := `<comment date="2026-08-06T12:34:56Z">`
+	secondComment := `<comment date="2026-08-07T01:02:03-07:00">`
+	if !strings.Contains(md, firstComment) || !strings.Contains(md, secondComment) {
+		t.Errorf("missing RFC3339 comment tags: %s", md)
+	}
+	if strings.Index(md, firstComment) < strings.Index(md, "</notes>") {
+		t.Error("comments must be exported after notes")
+	}
+	if !strings.Contains(md, "Second\ncomment\n</comment>") {
+		t.Error("multiline comment text was not preserved")
 	}
 }
 
@@ -271,6 +308,7 @@ func TestMarkdownToSnapshot(t *testing.T) {
 id: BD-42
 title: Fix the widget
 status: open
+type: review
 priority: 2
 assignee: alice
 labels: bug, ux
@@ -305,6 +343,9 @@ See also BD-456.
 	}
 	if snap.Status != "open" {
 		t.Errorf("Status = %q", snap.Status)
+	}
+	if snap.IssueType != "review" {
+		t.Errorf("IssueType = %q", snap.IssueType)
 	}
 	if snap.Priority != 2 {
 		t.Errorf("Priority = %d", snap.Priority)
@@ -370,6 +411,48 @@ Works fine.
 	}
 	if !strings.Contains(snap.Description, "The cog is broken.") {
 		t.Errorf("Description lost content after heading, got: %q", snap.Description)
+	}
+}
+
+func TestMarkdownToSnapshot_IgnoresCommentBodies(t *testing.T) {
+	md := `---
+id: BD-1
+title: Keep fields
+status: open
+type: docs
+priority: 2
+---
+
+<description>
+Real description.
+</description>
+
+<notes>
+Real notes.
+</notes>
+
+<comment date="2026-08-06T12:34:56Z">
+Edited comment text must be ignored.
+</comment>
+<description>
+This must not replace the real description.
+</description>
+<notes>
+This must not replace the real notes.
+</notes>
+`
+	snap, err := MarkdownToSnapshot(md)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Description != "Real description." {
+		t.Errorf("comment body affected description: %q", snap.Description)
+	}
+	if snap.Notes != "Real notes." {
+		t.Errorf("comment body affected notes: %q", snap.Notes)
+	}
+	if snap.IssueType != "docs" {
+		t.Errorf("IssueType = %q", snap.IssueType)
 	}
 }
 
@@ -479,13 +562,15 @@ func TestDiffSnapshots_NoChanges(t *testing.T) {
 func TestDiffSnapshots_AllChanged(t *testing.T) {
 	orig := IssueSnapshot{
 		ID: "BD-1", Title: "Old", Status: "open", Priority: 2,
-		Assignee: "alice", Labels: []string{"a"}, Description: "old desc",
+		IssueType: "task",
+		Assignee:  "alice", Labels: []string{"a"}, Description: "old desc",
 		Design: "old design", AcceptanceCriteria: "old ac", Notes: "old notes",
 		SourceRepo: "repo1",
 	}
 	edited := IssueSnapshot{
 		ID: "BD-1", Title: "New", Status: "closed", Priority: 0,
-		Assignee: "bob", Labels: []string{"b", "c"}, Description: "new desc",
+		IssueType: "bug",
+		Assignee:  "bob", Labels: []string{"b", "c"}, Description: "new desc",
 		Design: "new design", AcceptanceCriteria: "new ac", Notes: "new notes",
 		SourceRepo: "repo2",
 	}
@@ -493,14 +578,17 @@ func TestDiffSnapshots_AllChanged(t *testing.T) {
 	if d.IsEmpty() {
 		t.Error("diff should not be empty")
 	}
-	if d.FieldCount() != 10 {
-		t.Errorf("FieldCount = %d, want 10", d.FieldCount())
+	if d.FieldCount() != 11 {
+		t.Errorf("FieldCount = %d, want 11", d.FieldCount())
 	}
 	if d.Title == nil || *d.Title != "New" {
 		t.Errorf("Title diff = %v", d.Title)
 	}
 	if d.Priority == nil || *d.Priority != 0 {
 		t.Errorf("Priority diff = %v", d.Priority)
+	}
+	if d.IssueType == nil || *d.IssueType != "bug" {
+		t.Errorf("IssueType diff = %v", d.IssueType)
 	}
 	if d.Labels == nil || len(d.Labels) != 2 {
 		t.Errorf("Labels diff = %v", d.Labels)
@@ -551,6 +639,7 @@ func TestBuildUpdateArgv_AllFields(t *testing.T) {
 	ac := "New AC"
 	notes := "New Notes"
 	status := "closed"
+	issueType := "review"
 	priority := 1
 	assignee := "bob"
 	d := &IssueDiff{
@@ -560,6 +649,7 @@ func TestBuildUpdateArgv_AllFields(t *testing.T) {
 		AcceptanceCriteria: &ac,
 		Notes:              &notes,
 		Status:             &status,
+		IssueType:          &issueType,
 		Priority:           &priority,
 		Assignee:           &assignee,
 		Labels:             []string{"bug", "ux"},
@@ -582,6 +672,7 @@ func TestBuildUpdateArgv_AllFields(t *testing.T) {
 		"--acceptance-criteria=New AC",
 		"--notes=New Notes",
 		"--status=closed",
+		"--type=review",
 		"--priority=1",
 		"--assignee=bob",
 		"--set-labels=bug",
@@ -951,6 +1042,57 @@ func TestKnownStatuses(t *testing.T) {
 	}
 	if KnownStatuses[8] != "tombstone" {
 		t.Errorf("last status = %q", KnownStatuses[8])
+	}
+}
+
+func TestOpenTypePicker_CustomTypeIsPerIssue(t *testing.T) {
+	presets := append([]string(nil), KnownIssueTypes...)
+	m := NewModel([]model.Issue{{
+		ID: "BD-1", Title: "Docs", Status: model.StatusOpen, IssueType: model.IssueType("docs"),
+	}}, nil, "")
+	m.focused = focusList
+
+	updated, cmd := m.openTypePicker()
+	if cmd != nil {
+		t.Fatal("type picker should not start a command")
+	}
+	if !updated.showEditPicker || updated.editPickerKind != editPickerType {
+		t.Fatal("type picker was not opened")
+	}
+	if got := updated.editPicker.Items[len(updated.editPicker.Items)-1]; got != "docs" {
+		t.Fatalf("custom current type = %q, want docs", got)
+	}
+	if updated.editPicker.Cursor != len(updated.editPicker.Items)-1 {
+		t.Fatalf("cursor = %d, want custom item", updated.editPicker.Cursor)
+	}
+	if len(KnownIssueTypes) != len(presets) {
+		t.Fatalf("preset list mutated: %v", KnownIssueTypes)
+	}
+	for i := range presets {
+		if KnownIssueTypes[i] != presets[i] {
+			t.Fatalf("preset list mutated: %v", KnownIssueTypes)
+		}
+	}
+
+	presetModel := NewModel([]model.Issue{{
+		ID: "BD-2", Title: "Task", Status: model.StatusOpen, IssueType: model.TypeTask,
+	}}, nil, "")
+	presetModel.focused = focusList
+	presetUpdated, _ := presetModel.openTypePicker()
+	if len(presetUpdated.editPicker.Items) != len(presets) {
+		t.Fatalf("custom type leaked to another picker: %v", presetUpdated.editPicker.Items)
+	}
+}
+
+func TestKnownIssueTypes(t *testing.T) {
+	want := []string{"bug", "chore", "epic", "task", "review", "ofi"}
+	if len(KnownIssueTypes) != len(want) {
+		t.Fatalf("KnownIssueTypes = %v", KnownIssueTypes)
+	}
+	for i := range want {
+		if KnownIssueTypes[i] != want[i] {
+			t.Fatalf("KnownIssueTypes = %v", KnownIssueTypes)
+		}
 	}
 }
 
