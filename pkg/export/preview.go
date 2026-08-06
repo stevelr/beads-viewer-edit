@@ -53,9 +53,18 @@ func (p *PreviewServer) Start() error {
 	mux.HandleFunc("/__preview__/status", p.statusHandler)
 
 	p.server = &http.Server{
-		Addr:    fmt.Sprintf("127.0.0.1:%d", p.port),
-		Handler: mux,
+		Addr:              fmt.Sprintf("127.0.0.1:%d", p.port),
+		Handler:           mux,
+		ReadTimeout:       10 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
+
+	listener, err := net.Listen("tcp", p.server.Addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", p.server.Addr, err)
+	}
+	defer listener.Close()
 
 	// Open browser after short delay
 	go func() {
@@ -71,7 +80,7 @@ func (p *PreviewServer) Start() error {
 	fmt.Printf("Serving: %s\n", p.bundlePath)
 	fmt.Println("\nPress Ctrl+C to stop")
 
-	return p.server.ListenAndServe()
+	return p.server.Serve(listener)
 }
 
 // StartWithGracefulShutdown starts the server with signal handling for clean shutdown.
@@ -365,6 +374,12 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 
 	// Create server
 	server := NewPreviewServer(config.BundlePath, port)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", addr, err)
+	}
+	defer listener.Close()
 
 	// Need to initialize the server first
 	mux := http.NewServeMux()
@@ -404,8 +419,11 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 	server.liveReloadHub = liveReloadHub
 
 	server.server = &http.Server{
-		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
-		Handler: mux,
+		Addr:              addr,
+		Handler:           mux,
+		ReadTimeout:       10 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// Handle opening browser
@@ -442,7 +460,7 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 
 	// Start server in goroutine
 	go func() {
-		if err := server.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errChan <- err
 		}
 	}()

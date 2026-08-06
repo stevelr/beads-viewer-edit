@@ -4,6 +4,7 @@ package correlation
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os/exec"
@@ -23,6 +24,17 @@ type StreamExtractor struct {
 	repoPath   string
 	beadsFiles []string
 	progressCB ProgressCallback
+
+	// ctx, when set via WithContext, bounds the git subprocesses spawned by
+	// the extractor (issue #166). nil means context.Background().
+	ctx context.Context
+}
+
+// WithContext binds ctx to the extractor so its git subprocesses are
+// cancelled when ctx is done (issue #166). Returns the receiver for chaining.
+func (s *StreamExtractor) WithContext(ctx context.Context) *StreamExtractor {
+	s.ctx = ctx
+	return s
 }
 
 // NewStreamExtractor creates a new streaming extractor
@@ -133,7 +145,7 @@ func (s *StreamExtractor) countCommits(opts StreamOptions) (int, error) {
 		args = insertBefore(args, "--", fmt.Sprintf("--until=%s", opts.Until.Format(time.RFC3339)))
 	}
 
-	cmd := exec.Command("git", args...)
+	cmd := gitCommand(s.ctx, args...)
 	cmd.Dir = s.repoPath
 
 	out, err := cmd.Output()
@@ -170,7 +182,7 @@ func (s *StreamExtractor) buildStreamCommand(opts StreamOptions, limit int) *exe
 	// Use primary beads file
 	args = append(args, s.primaryBeadsFile())
 
-	cmd := exec.Command("git", withNoColorGit(args)...)
+	cmd := gitCommand(s.ctx, withNoColorGit(args)...)
 	cmd.Dir = s.repoPath
 	return cmd
 }
@@ -361,6 +373,17 @@ type BatchFileStatsExtractor struct {
 	batchSize int
 	mu        sync.Mutex
 	cache     map[string][]FileChange
+
+	// ctx, when set via WithContext, bounds the git subprocesses spawned by
+	// the extractor (issue #166). nil means context.Background().
+	ctx context.Context
+}
+
+// WithContext binds ctx to the extractor so its git subprocesses are
+// cancelled when ctx is done (issue #166). Returns the receiver for chaining.
+func (b *BatchFileStatsExtractor) WithContext(ctx context.Context) *BatchFileStatsExtractor {
+	b.ctx = ctx
+	return b
 }
 
 // NewBatchFileStatsExtractor creates a new batch extractor
@@ -468,7 +491,7 @@ func (b *BatchFileStatsExtractor) extractBatchFiles(shas []string) (map[string][
 	args := []string{"log", "--name-status", "--format=%H", "--no-walk"}
 	args = append(args, shas...)
 
-	cmd := exec.Command("git", args...)
+	cmd := gitCommand(b.ctx, args...)
 	cmd.Dir = b.repoPath
 
 	out, err := cmd.Output()

@@ -87,6 +87,7 @@ case "$1" in
        exit 0
     elif echo "$*" | grep -q "repos/.*/contents"; then
        # RepoHasContent check - return 404/empty to simulate empty repo
+       echo "gh: Not Found (HTTP 404)"
        exit 1
     fi
     ;;

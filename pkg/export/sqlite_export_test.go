@@ -198,6 +198,66 @@ func TestExport_MaterializedView(t *testing.T) {
 	}
 }
 
+// TestExport_RichTextFieldsRoundTrip guards against the #170 regression where
+// notes (and the sibling design / acceptance_criteria fields) were silently
+// dropped from the static-site export — they were never written to the issues
+// table nor surfaced in issue_overview_mv, so the web UI could never display
+// them. The web viewer reads a single issue via `SELECT * FROM issue_overview_mv`,
+// so we assert these fields round-trip through the materialized view (not just
+// the base table).
+func TestExport_RichTextFieldsRoundTrip(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	now := time.Now()
+	issues := []*model.Issue{
+		{
+			ID:                 "rich-1",
+			Title:              "Issue with rich text",
+			Description:        "The description.",
+			Design:             "The design notes.",
+			AcceptanceCriteria: "The acceptance criteria.",
+			Notes:              "The notes that must be visible in the web UI.",
+			Status:             model.StatusOpen,
+			Priority:           1,
+			IssueType:          model.TypeTask,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+		},
+	}
+
+	exp := NewSQLiteExporter(issues, nil, nil, nil)
+	if err := exp.Export(tmpDir); err != nil {
+		t.Fatalf("Export failed: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", filepath.Join(tmpDir, "beads.sqlite3"))
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// The web UI's getIssue() runs `SELECT * FROM issue_overview_mv`, so the
+	// rich-text fields must be present in the materialized view to be displayed.
+	var design, acceptance, notes string
+	err = db.QueryRow(
+		`SELECT design, acceptance_criteria, notes FROM issue_overview_mv WHERE id = ?`,
+		"rich-1",
+	).Scan(&design, &acceptance, &notes)
+	if err != nil {
+		t.Fatalf("Query rich-text fields from materialized view failed: %v", err)
+	}
+
+	if design != "The design notes." {
+		t.Errorf("design not exported: got %q", design)
+	}
+	if acceptance != "The acceptance criteria." {
+		t.Errorf("acceptance_criteria not exported: got %q", acceptance)
+	}
+	if notes != "The notes that must be visible in the web UI." {
+		t.Errorf("notes not exported (regression of #170): got %q", notes)
+	}
+}
+
 func TestExport_ChunkConfigCreated(t *testing.T) {
 	tmpDir := t.TempDir()
 

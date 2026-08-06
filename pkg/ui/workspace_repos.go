@@ -4,7 +4,19 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+func normalizeRepoKey(raw string) string {
+	key := strings.TrimSpace(raw)
+	key = strings.TrimRight(key, "-:_")
+	key = strings.ToLower(key)
+	if key == "" || key == "." || strings.ContainsAny(key, `/\`) {
+		return ""
+	}
+	return key
+}
 
 // normalizeRepoPrefixes normalizes workspace repo prefixes (e.g., "api-" -> "api")
 // for display and interactive filtering.
@@ -16,9 +28,7 @@ func normalizeRepoPrefixes(prefixes []string) []string {
 	seen := make(map[string]bool, len(prefixes))
 	var out []string
 	for _, raw := range prefixes {
-		p := strings.TrimSpace(raw)
-		p = strings.TrimRight(p, "-:_")
-		p = strings.ToLower(p)
+		p := normalizeRepoKey(raw)
 		if p == "" {
 			continue
 		}
@@ -30,6 +40,13 @@ func normalizeRepoPrefixes(prefixes []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func issueRepoKey(issue model.Issue) string {
+	if key := normalizeRepoKey(issue.SourceRepo); key != "" {
+		return key
+	}
+	return normalizeRepoKey(ExtractRepoPrefix(issue.ID))
 }
 
 func sortedRepoKeys(selected map[string]bool) []string {

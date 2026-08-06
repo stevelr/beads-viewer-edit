@@ -11,27 +11,27 @@ import (
 
 // BlurbVersion is the current version of the agent instructions blurb.
 // Increment this when making breaking changes to the blurb format.
-const BlurbVersion = 2
+const BlurbVersion = 3
 
 // BlurbStartMarker marks the beginning of injected agent instructions.
-const BlurbStartMarker = "<!-- bv-agent-instructions-v2 -->"
+const BlurbStartMarker = "<!-- bv-agent-instructions-v3 -->"
 
 // BlurbEndMarker marks the end of injected agent instructions.
 const BlurbEndMarker = "<!-- end-bv-agent-instructions -->"
 
 // AgentBlurb contains the instructions to be appended to AGENTS.md files.
-// This is the v2 blurb that combines br workflow commands with bv robot triage.
-const AgentBlurb = `<!-- bv-agent-instructions-v2 -->
+// This is the v3 blurb that combines br workflow commands with bv robot triage.
+const AgentBlurb = `<!-- bv-agent-instructions-v3 -->
 
 ---
 
 ## Beads Workflow Integration
 
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (` + "`" + `br` + "`" + `) for issue tracking and [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) (` + "`" + `bv` + "`" + `) for graph-aware triage. Issues are stored in ` + "`" + `.beads/` + "`" + ` and tracked in git.
+This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (` + "`" + `br` + "`" + `) for issue tracking and [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) (` + "`" + `bv` + "`" + `) for graph-aware triage. Issues are stored in ` + "`" + `.beads/` + "`" + ` and tracked in git. Current ` + "`" + `br` + "`" + ` workspaces normally export ` + "`" + `.beads/issues.jsonl` + "`" + `; older ` + "`" + `bd` + "`" + `/legacy workspaces may use ` + "`" + `.beads/beads.jsonl` + "`" + `. ` + "`" + `bv` + "`" + ` auto-discovers the supported JSONL files, so agents should use ` + "`" + `br` + "`" + `/` + "`" + `bv` + "`" + ` commands instead of hard-coding a single filename.
 
 ### Using bv as an AI sidecar
 
-bv is a graph-aware triage engine for Beads projects (.beads/beads.jsonl). Instead of parsing JSONL or hallucinating graph traversal, use robot flags for deterministic, dependency-aware outputs with precomputed metrics (PageRank, betweenness, critical path, cycles, HITS, eigenvector, k-core).
+bv is a graph-aware triage engine for Beads projects. Instead of parsing .beads/issues.jsonl / .beads/beads.jsonl directly or hallucinating graph traversal, use robot flags for deterministic, dependency-aware outputs with precomputed metrics (PageRank, betweenness, critical path, cycles, HITS, eigenvector, k-core).
 
 **Scope boundary:** bv handles *what to work on* (triage, priority, planning). ` + "`" + `br` + "`" + ` handles creating, modifying, and closing beads.
 
@@ -81,40 +81,34 @@ bv --recipe high-impact --robot-triage       # Pre-filter: top PageRank scores
 ### br Commands for Issue Management
 
 ` + "```" + `bash
-br ready              # Show issues ready to work (no blockers)
-br list --status=open # All open issues
-br show <id>          # Full issue details with dependencies
-br create --title="..." --type=task --priority=2
-br update <id> --status=in_progress
-br close <id> --reason="Completed"
-br close <id1> <id2>  # Close multiple issues at once
-br sync --flush-only  # Export DB to JSONL
+br ready --json                       # Show issues ready to work (no blockers)
+br list --status=open --json          # All open issues
+br show <id> --json                   # Full issue details with dependencies
+br create --title="..." --type=task --priority=2 --json
+br update <id> --status=in_progress --json
+br close <id> --reason="Completed" --json
+br close <id1> <id2> --reason="Completed" --json
+br sync --flush-only                  # Export DB to JSONL after Beads mutations
 ` + "```" + `
 
 ### Workflow Pattern
 
 1. **Triage**: Run ` + "`" + `bv --robot-triage` + "`" + ` to find the highest-impact actionable work
-2. **Claim**: Use ` + "`" + `br update <id> --status=in_progress` + "`" + `
+2. **Claim**: Use ` + "`" + `br update <id> --status=in_progress --json` + "`" + `
 3. **Work**: Implement the task
-4. **Complete**: Use ` + "`" + `br close <id>` + "`" + `
-5. **Sync**: Always run ` + "`" + `br sync --flush-only` + "`" + ` at session end
+4. **Complete**: Use ` + "`" + `br close <id> --reason="Completed" --json` + "`" + `
+5. **Sync**: Run ` + "`" + `br sync --flush-only` + "`" + ` after Beads mutations so the JSONL export is current
 
 ### Key Concepts
 
-- **Dependencies**: Issues can block other issues. ` + "`" + `br ready` + "`" + ` shows only unblocked work.
+- **Dependencies**: Issues can block other issues. ` + "`" + `br ready --json` + "`" + ` shows only unblocked work.
 - **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers 0-4, not words)
 - **Types**: task, bug, feature, epic, chore, docs, question
 - **Blocking**: ` + "`" + `br dep add <issue> <depends-on>` + "`" + ` to add dependencies
 
-### Session Protocol
+### Git Policy
 
-` + "```" + `bash
-git status              # Check what changed
-git add <files>         # Stage code changes
-br sync --flush-only    # Export beads changes to JSONL
-git commit -m "..."     # Commit everything
-git push                # Push to remote
-` + "```" + `
+` + "`" + `br` + "`" + ` never commits or pushes. Follow this repository's own git instructions before staging, committing, or pushing. If the repository says "commit only when asked," that rule overrides any generic workflow advice.
 
 <!-- end-bv-agent-instructions -->`
 

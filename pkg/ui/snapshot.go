@@ -636,7 +636,7 @@ func resetIssueItemForSnapshot(item *IssueItem, issue model.Issue, stats *analys
 		item.GraphScore = 0
 		item.Impact = 0
 	}
-	item.RepoPrefix = ExtractRepoPrefix(issue.ID)
+	item.RepoPrefix = issueRepoKey(issue)
 	item.DiffStatus = DiffStatusNone
 
 	item.SearchScore = 0

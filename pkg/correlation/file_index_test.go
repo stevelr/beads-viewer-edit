@@ -1140,3 +1140,155 @@ func TestGetRelatedFilesLimit(t *testing.T) {
 		t.Errorf("Expected at most 2 related files due to limit, got %d", len(result.RelatedFiles))
 	}
 }
+
+// tombstoneAgreementReport builds a report where three tombstoned beads and no
+// live beads touch AGENTS.md via correlated commits — the exact shape behind
+// issue #184, where --robot-file-hotspots reported 3 beads for a path while
+// --robot-file-beads reported 0 and --robot-impact said "safe to proceed".
+func tombstoneAgreementReport(now time.Time) *HistoryReport {
+	mkHistory := func(id, status, sha string) BeadHistory {
+		return BeadHistory{
+			BeadID: id,
+			Title:  "Bead " + id,
+			Status: status,
+			Commits: []CorrelatedCommit{
+				{
+					SHA:       sha,
+					ShortSHA:  sha,
+					Timestamp: now,
+					Files:     []FileChange{{Path: "AGENTS.md", Insertions: 1}},
+				},
+			},
+		}
+	}
+	return &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"bv-t1": mkHistory("bv-t1", "tombstone", "sha1"),
+			"bv-t2": mkHistory("bv-t2", "tombstone", "sha2"),
+			"bv-t3": mkHistory("bv-t3", "tombstone", "sha3"),
+		},
+		CommitIndex: CommitIndex{
+			"sha1": {"bv-t1"},
+			"sha2": {"bv-t2"},
+			"sha3": {"bv-t3"},
+		},
+	}
+}
+
+// TestFileSurfacesAgree_TombstoneOnly locks in the #184 fix: when every bead
+// touching a file is tombstoned, hotspots, per-file lookup, impact analysis,
+// and the index stats must all agree that zero beads touch the file.
+func TestFileSurfacesAgree_TombstoneOnly(t *testing.T) {
+	lookup := NewFileLookup(tombstoneAgreementReport(time.Now()))
+
+	hotspots := lookup.GetHotspots(10)
+	if len(hotspots) != 0 {
+		t.Errorf("Expected no hotspots when all beads are tombstoned, got %+v", hotspots)
+	}
+
+	stats := lookup.GetStats()
+	if stats.TotalFiles != 0 || stats.TotalBeadLinks != 0 || stats.FilesWithMultipleBeads != 0 {
+		t.Errorf("Expected empty stats when all beads are tombstoned, got %+v", stats)
+	}
+
+	fileResult := lookup.LookupByFile("AGENTS.md")
+	if fileResult.TotalBeads != 0 {
+		t.Errorf("Expected 0 beads from LookupByFile, got %d", fileResult.TotalBeads)
+	}
+
+	impact := lookup.ImpactAnalysis([]string{"AGENTS.md"})
+	if len(impact.AffectedBeads) != 0 || impact.RiskLevel != "low" {
+		t.Errorf("Expected no affected beads / low risk, got %+v", impact)
+	}
+}
+
+// TestFileSurfacesAgree_MixedStatuses verifies that hotspot bead counts equal
+// the LookupByFile bead counts for the same path when open, closed, and
+// tombstoned beads are mixed (with case/whitespace variance in statuses).
+func TestFileSurfacesAgree_MixedStatuses(t *testing.T) {
+	now := time.Now()
+	mkHistory := func(id, status, sha string) BeadHistory {
+		return BeadHistory{
+			BeadID: id,
+			Title:  "Bead " + id,
+			Status: status,
+			Commits: []CorrelatedCommit{
+				{
+					SHA:       sha,
+					ShortSHA:  sha,
+					Timestamp: now,
+					Files:     []FileChange{{Path: "pkg/core/engine.go", Insertions: 1}},
+				},
+			},
+		}
+	}
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"bv-open":   mkHistory("bv-open", "open", "s1"),
+			"bv-closed": mkHistory("bv-closed", "Closed ", "s2"), // case+space variance
+			"bv-tomb":   mkHistory("bv-tomb", "tombstone", "s3"),
+		},
+		CommitIndex: CommitIndex{
+			"s1": {"bv-open"},
+			"s2": {"bv-closed"},
+			"s3": {"bv-tomb"},
+		},
+	}
+
+	lookup := NewFileLookup(report)
+
+	hotspots := lookup.GetHotspots(10)
+	if len(hotspots) != 1 {
+		t.Fatalf("Expected 1 hotspot, got %+v", hotspots)
+	}
+	hs := hotspots[0]
+	if hs.TotalBeads != 2 || hs.OpenBeads != 1 || hs.ClosedBeads != 1 {
+		t.Errorf("Expected hotspot total=2 open=1 closed=1, got %+v", hs)
+	}
+
+	fileResult := lookup.LookupByFile("pkg/core/engine.go")
+	if fileResult.TotalBeads != hs.TotalBeads {
+		t.Errorf("Hotspots (%d) and LookupByFile (%d) disagree on bead count", hs.TotalBeads, fileResult.TotalBeads)
+	}
+	if len(fileResult.OpenBeads) != hs.OpenBeads || len(fileResult.ClosedBeads) != hs.ClosedBeads {
+		t.Errorf("Open/closed split disagrees: hotspot %+v vs lookup open=%d closed=%d",
+			hs, len(fileResult.OpenBeads), len(fileResult.ClosedBeads))
+	}
+
+	stats := lookup.GetStats()
+	if stats.TotalBeadLinks != 2 {
+		t.Errorf("Expected stats.TotalBeadLinks=2 (tombstone excluded), got %d", stats.TotalBeadLinks)
+	}
+}
+
+// TestGetHotspots_DeterministicTieBreak verifies stable path ordering when
+// bead counts tie.
+func TestGetHotspots_DeterministicTieBreak(t *testing.T) {
+	now := time.Now()
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"bv-1": {
+				BeadID: "bv-1",
+				Status: "open",
+				Commits: []CorrelatedCommit{
+					{SHA: "a", ShortSHA: "a", Timestamp: now, Files: []FileChange{
+						{Path: "zeta.go"}, {Path: "alpha.go"}, {Path: "mid.go"},
+					}},
+				},
+			},
+		},
+		CommitIndex: CommitIndex{"a": {"bv-1"}},
+	}
+
+	lookup := NewFileLookup(report)
+	hotspots := lookup.GetHotspots(0)
+	if len(hotspots) != 3 {
+		t.Fatalf("Expected 3 hotspots, got %d", len(hotspots))
+	}
+	want := []string{"alpha.go", "mid.go", "zeta.go"}
+	for i, w := range want {
+		if hotspots[i].FilePath != w {
+			t.Errorf("hotspots[%d] = %s, want %s (deterministic tie-break)", i, hotspots[i].FilePath, w)
+		}
+	}
+}

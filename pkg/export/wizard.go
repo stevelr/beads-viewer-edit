@@ -938,6 +938,10 @@ func LoadWizardConfig() (*WizardConfig, error) {
 
 // SaveWizardConfig saves wizard configuration for future runs.
 func SaveWizardConfig(config *WizardConfig) error {
+	if config == nil {
+		return errors.New("wizard config is nil")
+	}
+
 	path := WizardConfigPath()
 	if path == "" {
 		return fmt.Errorf("could not determine config path")
@@ -946,13 +950,51 @@ func SaveWizardConfig(config *WizardConfig) error {
 	// Ensure directory exists
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+		return fmt.Errorf("create wizard config directory: %w", err)
 	}
 
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal wizard config: %w", err)
 	}
 
-	return os.WriteFile(path, data, 0644)
+	return writeWizardConfigFile(path, data)
+}
+
+func writeWizardConfigFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary wizard config: %w", err)
+	}
+
+	tmpPath := tmpFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("write temporary wizard config: %w", err)
+	}
+	if err := tmpFile.Chmod(0644); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("chmod temporary wizard config: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("sync temporary wizard config: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temporary wizard config: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace wizard config: %w", err)
+	}
+
+	cleanup = false
+	return nil
 }

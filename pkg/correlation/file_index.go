@@ -63,6 +63,13 @@ func BuildFileIndex(report *HistoryReport) *FileBeadIndex {
 	fileBeadMap := make(map[string]map[string]*BeadReference)
 
 	for beadID, history := range report.Histories {
+		// Keep the index consistent with every lookup surface: beads whose
+		// status classifies as skip (tombstone / soft-deleted) are excluded
+		// at build time, so hotspots, per-file lookups, impact analysis, and
+		// the aggregate stats all agree on the same set of bead links (#184).
+		if _, skip := classifyBeadStatus(history.Status); skip {
+			continue
+		}
 		for _, commit := range history.Commits {
 			for _, file := range commit.Files {
 				// Normalize path (remove leading ./ and normalize separators)
@@ -307,25 +314,52 @@ func (fl *FileLookup) GetCoChangeMatrix() *CoChangeMatrix {
 }
 
 // GetHotspots returns files touched by the most beads (potential conflict zones).
+//
+// Bead counting uses the exact same status classification as LookupByFile and
+// ImpactAnalysis (classifyBeadStatus on the current status from fl.beads), so
+// the three robot surfaces built on this index can never disagree about how
+// many beads touch a given file (#184). Beads that classify as skip
+// (tombstone) are not counted, and files whose every bead is skipped are
+// omitted entirely.
 func (fl *FileLookup) GetHotspots(limit int) []FileHotspot {
-	type fileBeadCount struct {
-		path  string
-		count int
-		refs  []BeadReference
-	}
-
-	var counts []fileBeadCount
+	counts := []FileHotspot{}
 	for path, refs := range fl.index.FileToBeads {
-		counts = append(counts, fileBeadCount{
-			path:  path,
-			count: len(refs),
-			refs:  refs,
+		openCount := 0
+		closedCount := 0
+		for _, ref := range refs {
+			// Get current status from beads map (may have changed since index was built)
+			status := ref.Status
+			if history, ok := fl.beads[ref.BeadID]; ok {
+				status = history.Status
+			}
+			bucket, skip := classifyBeadStatus(status)
+			if skip {
+				continue
+			}
+			if bucket == "closed" {
+				closedCount++
+			} else {
+				openCount++
+			}
+		}
+		total := openCount + closedCount
+		if total == 0 {
+			continue
+		}
+		counts = append(counts, FileHotspot{
+			FilePath:    path,
+			TotalBeads:  total,
+			OpenBeads:   openCount,
+			ClosedBeads: closedCount,
 		})
 	}
 
-	// Sort by count descending
+	// Sort by count descending; tie-break on path for deterministic output.
 	sort.Slice(counts, func(i, j int) bool {
-		return counts[i].count > counts[j].count
+		if counts[i].TotalBeads != counts[j].TotalBeads {
+			return counts[i].TotalBeads > counts[j].TotalBeads
+		}
+		return counts[i].FilePath < counts[j].FilePath
 	})
 
 	// Take top N
@@ -333,32 +367,7 @@ func (fl *FileLookup) GetHotspots(limit int) []FileHotspot {
 		limit = len(counts)
 	}
 
-	hotspots := make([]FileHotspot, 0, limit)
-	for i := 0; i < limit; i++ {
-		c := counts[i]
-
-		// Count open vs closed using current status from fl.beads
-		openCount := 0
-		for _, ref := range c.refs {
-			// Get current status from beads map (may have changed since index was built)
-			status := ref.Status
-			if history, ok := fl.beads[ref.BeadID]; ok {
-				status = history.Status
-			}
-			if status != "closed" {
-				openCount++
-			}
-		}
-
-		hotspots = append(hotspots, FileHotspot{
-			FilePath:    c.path,
-			TotalBeads:  c.count,
-			OpenBeads:   openCount,
-			ClosedBeads: c.count - openCount,
-		})
-	}
-
-	return hotspots
+	return counts[:limit]
 }
 
 // FileHotspot represents a file that has been touched by many beads.

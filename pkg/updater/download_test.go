@@ -1,6 +1,7 @@
 package updater
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -45,6 +46,13 @@ func TestDownloadFile_SizeMismatch_Header(t *testing.T) {
 	}
 }
 
+func TestDownloadFile_RejectsNegativeExpectedSize(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "file.bin")
+	if err := downloadFile("http://127.0.0.1:1/file.bin", dest, -1); err == nil {
+		t.Fatalf("expected negative size error")
+	}
+}
+
 func TestDownloadFile_SizeMismatch_WrittenBytes(t *testing.T) {
 	// Force chunked transfer so ContentLength is not available to the client;
 	// then rely on the post-download byte-count check.
@@ -60,5 +68,30 @@ func TestDownloadFile_SizeMismatch_WrittenBytes(t *testing.T) {
 	dest := filepath.Join(t.TempDir(), "file.bin")
 	if err := downloadFile(srv.URL, dest, 5); err == nil {
 		t.Fatalf("expected downloaded size mismatch error")
+	}
+}
+
+func TestDownloadFile_SizeMismatchStopsAfterExpectedPlusOne(t *testing.T) {
+	body := bytes.Repeat([]byte("x"), 1024)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+
+	dest := filepath.Join(t.TempDir(), "file.bin")
+	if err := downloadFile(srv.URL, dest, 5); err == nil {
+		t.Fatalf("expected downloaded size mismatch error")
+	}
+
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatalf("stat dest: %v", err)
+	}
+	if info.Size() > 6 {
+		t.Fatalf("download wrote %d bytes; want at most expected size plus one", info.Size())
 	}
 }

@@ -192,16 +192,56 @@ func (ctx *TriageContext) computeBlockerDepthInternal(id string, visiting map[st
 
 // getOpenBlockersInternal returns open blockers without locking.
 // MUST be called while holding the lock.
+//
+// IMPORTANT: only true predecessor edges contribute directly. `parent-child`
+// edges in beads' JSONL are *rollup* edges (an epic contains its children);
+// they are NOT direct predecessor edges. An open, unblocked parent never
+// "blocks" its child, and closing the parent never "unblocks" the child —
+// that's precisely backwards: the parent closes when its children do.
+//
+// However, a parent that is itself blocked DOES propagate downward to its
+// descendants: a child cannot start while its parent is gated. This matches
+// the canonical beads_rust (`br`) semantics:
+//
+//	// from beads_rust/src/storage/sqlite.rs (compute_blocked_issues_map_impl):
+//	// "Standard blocking edges (blocks, conditional-blocks, waits-for) block
+//	//  directly. parent-child does not make an open parent block a child;
+//	//  instead it propagates an already-blocked parent down to its descendants."
+//
+// The previous implementation here added every open parent-child parent to
+// the blocker set unconditionally, which produced inverted advice like:
+//
+//	"Work on <epic> first to unblock <epic>.1"
+//
+// for child tasks whose only edge was a parent-child rollup, even when the
+// parent epic itself was perfectly unblocked. That broke `--robot-triage`,
+// `--robot-next`, the TUI "Triage Insights" blocked-by list, the "complete
+// X first" action hint in GenerateTriageReasons, the UnblocksMap (which
+// inflated parent-epic unblocks_ids), and the blocker-depth scoring that
+// consumes it.
+//
+// The fix below restores the distinction: a parent only enters the child's
+// blocked_by set when the parent is itself transitively blocked. See
+// beads_viewer#158 for the original report. The propagation uses a small
+// internal helper (isTransitivelyBlockedInternal) with cycle detection so a
+// pathological parent-child cycle cannot infinitely recurse.
 func (ctx *TriageContext) getOpenBlockersInternal(id string) []string {
 	if blockers, ok := ctx.openBlockers[id]; ok {
 		return blockers
 	}
 
+	// 1. Direct predecessor edges. Analyzer.GetOpenBlockers already filters
+	//    via DependencyType.IsBlocking(), so parent-child / related /
+	//    discovered-from edges are excluded by construction.
 	blockerSet := make(map[string]struct{})
 	for _, blockerID := range ctx.analyzer.GetOpenBlockers(id) {
 		blockerSet[blockerID] = struct{}{}
 	}
 
+	// 2. Transitive parent-blocked propagation. Match br's behavior in
+	//    propagate_blocked_parents: an open parent is added to the child's
+	//    blocked_by only when the parent itself is transitively blocked.
+	//    A standalone open parent with no real predecessors yields nothing.
 	if issue, ok := ctx.analyzer.issueMap[id]; ok {
 		for _, dep := range issue.Dependencies {
 			if dep == nil || dep.Type != model.DepParentChild {
@@ -211,7 +251,9 @@ func (ctx *TriageContext) getOpenBlockersInternal(id string) []string {
 			if !exists || isClosedLikeStatus(parent.Status) {
 				continue
 			}
-			blockerSet[dep.DependsOnID] = struct{}{}
+			if ctx.isTransitivelyBlockedInternal(parent.ID, map[string]bool{id: true}) {
+				blockerSet[parent.ID] = struct{}{}
+			}
 		}
 	}
 
@@ -229,9 +271,67 @@ func (ctx *TriageContext) getOpenBlockersInternal(id string) []string {
 	return blockers
 }
 
+// isTransitivelyBlockedInternal returns true if `id` has at least one
+// open direct predecessor (a `blocks`-type edge to a non-closed issue) OR
+// has an open parent-child parent that is itself transitively blocked.
+//
+// MUST be called while holding the lock. The `visiting` set carries cycle
+// detection across recursive calls. If a cycle is encountered, the cycle
+// participants are conservatively treated as NOT blocking (returning false),
+// matching the way br's propagate_blocked_parents stops at already-seen
+// nodes.
+//
+// This intentionally does NOT consult `ctx.openBlockers` (the cache built
+// by getOpenBlockersInternal), because doing so would re-enter the caller
+// for the parent ID and trip cycle detection on the legitimate
+// child→parent→grandparent walk. Instead it inspects the analyzer's raw
+// edges directly, which is O(d) per node.
+func (ctx *TriageContext) isTransitivelyBlockedInternal(id string, visiting map[string]bool) bool {
+	if visiting[id] {
+		return false
+	}
+
+	issue, ok := ctx.analyzer.issueMap[id]
+	if !ok || isClosedLikeStatus(issue.Status) {
+		return false
+	}
+
+	// Direct predecessor check: any open blocking-type edge gates this issue.
+	if len(ctx.analyzer.GetOpenBlockers(id)) > 0 {
+		return true
+	}
+
+	// Parent-blocked propagation: an open parent that is itself blocked
+	// propagates blocking down. A standalone open parent does not.
+	visiting[id] = true
+	defer delete(visiting, id)
+	for _, dep := range issue.Dependencies {
+		if dep == nil || dep.Type != model.DepParentChild {
+			continue
+		}
+		parent, exists := ctx.analyzer.issueMap[dep.DependsOnID]
+		if !exists || isClosedLikeStatus(parent.Status) {
+			continue
+		}
+		if ctx.isTransitivelyBlockedInternal(parent.ID, visiting) {
+			return true
+		}
+	}
+	return false
+}
+
 // OpenBlockers returns the IDs of open issues that block claiming the given issue.
-// In triage, parent-child parents count because br ready/update treats them as
-// ready-work blockers even though lower-level graph metrics keep them separate.
+//
+// Two contributors:
+//
+//  1. Direct predecessor edges — `DependencyType.IsBlocking()` (currently
+//     `blocks` and the empty-string legacy default).
+//  2. Transitive parent-blocked propagation — an open parent-child parent
+//     that is itself transitively blocked.
+//
+// An unblocked open parent does NOT block its child, matching `br ready`
+// semantics. See implementation notes on getOpenBlockersInternal and
+// isTransitivelyBlockedInternal (beads_viewer#158).
 //
 // Returns nil if the issue doesn't exist or has no open blockers.
 // Time complexity: O(d) on first call where d is dependency count, O(1) thereafter.

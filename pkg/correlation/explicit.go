@@ -4,6 +4,7 @@ package correlation
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os/exec"
 	"regexp"
@@ -15,6 +16,17 @@ import (
 type ExplicitMatcher struct {
 	repoPath string
 	patterns []*regexp.Regexp
+
+	// ctx, when set via WithContext, bounds the git subprocesses spawned by
+	// the matcher (issue #166). nil means context.Background().
+	ctx context.Context
+}
+
+// WithContext binds ctx to the matcher so its git subprocesses are cancelled
+// when ctx is done (issue #166). Returns the receiver for chaining.
+func (m *ExplicitMatcher) WithContext(ctx context.Context) *ExplicitMatcher {
+	m.ctx = ctx
+	return m
 }
 
 // DefaultPatterns returns the default set of bead ID patterns.
@@ -246,7 +258,7 @@ func (m *ExplicitMatcher) searchWithGrep(pattern string, opts ExtractOptions) ([
 		args = append(args, fmt.Sprintf("-n%d", opts.Limit))
 	}
 
-	cmd := exec.Command("git", args...)
+	cmd := gitCommand(m.ctx, args...)
 	cmd.Dir = m.repoPath
 
 	out, err := cmd.Output()

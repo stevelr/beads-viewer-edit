@@ -3,6 +3,8 @@ package ui
 import (
 	"reflect"
 	"testing"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // =============================================================================
@@ -319,5 +321,53 @@ func TestNormalizeRepoPrefixes_OrderStability(t *testing.T) {
 		if !reflect.DeepEqual(result, expected) {
 			t.Errorf("iteration %d: got %v, want %v", i, result, expected)
 		}
+	}
+}
+
+func TestIssueRepoKeyPrefersSourceRepo(t *testing.T) {
+	tests := []struct {
+		name  string
+		issue model.Issue
+		want  string
+	}{
+		{
+			name: "source repo handles hyphenated workspace prefixes",
+			issue: model.Issue{
+				ID:         "backend-service-AUTH-1",
+				SourceRepo: "backend-service",
+			},
+			want: "backend-service",
+		},
+		{
+			name: "fallback extracts legacy simple prefix",
+			issue: model.Issue{
+				ID: "api-AUTH-1",
+			},
+			want: "api",
+		},
+		{
+			name: "path-like source repo falls back to ID",
+			issue: model.Issue{
+				ID:         "api-AUTH-1",
+				SourceRepo: "services/api",
+			},
+			want: "api",
+		},
+		{
+			name: "dot source repo falls back to ID",
+			issue: model.Issue{
+				ID:         "web:UI-1",
+				SourceRepo: ".",
+			},
+			want: "web",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := issueRepoKey(tt.issue); got != tt.want {
+				t.Fatalf("issueRepoKey(%+v) = %q, want %q", tt.issue, got, tt.want)
+			}
+		})
 	}
 }

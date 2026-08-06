@@ -1,5 +1,32 @@
 # Dependency Upgrade Log
 
+**Date:** 2026-06-08 | **Project:** beads_viewer | **Language:** Go | **Release:** v0.17.0
+
+## Summary
+
+- **Updated:** 7 direct Go dependencies (all minor/patch bumps of mature libraries) + transitive `golang.org/x/text` and re-vendored.
+- **Method:** Staged by risk — `golang.org/x/*` + `go-runewidth` together (official, near-zero risk), then `modernc.org/sqlite` alone (FTS5 search engine), then `git.sr.ht/~sbinet/gg` alone (graphics/export). Full `go test ./...` gate after the batch; focused `pkg/search` + `pkg/export` (FTS5) gate after the sqlite bump.
+- **Failed:** None. **Needs attention:** None.
+- **Validation:** `go vet ./...` clean, `gofmt -l` clean, `go test ./...` 27 packages OK / 0 FAIL (with `BV_NO_BROWSER=1 BV_TEST_MODE=1 CGO_CFLAGS=-DSQLITE_ENABLE_FTS5`).
+
+### Direct dependencies
+
+- `git.sr.ht/~sbinet/gg`: `v0.7.0` -> `v0.8.0`
+- `github.com/mattn/go-runewidth`: `v0.0.23` -> `v0.0.24`
+- `golang.org/x/image`: `v0.40.0` -> `v0.42.0`
+- `golang.org/x/sync`: `v0.20.0` -> `v0.21.0`
+- `golang.org/x/sys`: `v0.44.0` -> `v0.46.0`
+- `golang.org/x/term`: `v0.43.0` -> `v0.44.0`
+- `modernc.org/sqlite`: `v1.50.1` -> `v1.52.0`
+
+### Notable indirect dependency updates
+
+- `golang.org/x/text`: `v0.37.0` -> `v0.38.0` (pulled by the x/* bumps)
+
+Remaining outdated entries reported by `go list -m -u` are all transitive-only deps not required by `go mod why` (e.g. `gonum.org/v1/plot`, `honnef.co/go/tools`, `codeberg.org/go-latex/*`); left untouched to keep the release surface minimal.
+
+---
+
 **Date:** 2026-05-14 | **Project:** beads_viewer | **Languages:** Go, Rust/WASM
 
 ## Summary

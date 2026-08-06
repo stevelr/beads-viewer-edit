@@ -17,6 +17,14 @@ func TestIsUsableVersion(t *testing.T) {
 		{"v1.0.0", true},
 		{"1.0.0-rc1", true},
 		{"v0.14.5-0.20260212-abcdef", true}, // pseudo-version is still "usable" at this layer
+		// Un-substituted release-pipeline templates must be rejected (#174) so
+		// resolution falls through to build-info / the hardcoded fallback
+		// instead of accepting a literal placeholder.
+		{"${version}", false},
+		{"v${version}", false},
+		{"{{.Version}}", false},
+		{"v{{.Version}}", false},
+		{" v${version} ", false},
 	}
 	for _, tt := range tests {
 		if got := isUsableVersion(tt.input); got != tt.want {

@@ -306,7 +306,7 @@ func (r *SQLiteReader) loadIssuesSimple(filter func(*model.Issue) bool) ([]model
 		orderBy = "ORDER BY updated_at DESC"
 	}
 	query := fmt.Sprintf(`
-		SELECT id, title, %s, status, %s, %s, %s, %s, %s
+		SELECT id, title, %s, status, %s, %s, %s, %s, %s, %s
 		FROM issues
 		%s
 		%s
@@ -314,6 +314,7 @@ func (r *SQLiteReader) loadIssuesSimple(filter func(*model.Issue) bool) ([]model
 		expr("description", "NULL"),
 		coalesceExpr("priority", "3"),
 		coalesceExpr("issue_type", "'task'"),
+		expr("assignee", "NULL"),
 		expr("created_at", "NULL"),
 		expr("updated_at", "NULL"),
 		expr("labels", "NULL"),
@@ -333,14 +334,14 @@ func (r *SQLiteReader) loadIssuesSimple(filter func(*model.Issue) bool) ([]model
 	var issues []model.Issue
 	for rows.Next() {
 		var issue model.Issue
-		var description sql.NullString
+		var description, assignee sql.NullString
 		var createdAt, updatedAt sql.NullString
 		var labelsJSON sql.NullString
 		var issueType string
 
 		err := rows.Scan(
 			&issue.ID, &issue.Title, &description, &issue.Status, &issue.Priority, &issueType,
-			&createdAt, &updatedAt, &labelsJSON,
+			&assignee, &createdAt, &updatedAt, &labelsJSON,
 		)
 		if err != nil {
 			continue
@@ -350,6 +351,9 @@ func (r *SQLiteReader) loadIssuesSimple(filter func(*model.Issue) bool) ([]model
 			issue.Description = description.String
 		}
 		issue.IssueType = model.IssueType(issueType)
+		if assignee.Valid {
+			issue.Assignee = assignee.String
+		}
 		if createdAt.Valid {
 			if t, ok := parseSQLiteTime(createdAt.String); ok {
 				issue.CreatedAt = t

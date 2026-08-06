@@ -80,6 +80,32 @@ func TestIsExcludedPath(t *testing.T) {
 	}
 }
 
+func TestExcludePathspecArgs(t *testing.T) {
+	args := excludePathspecArgs()
+
+	// Must begin with the pathspec separator and the "." include so the
+	// excludes are interpreted as pathspecs, not revisions.
+	if len(args) < 2 || args[0] != "--" || args[1] != "." {
+		t.Fatalf("expected args to start with [\"--\", \".\"], got %v", args[:min(len(args), 2)])
+	}
+
+	// Every excluded directory must produce a matching exclude pathspec so the
+	// git show diff skips that content (the cost #160 was paying then discarding).
+	joined := strings.Join(args, " ")
+	for _, prefix := range excludedPaths {
+		dir := strings.TrimSuffix(prefix, "/")
+		want := ":(exclude,glob)" + dir + "/**"
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing exclude pathspec for %q (want %q) in %v", prefix, want, args)
+		}
+	}
+
+	// .beads/ is the dominant blob; assert it explicitly.
+	if !strings.Contains(joined, ":(exclude,glob).beads/**") {
+		t.Errorf("expected .beads exclusion in pathspec args, got %v", args)
+	}
+}
+
 func TestContainsBeadID(t *testing.T) {
 	tests := []struct {
 		text   string

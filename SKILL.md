@@ -5,18 +5,18 @@ description: "Beads Viewer - Graph-aware triage engine for Beads projects. Compu
 
 # BV - Beads Viewer
 
-A graph-aware triage engine for Beads projects (`.beads/beads.jsonl`). Computes 9 graph metrics, generates execution plans, and provides deterministic recommendations. Human TUI for browsing; robot flags for AI agents.
+A graph-aware triage engine for Beads projects (`.beads/issues.jsonl` in current `br` workspaces, with `.beads/beads.jsonl` supported for legacy/`bd` workspaces). Computes 9 graph metrics, generates execution plans, and provides deterministic recommendations. Human TUI for browsing; robot flags for AI agents.
 
 ## Why BV vs Raw Beads
 
-| Capability | Raw beads.jsonl | BV Robot Mode |
+| Capability | Raw Beads JSONL | BV Robot Mode |
 |------------|-----------------|---------------|
 | Query | "List all issues" | "List the top 5 bottlenecks blocking the release" |
 | Context Cost | High (linear with issue count) | Low (fixed summary struct) |
 | Graph Logic | Agent must compute | Pre-computed (PageRank, betweenness, cycles) |
 | Safety | Agent might miss cycles | Cycles explicitly flagged |
 
-Use BV instead of parsing beads.jsonl directly. It computes graph metrics deterministically.
+Use BV instead of parsing Beads JSONL directly. It computes graph metrics deterministically.
 
 ## CRITICAL: Robot Mode for Agents
 
@@ -121,7 +121,7 @@ bv --robot-triage --robot-triage-by-label    # Group by domain
 ## Robot Output Structure
 
 All robot JSON includes:
-- `data_hash` - Fingerprint of beads.jsonl (verify consistency)
+- `data_hash` - Fingerprint of the source JSONL issue file (verify consistency)
 - `status` - Per-metric state: `computed|approx|timeout|skipped`
 - `as_of` / `as_of_commit` - Present when using `--as-of`
 
@@ -204,9 +204,16 @@ When running `bv` interactively (not for agents):
 | `f` | Flow matrix (cross-label dependencies) |
 | `]` | Attention view (label priority ranking) |
 
-## Integration with bd CLI
+## Integration with br/bd CLIs
 
-BV reads from `.beads/beads.jsonl` created by the `bd` CLI:
+BV reads from `.beads/issues.jsonl` created by current `br` workspaces and from `.beads/beads.jsonl` created by legacy `bd` workspaces:
+
+```bash
+br ready --json             # Show actionable beads
+br sync --flush-only        # Export current br state to JSONL
+```
+
+Legacy `bd` workflow:
 
 ```bash
 bd init                    # Initialize beads in project

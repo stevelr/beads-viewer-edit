@@ -2,10 +2,13 @@
 package correlation
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
+
+	json "github.com/goccy/go-json"
 )
 
 // Correlator orchestrates the extraction and correlation of bead history data
@@ -13,6 +16,10 @@ type Correlator struct {
 	repoPath    string
 	extractor   *Extractor
 	coCommitter *CoCommitExtractor
+
+	// ctx, when set via WithContext, bounds every git subprocess spawned
+	// during report generation (issue #166). nil means context.Background().
+	ctx context.Context
 }
 
 // NewCorrelator creates a new correlator for the given repository.
@@ -27,6 +34,22 @@ func NewCorrelator(repoPath string, beadsFilePath ...string) *Correlator {
 	}
 }
 
+// WithContext binds ctx to the correlator and its underlying extractors so
+// every git subprocess spawned while generating a report is killed as soon as
+// ctx is cancelled (issue #166: bounded robot liveness). It mutates and
+// returns the receiver for chaining:
+//
+//	report, err := NewCorrelator(dir).WithContext(ctx).GenerateReportCached(beads, opts)
+//
+// A nil ctx (or never calling WithContext) preserves the legacy
+// run-to-completion behavior.
+func (c *Correlator) WithContext(ctx context.Context) *Correlator {
+	c.ctx = ctx
+	c.extractor.ctx = ctx
+	c.coCommitter.ctx = ctx
+	return c
+}
+
 // CorrelatorOptions controls how the history report is generated
 type CorrelatorOptions struct {
 	BeadID string     // Filter to single bead ID (empty = all)
@@ -35,9 +58,60 @@ type CorrelatorOptions struct {
 	Limit  int        // Max commits to process (0 = no limit)
 }
 
-// GenerateReport generates a complete history report
-func (c *Correlator) GenerateReport(beads []BeadInfo, opts CorrelatorOptions) (*HistoryReport, error) {
-	// Build extract options
+// historyArtifact holds the purely history-derived (HEAD + options only)
+// intermediate products of report generation: the extracted lifecycle events
+// and the co-committed-file correlations derived from them. NEITHER depends on
+// the passed-in beads slice (bead ID/Title/Status) — Extract reads only
+// committed git history, and ExtractAllCoCommits is a pure function of events.
+// This is the expensive part of GenerateReport (the 232MB git-blob extraction
+// plus the batched co-commit git logs), so it is the unit cached by the
+// HEAD-keyed disk cache and reused unchanged across working-tree bead edits.
+type historyArtifact struct {
+	Events  []BeadEvent        `json:"events"`
+	Commits []CorrelatedCommit `json:"commits"`
+}
+
+// CorrelatedCommit.BeadID carries the json:"-" tag (it is internal linking state,
+// intentionally hidden from the public report JSON). The HEAD-artifact disk cache,
+// however, serializes the PRE-assembly Commits slice and MUST round-trip BeadID —
+// assembleReport groups commits onto beads by exactly that field. Without this the
+// cache would return commit-less reports on the middle-tier (bead-edit) path.
+// Custom (Un)MarshalJSON preserves BeadID via a parallel commit_bead_ids array
+// without disturbing the public CorrelatedCommit tag.
+type historyArtifactWire struct {
+	Events        []BeadEvent        `json:"events"`
+	Commits       []CorrelatedCommit `json:"commits"`
+	CommitBeadIDs []string           `json:"commit_bead_ids,omitempty"`
+}
+
+func (a historyArtifact) MarshalJSON() ([]byte, error) {
+	ids := make([]string, len(a.Commits))
+	for i := range a.Commits {
+		ids[i] = a.Commits[i].BeadID
+	}
+	return json.Marshal(historyArtifactWire{Events: a.Events, Commits: a.Commits, CommitBeadIDs: ids})
+}
+
+func (a *historyArtifact) UnmarshalJSON(b []byte) error {
+	var w historyArtifactWire
+	if err := json.Unmarshal(b, &w); err != nil {
+		return err
+	}
+	a.Events = w.Events
+	a.Commits = w.Commits
+	for i := range a.Commits {
+		if i < len(w.CommitBeadIDs) {
+			a.Commits[i].BeadID = w.CommitBeadIDs[i]
+		}
+	}
+	return nil
+}
+
+// extractHistoryArtifact runs ONLY the HEAD/options-dependent extraction steps
+// (git history walk + co-commit correlation). It is deterministic given the
+// repository HEAD and the extract options; it never reads the working-tree bead
+// slice. Split out so the result can be memoized independently of bead edits.
+func (c *Correlator) extractHistoryArtifact(opts CorrelatorOptions) (*historyArtifact, error) {
 	extractOpts := ExtractOptions{
 		Since:  opts.Since,
 		Until:  opts.Until,
@@ -56,6 +130,29 @@ func (c *Correlator) GenerateReport(beads []BeadInfo, opts CorrelatorOptions) (*
 	if err != nil {
 		return nil, fmt.Errorf("extracting co-commits: %w", err)
 	}
+
+	return &historyArtifact{Events: events, Commits: commits}, nil
+}
+
+// GenerateReport generates a complete history report
+func (c *Correlator) GenerateReport(beads []BeadInfo, opts CorrelatorOptions) (*HistoryReport, error) {
+	art, err := c.extractHistoryArtifact(opts)
+	if err != nil {
+		return nil, err
+	}
+	return c.assembleReport(beads, opts, art), nil
+}
+
+// assembleReport builds the final HistoryReport from the current bead slice and
+// a (possibly cached) history artifact. Every step here is cheap and depends on
+// the passed-in beads (title/status enrichment, stats, data hash); the
+// expensive history extraction lives in extractHistoryArtifact. Splitting the
+// two lets a working-tree bead edit (which flips hashBeads but not HEAD) reuse
+// the cached artifact and re-run only this assembly. The output is identical to
+// the inline pre-split GenerateReport for the same (beads, opts, artifact).
+func (c *Correlator) assembleReport(beads []BeadInfo, opts CorrelatorOptions, art *historyArtifact) *HistoryReport {
+	events := art.Events
+	commits := art.Commits
 
 	// Build bead histories
 	histories := c.buildHistories(beads, events, commits)
@@ -92,7 +189,7 @@ func (c *Correlator) GenerateReport(beads []BeadInfo, opts CorrelatorOptions) (*
 		Stats:           stats,
 		Histories:       histories,
 		CommitIndex:     commitIndex,
-	}, nil
+	}
 }
 
 // findLatestCommitSHA finds the most recent commit SHA from events and commits

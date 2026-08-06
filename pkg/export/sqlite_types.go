@@ -14,17 +14,20 @@ import (
 // The client builds search text on load by concatenating fields.
 type ExportIssue struct {
 	// Core issue data (embedded)
-	ID          string          `json:"id"`
-	Title       string          `json:"title"`
-	Description string          `json:"description,omitempty"`
-	Status      model.Status    `json:"status"`
-	Priority    int             `json:"priority"`
-	IssueType   model.IssueType `json:"issue_type"`
-	Assignee    string          `json:"assignee,omitempty"`
-	Labels      []string        `json:"labels,omitempty"`
-	CreatedAt   time.Time       `json:"created_at"`
-	UpdatedAt   time.Time       `json:"updated_at"`
-	ClosedAt    *time.Time      `json:"closed_at,omitempty"`
+	ID                 string          `json:"id"`
+	Title              string          `json:"title"`
+	Description        string          `json:"description,omitempty"`
+	Design             string          `json:"design,omitempty"`
+	AcceptanceCriteria string          `json:"acceptance_criteria,omitempty"`
+	Notes              string          `json:"notes,omitempty"`
+	Status             model.Status    `json:"status"`
+	Priority           int             `json:"priority"`
+	IssueType          model.IssueType `json:"issue_type"`
+	Assignee           string          `json:"assignee,omitempty"`
+	Labels             []string        `json:"labels,omitempty"`
+	CreatedAt          time.Time       `json:"created_at"`
+	UpdatedAt          time.Time       `json:"updated_at"`
+	ClosedAt           *time.Time      `json:"closed_at,omitempty"`
 
 	// Computed graph metrics
 	PageRank       float64  `json:"pagerank"`

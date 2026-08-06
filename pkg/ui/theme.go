@@ -12,8 +12,12 @@ import (
 // package init so every style helper can branch without re-detecting.
 var TermProfile colorprofile.Profile
 
-// BVThemeOverride holds the user's explicit theme preference from BV_THEME.
-// Values: "" (auto-detect), "dark", "light".
+// BVThemeOverride holds the user's explicit theme preference.
+// Values: "" (auto-detect), "dark", "light". It is seeded from BV_THEME at
+// package init for backward compatibility, but the full precedence
+// (--theme flag > BV_THEME > config file) is resolved by cmd/bv, which calls
+// SetThemeOverride once at startup. Always mutate it through SetThemeOverride
+// so the global lipgloss renderer stays in agreement.
 var BVThemeOverride string
 
 func init() {
@@ -25,6 +29,36 @@ func init() {
 	// custom schemes, tmux, SSH). (bv-128)
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("BV_THEME"))); v == "light" || v == "dark" {
 		BVThemeOverride = v
+	}
+}
+
+// SetThemeOverride applies an explicit light/dark theme preference
+// process-wide. "light" and "dark" record the preference in BVThemeOverride
+// AND pin the global (default-renderer) background assumption via
+// lipgloss.SetHasDarkBackground. Any other value ("auto", "", unrecognized)
+// clears the override and leaves lipgloss's auto-detection in charge.
+//
+// Pinning the GLOBAL renderer is the load-bearing part: most bv styles are
+// built with the package-level lipgloss.NewStyle(), and markdown rendering
+// branches on the global lipgloss.HasDarkBackground(), so overriding only a
+// per-model renderer (as DefaultTheme does) leaves the majority of adaptive
+// colors on auto-detection. Auto-detection assumes a DARK background whenever
+// the terminal never answers the background query — typical over SSH and
+// inside tmux/screen — which renders near-white text on light terminals.
+//
+// Call this once, early at startup, before any styles are rendered. (bv-128)
+func SetThemeOverride(pref string) {
+	switch strings.ToLower(strings.TrimSpace(pref)) {
+	case "light":
+		BVThemeOverride = "light"
+		lipgloss.SetHasDarkBackground(false)
+	case "dark":
+		BVThemeOverride = "dark"
+		lipgloss.SetHasDarkBackground(true)
+	default:
+		// "auto" / empty / unknown: no pin; adaptive colors follow the
+		// terminal's detected background.
+		BVThemeOverride = ""
 	}
 }
 

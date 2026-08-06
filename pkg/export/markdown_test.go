@@ -361,7 +361,13 @@ func TestGeneratePriorityBriefFromTriageJSON_Basic(t *testing.T) {
 	if !strings.Contains(md, "**Hash:** `hash123`") {
 		t.Fatalf("missing hash:\n%s", md)
 	}
-	if !strings.Contains(md, "| 2 | 0 | 1 | 1 |") {
+	// Strict count semantics (#165): the "Blocked" column reflects
+	// quick_ref.blocked_count, which counts only issues whose status is
+	// exactly "blocked". Issue B is StatusOpen (dependency-blocked, not
+	// status-blocked), so Blocked=0 here; the dependency-blocked tally now
+	// lives in not_actionable_count. Open=2, In Progress=0, Blocked=0,
+	// Actionable=1.
+	if !strings.Contains(md, "| 2 | 0 | 0 | 1 |") {
 		t.Fatalf("missing expected summary counts:\n%s", md)
 	}
 	if !strings.Contains(md, "**A**") {

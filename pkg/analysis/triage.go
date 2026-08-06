@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
@@ -19,6 +20,7 @@ func isClosedLikeStatus(status model.Status) bool {
 // Designed as a single entry point for AI agents to get everything they need
 type TriageResult struct {
 	Meta            TriageMeta       `json:"meta"`
+	Status          MetricStatus     `json:"status,omitempty"`
 	QuickRef        QuickRef         `json:"quick_ref"`
 	Recommendations []Recommendation `json:"recommendations"`
 	QuickWins       []QuickWin       `json:"quick_wins"`
@@ -40,15 +42,47 @@ type TriageMeta struct {
 	Phase2Ready   bool      `json:"phase2_ready"`
 	IssueCount    int       `json:"issue_count"`
 	ComputeTimeMs int64     `json:"compute_time_ms"`
+	// HistoryStatus reports the outcome of the optional git-history
+	// correlation prologue used by --robot-triage (issue #166):
+	// "ok" (history report generated), "error" (generation failed),
+	// "timeout" (generation exceeded the configured budget and was
+	// cancelled; triage proceeded without history), or empty when history
+	// generation was not attempted (no git repo / no open issues / callers
+	// outside the robot-triage path).
+	HistoryStatus string `json:"history_status,omitempty"`
 }
 
-// QuickRef provides at-a-glance summary for fast decisions
+// QuickRef provides at-a-glance summary for fast decisions.
+//
+// Count semantics (issue #165): open_count and blocked_count are STRICT
+// status counts and always equal project_health.counts.by_status["open"] and
+// by_status["blocked"]. The legacy aggregate values (every non-closed issue,
+// and every non-closed-but-not-actionable issue) moved to not_closed_count
+// and not_actionable_count. Partition invariant:
+//
+//	not_closed_count == actionable_count + not_actionable_count
 type QuickRef struct {
-	OpenCount       int       `json:"open_count"`
-	ActionableCount int       `json:"actionable_count"`
-	BlockedCount    int       `json:"blocked_count"`
-	InProgressCount int       `json:"in_progress_count"`
-	TopPicks        []TopPick `json:"top_picks"` // Top 3 recommended items
+	// OpenCount counts issues whose status is exactly "open"
+	// (== by_status["open"]; excludes in_progress/blocked/deferred).
+	OpenCount int `json:"open_count"`
+	// ActionableCount counts non-closed issues that are ready to work on
+	// (no open blocking dependencies).
+	ActionableCount int `json:"actionable_count"`
+	// BlockedCount counts issues whose status is exactly "blocked"
+	// (== by_status["blocked"]). For dependency-blocked work regardless of
+	// status, see NotActionableCount.
+	BlockedCount int `json:"blocked_count"`
+	// InProgressCount counts issues whose status is exactly "in_progress".
+	InProgressCount int `json:"in_progress_count"`
+	// NotClosedCount counts every issue that is not closed-like (status is
+	// not "closed"/"tombstone"). This carries the pre-#165 open_count
+	// semantics.
+	NotClosedCount int `json:"not_closed_count"`
+	// NotActionableCount counts non-closed issues that are NOT actionable
+	// (blocked by open dependencies, whatever their status). This carries
+	// the pre-#165 blocked_count semantics.
+	NotActionableCount int       `json:"not_actionable_count"`
+	TopPicks           []TopPick `json:"top_picks"` // Top 3 recommended items
 }
 
 // TopPick is a condensed recommendation for quick reference
@@ -104,16 +138,41 @@ type ProjectHealth struct {
 	Staleness *Staleness   `json:"staleness,omitempty"` // nil until history ready
 }
 
-// HealthCounts is basic issue statistics
+// HealthCounts is basic issue statistics.
+//
+// Count semantics (issue #165): Open and Blocked are STRICT status counts
+// (always equal to ByStatus["open"] / ByStatus["blocked"]). The pre-#165
+// aggregate values are preserved under the semantically accurate names
+// NotClosed and DependencyBlocked. Partition invariant:
+//
+//	not_closed == actionable + dependency_blocked
 type HealthCounts struct {
-	Total      int            `json:"total"`
-	Open       int            `json:"open"`
-	Closed     int            `json:"closed"`
-	Blocked    int            `json:"blocked"`
-	Actionable int            `json:"actionable"`
-	ByStatus   map[string]int `json:"by_status"`
-	ByType     map[string]int `json:"by_type"`
-	ByPriority map[int]int    `json:"by_priority"`
+	// Total counts every issue, including closed and tombstone.
+	Total int `json:"total"`
+	// Open counts issues whose status is exactly "open" (== ByStatus["open"]).
+	// Before #165 this counted every non-closed issue; that value is now
+	// NotClosed.
+	Open int `json:"open"`
+	// Closed counts closed-like issues (status "closed" or "tombstone").
+	Closed int `json:"closed"`
+	// Blocked counts issues whose status is exactly "blocked"
+	// (== ByStatus["blocked"]). Before #165 this counted non-closed issues
+	// that were not actionable; that value is now DependencyBlocked.
+	Blocked int `json:"blocked"`
+	// Actionable counts non-closed issues with no open blocking
+	// dependencies (ready to work on now).
+	Actionable int `json:"actionable"`
+	// NotClosed counts every issue that is not closed-like (status is not
+	// "closed"/"tombstone"): open + in_progress + blocked + deferred + any
+	// other live status. Pre-#165 "open" semantics.
+	NotClosed int `json:"not_closed"`
+	// DependencyBlocked counts non-closed issues that are NOT actionable
+	// (blocked by open dependencies, whatever their status). Pre-#165
+	// "blocked" semantics.
+	DependencyBlocked int            `json:"dependency_blocked"`
+	ByStatus          map[string]int `json:"by_status"`
+	ByType            map[string]int `json:"by_type"`
+	ByPriority        map[int]int    `json:"by_priority"`
 }
 
 // GraphHealth summarizes dependency graph metrics
@@ -307,6 +366,28 @@ type TriageOptions struct {
 
 	// History report for staleness analysis
 	History *correlation.HistoryReport
+
+	// SeedDataHash, when non-empty, is a pre-computed ComputeDataHash(issues)
+	// the caller has already calculated for the same issue set. It is used to
+	// seed the analyzer's disk-cache key so the identical SHA256 is not run
+	// again. It is ignored when RootIssueID scopes the issue set (the seed would
+	// then describe a different slice).
+	SeedDataHash string
+
+	// NotReadyLabels (issue #173) is an opt-in label-class that marks a bead as
+	// graph-ready but NOT work-ready. Any OPEN, unblocked, unassigned, non-epic
+	// leaf carrying one of these labels (case-insensitive) is excluded from the
+	// claimable top picks fed to --robot-next / --robot-triage, so an agent is
+	// never handed a deliberately-not-ready bead as its next claim.
+	//
+	// Beads labels are free-form, so there is no canonical not-ready label to
+	// hardcode; this defaults empty (zero behavior change unless opted in via
+	// --robot-not-ready-labels or BV_ROBOT_NOT_READY_LABELS). It complements the
+	// existing not-ready *status* path (draft/deferred/review are already
+	// excluded because claimability requires status=="open"); this covers
+	// workflows that keep a bead open to stay visible but signal not-ready with
+	// a label.
+	NotReadyLabels []string
 }
 
 // TrackRecommendationGroup groups recommendations by execution track (bv-87)
@@ -344,6 +425,11 @@ func ComputeTriageWithOptionsAndTime(issues []model.Issue, opts TriageOptions, n
 
 	// Build analyzer and stats
 	analyzer := NewAnalyzer(issues)
+	// Reuse a caller-supplied data hash when it still describes this exact issue
+	// set (i.e. no root-subgraph scoping happened above).
+	if opts.SeedDataHash != "" && opts.RootIssueID == "" {
+		analyzer.SeedDataHash(opts.SeedDataHash)
+	}
 
 	// bv-perf: Check if there are any open issues before computing Phase 2
 	// Phase 2 metrics (PageRank, Betweenness) are only used for scoring open issues.
@@ -495,10 +581,16 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	// Build blockers to clear (uses cached actionable issues)
 	blockersToClear := buildBlockersToClearWithContext(triageCtx, unblocksMap, opts.BlockerN)
 
+	// Parents with open children are excluded from claimable top picks (issue
+	// #17 parity): such a parent is a planning container, not directly claimable
+	// work, even when it passes the epic-type / blocker checks (e.g. a non-epic
+	// parent). The parent re-becomes claimable once its children are all closed.
+	parentsWithOpenChildren := analyzer.ParentsWithOpenChildren()
+
 	// Build top picks for quick ref. Pass the full set so blocked
 	// high-priority items don't crowd genuine actionable work out of
 	// the picks (issue #146).
-	topPicks := buildTopPicks(allRecommendations, 3)
+	topPicks := buildTopPicks(allRecommendations, 3, opts.NotReadyLabels, parentsWithOpenChildren)
 
 	// Determine top issue for commands
 	topID := ""
@@ -513,10 +605,10 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	var recsByTrack []TrackRecommendationGroup
 	var recsByLabel []LabelRecommendationGroup
 	if opts.GroupByTrack {
-		recsByTrack = buildRecommendationsByTrack(recommendations, analyzer, unblocksMap)
+		recsByTrack = buildRecommendationsByTrack(recommendations, analyzer, unblocksMap, opts.NotReadyLabels, parentsWithOpenChildren)
 	}
 	if opts.GroupByLabel {
-		recsByLabel = buildRecommendationsByLabel(recommendations, unblocksMap)
+		recsByLabel = buildRecommendationsByLabel(recommendations, unblocksMap, opts.NotReadyLabels, parentsWithOpenChildren)
 	}
 
 	// Calculate staleness if history is available
@@ -533,12 +625,15 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 			IssueCount:    len(issues),
 			ComputeTimeMs: elapsed.Milliseconds(),
 		},
+		Status: stats.Status(),
 		QuickRef: QuickRef{
-			OpenCount:       counts.Open,
-			ActionableCount: counts.Actionable,
-			BlockedCount:    counts.Blocked,
-			InProgressCount: counts.ByStatus["in_progress"],
-			TopPicks:        topPicks,
+			OpenCount:          counts.Open,
+			ActionableCount:    counts.Actionable,
+			BlockedCount:       counts.Blocked,
+			InProgressCount:    counts.ByStatus["in_progress"],
+			NotClosedCount:     counts.NotClosed,
+			NotActionableCount: counts.DependencyBlocked,
+			TopPicks:           topPicks,
 		},
 		Recommendations:        recommendations,
 		QuickWins:              quickWins,
@@ -666,14 +761,19 @@ func computeCounts(issues []model.Issue, analyzer *Analyzer) HealthCounts {
 		if isClosedLikeStatus(issue.Status) {
 			counts.Closed++
 		} else {
-			counts.Open++
+			counts.NotClosed++
 			if actionableSet[issue.ID] {
 				counts.Actionable++
 			} else {
-				counts.Blocked++
+				counts.DependencyBlocked++
 			}
 		}
 	}
+
+	// Strict status counts (issue #165): keep Open/Blocked in lockstep with
+	// ByStatus so counts.open == by_status.open always holds.
+	counts.Open = counts.ByStatus[string(model.StatusOpen)]
+	counts.Blocked = counts.ByStatus[string(model.StatusBlocked)]
 
 	return counts
 }
@@ -696,15 +796,20 @@ func computeCountsWithContext(issues []model.Issue, ctx *TriageContext) HealthCo
 		if isClosedLikeStatus(issue.Status) {
 			counts.Closed++
 		} else {
-			counts.Open++
+			counts.NotClosed++
 			// Use cached IsActionable lookup - O(1) after first computation
 			if ctx.IsActionable(issue.ID) {
 				counts.Actionable++
 			} else {
-				counts.Blocked++
+				counts.DependencyBlocked++
 			}
 		}
 	}
+
+	// Strict status counts (issue #165): keep Open/Blocked in lockstep with
+	// ByStatus so counts.open == by_status.open always holds.
+	counts.Open = counts.ByStatus[string(model.StatusOpen)]
+	counts.Blocked = counts.ByStatus[string(model.StatusBlocked)]
 
 	return counts
 }
@@ -943,10 +1048,10 @@ func buildBlockersToClearWithContext(ctx *TriageContext, unblocksMap map[string]
 // buildTopPicks creates condensed top picks from recommendations.
 // Only includes actionable (non-blocked) items since TopPicks are used
 // for "what should I work on next" queries (e.g., --robot-next).
-func buildTopPicks(recommendations []Recommendation, limit int) []TopPick {
+func buildTopPicks(recommendations []Recommendation, limit int, notReadyLabels []string, parentsWithOpenChildren map[string]bool) []TopPick {
 	picks := make([]TopPick, 0, limit)
 	for _, rec := range recommendations {
-		if !isClaimableRecommendation(rec) {
+		if !isClaimableRecommendation(rec, notReadyLabels, parentsWithOpenChildren) {
 			continue
 		}
 		picks = append(picks, TopPick{
@@ -964,8 +1069,46 @@ func buildTopPicks(recommendations []Recommendation, limit int) []TopPick {
 	return picks
 }
 
-func isClaimableRecommendation(rec Recommendation) bool {
-	return rec.Status == string(model.StatusOpen) && rec.Assignee == "" && len(rec.BlockedBy) == 0
+// isClaimableRecommendation reports whether a recommendation is directly
+// claimable as a robot top pick.
+//
+// A bead is claimable iff it is open, not an epic, unassigned, has no open
+// blockers, (issue #173) carries none of the opt-in not-ready labels, and (for
+// parity with the Rust viewer's #17 fix) is not a parent that still has open
+// child work. The parent check is type-agnostic, so it also withholds a
+// non-epic parent with open children — which the epic-type gate alone misses —
+// while never withholding a genuinely-leaf epic.
+//
+// notReadyLabels may be empty (the default), in which case the label gate is a
+// no-op. parentsWithOpenChildren may be nil, in which case the parent gate is
+// skipped (used by unit tests that exercise the predicate in isolation).
+func isClaimableRecommendation(rec Recommendation, notReadyLabels []string, parentsWithOpenChildren map[string]bool) bool {
+	if parentsWithOpenChildren[rec.ID] {
+		return false
+	}
+	return rec.Status == string(model.StatusOpen) &&
+		rec.Type != string(model.TypeEpic) &&
+		rec.Assignee == "" &&
+		len(rec.BlockedBy) == 0 &&
+		!hasAnyLabel(rec.Labels, notReadyLabels)
+}
+
+// hasAnyLabel reports whether any of issueLabels matches a label in wanted,
+// case-insensitively (and trimming surrounding whitespace). Returns false when
+// wanted is empty, so an unconfigured not-ready set never excludes anything.
+func hasAnyLabel(issueLabels, wanted []string) bool {
+	if len(wanted) == 0 || len(issueLabels) == 0 {
+		return false
+	}
+	for _, have := range issueLabels {
+		haveNorm := strings.ToLower(strings.TrimSpace(have))
+		for _, want := range wanted {
+			if haveNorm == strings.ToLower(strings.TrimSpace(want)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // buildGraphHealth constructs graph health metrics from stats
@@ -1518,7 +1661,7 @@ func EnhanceRecommendationWithTriageReasons(rec *Recommendation, triageReasons T
 //
 // This differs from the previous connected-components approach which created
 // one track per disconnected work stream (issue #68).
-func buildRecommendationsByTrack(recs []Recommendation, analyzer *Analyzer, unblocksMap map[string][]string) []TrackRecommendationGroup {
+func buildRecommendationsByTrack(recs []Recommendation, analyzer *Analyzer, unblocksMap map[string][]string, notReadyLabels []string, parentsWithOpenChildren map[string]bool) []TrackRecommendationGroup {
 	// Compute blocker depth for all recommendations.
 	// Depth 0 = actionable now (no blockers), Depth N = blocked by depth-(N-1) items.
 	blockerDepths := make(map[string]int, len(recs))
@@ -1594,7 +1737,7 @@ func buildRecommendationsByTrack(recs []Recommendation, analyzer *Analyzer, unbl
 		group.TotalUnblocks += len(unblocksMap[rec.ID])
 
 		// Update top pick (highest score in this layer)
-		if isClaimableRecommendation(rec) && (group.TopPick == nil || rec.Score > group.TopPick.Score) {
+		if isClaimableRecommendation(rec, notReadyLabels, parentsWithOpenChildren) && (group.TopPick == nil || rec.Score > group.TopPick.Score) {
 			group.TopPick = &TopPick{
 				ID:       rec.ID,
 				Title:    rec.Title,
@@ -1636,7 +1779,7 @@ func layerReason(depth int, totalRecs int) string {
 }
 
 // buildRecommendationsByLabel groups recommendations by label
-func buildRecommendationsByLabel(recs []Recommendation, unblocksMap map[string][]string) []LabelRecommendationGroup {
+func buildRecommendationsByLabel(recs []Recommendation, unblocksMap map[string][]string, notReadyLabels []string, parentsWithOpenChildren map[string]bool) []LabelRecommendationGroup {
 	groups := make(map[string]*LabelRecommendationGroup)
 
 	for _, rec := range recs {
@@ -1654,7 +1797,7 @@ func buildRecommendationsByLabel(recs []Recommendation, unblocksMap map[string][
 		group.Recommendations = append(group.Recommendations, rec)
 		group.TotalUnblocks += len(unblocksMap[rec.ID])
 
-		if isClaimableRecommendation(rec) && (group.TopPick == nil || rec.Score > group.TopPick.Score) {
+		if isClaimableRecommendation(rec, notReadyLabels, parentsWithOpenChildren) && (group.TopPick == nil || rec.Score > group.TopPick.Score) {
 			group.TopPick = &TopPick{
 				ID:       rec.ID,
 				Title:    rec.Title,

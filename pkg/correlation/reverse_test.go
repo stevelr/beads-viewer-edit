@@ -1,6 +1,7 @@
 package correlation
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -102,6 +103,27 @@ func TestNewReverseLookup(t *testing.T) {
 	}
 }
 
+func TestNewReverseLookup_NilReport(t *testing.T) {
+	rl := NewReverseLookup(nil)
+	if rl == nil {
+		t.Fatal("NewReverseLookup returned nil")
+	}
+	if len(rl.index) != 0 {
+		t.Errorf("index has %d entries, want 0", len(rl.index))
+	}
+	if len(rl.beads) != 0 {
+		t.Errorf("beads has %d entries, want 0", len(rl.beads))
+	}
+
+	result, err := rl.LookupByCommit("abc123")
+	if err != nil {
+		t.Fatalf("LookupByCommit on empty lookup failed: %v", err)
+	}
+	if !result.IsOrphan {
+		t.Fatal("empty lookup should mark unknown commit as orphan")
+	}
+}
+
 func TestLookupByCommit_Found(t *testing.T) {
 	report := createTestReport()
 	rl := NewReverseLookup(report)
@@ -146,6 +168,74 @@ func TestLookupByCommit_ShortSHA(t *testing.T) {
 
 	if len(result.RelatedBeads) != 2 {
 		t.Errorf("RelatedBeads has %d entries, want 2", len(result.RelatedBeads))
+	}
+}
+
+func TestLookupByCommit_UppercaseShortSHA(t *testing.T) {
+	report := createTestReport()
+	rl := NewReverseLookup(report)
+
+	result, err := rl.LookupByCommit("ABC123")
+	if err != nil {
+		t.Fatalf("LookupByCommit with uppercase short SHA failed: %v", err)
+	}
+	if result.CommitSHA != "abc123def456" {
+		t.Fatalf("CommitSHA = %q, want abc123def456", result.CommitSHA)
+	}
+	if result.IsOrphan {
+		t.Fatal("uppercase short SHA should resolve to indexed commit")
+	}
+}
+
+func TestLookupByCommit_EmptySHARejected(t *testing.T) {
+	report := createTestReport()
+	rl := NewReverseLookup(report)
+
+	result, err := rl.LookupByCommit(" \t ")
+	if err == nil {
+		t.Fatal("expected empty SHA to be rejected")
+	}
+	if result != nil {
+		t.Fatalf("result = %#v, want nil on validation error", result)
+	}
+	if !strings.Contains(err.Error(), "commit SHA is required") {
+		t.Fatalf("error = %q, want missing SHA message", err.Error())
+	}
+}
+
+func TestLookupByCommit_AmbiguousShortSHARejected(t *testing.T) {
+	now := time.Now()
+	report := createTestReport()
+	report.CommitIndex["abc123zzz999"] = []string{"bv-ambiguous"}
+	report.Histories["bv-ambiguous"] = BeadHistory{
+		BeadID: "bv-ambiguous",
+		Title:  "Ambiguous short SHA",
+		Status: "closed",
+		Commits: []CorrelatedCommit{
+			{
+				SHA:         "abc123zzz999",
+				ShortSHA:    "abc123z",
+				Message:     "fix: ambiguous prefix",
+				Author:      "Dev Three",
+				AuthorEmail: "dev3@test.com",
+				Timestamp:   now,
+				Method:      MethodExplicitID,
+				Confidence:  0.88,
+				Reason:      "Explicit ID",
+			},
+		},
+	}
+	rl := NewReverseLookup(report)
+
+	result, err := rl.LookupByCommit("abc123")
+	if err == nil {
+		t.Fatal("expected ambiguous short SHA to be rejected")
+	}
+	if result != nil {
+		t.Fatalf("result = %#v, want nil on ambiguity", result)
+	}
+	if !strings.Contains(err.Error(), "ambiguous commit SHA prefix") {
+		t.Fatalf("error = %q, want ambiguity message", err.Error())
 	}
 }
 
@@ -277,6 +367,8 @@ func TestNormalizeSHA(t *testing.T) {
 		{"abc123def456", "abc123def456"}, // Full SHA in index
 		{"abc123", "abc123def456"},       // Short prefix expands
 		{"def456", "def456ghi789"},       // Another short prefix
+		{"  def456  ", "def456ghi789"},   // Surrounding whitespace is ignored
+		{"", ""},                         // Empty input cannot be expanded
 		{"unknown", "unknown"},           // Unknown stays as-is
 	}
 

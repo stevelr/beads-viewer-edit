@@ -261,21 +261,23 @@ func AuthenticateWrangler() error {
 // GenerateHeadersFile creates a _headers file for Cloudflare Pages.
 // This provides security headers without needing a service worker.
 func GenerateHeadersFile(bundlePath string) error {
-	headersContent := `/*
-  X-Frame-Options: DENY
-  X-Content-Type-Options: nosniff
-  Referrer-Policy: strict-origin-when-cross-origin
-  Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()
-
-/*.js
-  Content-Type: application/javascript; charset=utf-8
-
-/*.wasm
-  Content-Type: application/wasm
-
-/*.css
-  Content-Type: text/css; charset=utf-8
-`
+	headersContent := "/*\n" +
+		"  X-Frame-Options: DENY\n" +
+		"  X-Content-Type-Options: nosniff\n" +
+		"  Referrer-Policy: strict-origin-when-cross-origin\n" +
+		"  Cross-Origin-Opener-Policy: same-origin\n" +
+		"  Cross-Origin-Embedder-Policy: require-corp\n" +
+		"  Cross-Origin-Resource-Policy: same-origin\n" +
+		"  Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()\n" +
+		"\n" +
+		"/*.js\n" +
+		"  Content-Type: application/javascript; charset=utf-8\n" +
+		"\n" +
+		"/*.wasm\n" +
+		"  Content-Type: application/wasm\n" +
+		"\n" +
+		"/*.css\n" +
+		"  Content-Type: text/css; charset=utf-8\n"
 
 	headersPath := filepath.Join(bundlePath, "_headers")
 	if err := os.WriteFile(headersPath, []byte(headersContent), 0644); err != nil {

@@ -4,15 +4,18 @@ package correlation
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
+
+	json "github.com/goccy/go-json"
 )
 
 // ExtractOptions controls which commits and beads to extract events from
@@ -27,6 +30,11 @@ type ExtractOptions struct {
 type Extractor struct {
 	repoPath   string
 	beadsFiles []string // Files to track (e.g., .beads/beads.jsonl, .beads/issues.jsonl)
+
+	// ctx, when set (via Correlator.WithContext or directly), bounds the git
+	// subprocesses spawned during extraction (issue #166). nil means
+	// context.Background().
+	ctx context.Context
 }
 
 // NewExtractor creates a new extractor for the given repository.
@@ -81,13 +89,86 @@ type beadSnapshot struct {
 	Title  string
 }
 
-// Extract extracts bead lifecycle events from git history
+// snapshotBlobSizeThreshold is the followed-file blob size (in bytes) at or above
+// which Extract prefers the snapshot path over the legacy `git log -p` path.
+//
+// The legacy `-p` path asks git to run its Myers diff over the whole multi-MB
+// JSONL blob at every commit *and stream the full patch text back* — its cost is
+// dominated by that one subprocess and grows with blob size. The snapshot path
+// (pass-3 rewrite) instead runs a metadata-only `git log --raw` (~constant), reads
+// each *unique* blob once through a single `git cat-file --batch`, and computes
+// the per-commit record diff in Go with a 64-bit-hashed line multiset. It pays
+// one extra git fork but no per-commit diff, so it wins as soon as the blob is
+// big enough for git's diff to cost more than that fork.
+//
+// Measured on this machine (200-commit histories, warm cache, real
+// extractViaSnapshots vs extractViaGitLogPatch):
+//
+//	blob       legacy `-p`     snapshot     winner
+//	~1 KB      ~9.1 ms         ~12.6 ms     legacy (by ~3 ms, irrelevant)
+//	~100 KB    ~150 ms         ~84 ms       snapshot (~1.8x)
+//	~1.9 MB    ~853 ms         ~561 ms      snapshot (~1.5x)
+//
+// The only regime where legacy wins is a sub-KB blob, where the whole extraction
+// is already <15 ms and the difference is a few milliseconds. The crossover sits
+// well under 100 KB, so we gate at 64 KB: any real beads history takes the fast
+// snapshot path (including this repo's 1.9 MB blob, the #161 case), while a
+// pathologically tiny repo keeps the marginally-faster native diff where it
+// cannot matter. Output is byte-identical on either side of the gate (verified by
+// the differential test and the golden artifacts), so the threshold is purely a
+// speed/heuristic knob and never changes triage results.
+const snapshotBlobSizeThreshold = 64 * 1024 // 64 KB
+
+// Extract extracts bead lifecycle events from git history.
+//
+// It reconstructs lifecycle events from per-commit JSONL snapshot differences
+// (extractViaSnapshots) instead of asking git to produce a full textual patch
+// (`git log -p`) of the followed beads blob. The `-p` path runs git's diff over
+// the whole multi-MB JSONL at every commit (O(blob x commits)) and dominated
+// `--robot-triage` on large repos (#161). The snapshot path reads each blob and
+// computes the changed record lines in Go, feeding the *unchanged* parseDiff so
+// event semantics are identical (proven by the differential test).
+//
+// The two paths produce byte-identical events; they differ only in cost profile,
+// so Extract dispatches on the followed file's current blob size: large blobs
+// (where `-p` blows up to minutes) take the snapshot path; small blobs take the
+// faster native path. See snapshotBlobSizeThreshold.
 func (e *Extractor) Extract(opts ExtractOptions) ([]BeadEvent, error) {
+	if e.preferSnapshotPath() {
+		return e.extractViaSnapshots(opts)
+	}
+	return e.extractViaGitLogPatch(opts)
+}
+
+// preferSnapshotPath reports whether the followed beads file's current (HEAD)
+// blob is large enough that the snapshot path should be used. It runs a single
+// cheap `git cat-file -s HEAD:<file>`. If the size cannot be determined (no
+// history yet, untracked file, detached/empty repo), it returns true so the
+// snapshot path — which already degrades gracefully to "no commits" — handles the
+// edge case, never falling back to a slower-or-equal native diff in that case.
+func (e *Extractor) preferSnapshotPath() bool {
+	primary := e.primaryBeadsFile()
+	cmd := gitCommand(e.ctx, "cat-file", "-s", "HEAD:"+primary)
+	cmd.Dir = e.repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return true
+	}
+	var size int64
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &size); err != nil {
+		return true
+	}
+	return size >= snapshotBlobSizeThreshold
+}
+
+// extractViaGitLogPatch is the legacy `git log -p` extraction path, retained for
+// reference and differential testing against extractViaSnapshots.
+func (e *Extractor) extractViaGitLogPatch(opts ExtractOptions) ([]BeadEvent, error) {
 	// Build git log command
 	logArgs := e.buildGitLogArgs(opts)
 
 	// Disable colors so patch lines still start with raw '+' and '-'.
-	cmd := exec.Command("git", withNoColorGit(logArgs)...)
+	cmd := gitCommand(e.ctx, withNoColorGit(logArgs)...)
 	cmd.Dir = e.repoPath
 
 	stdout, err := cmd.StdoutPipe()
@@ -131,6 +212,7 @@ func (e *Extractor) buildGitLogArgs(opts ExtractOptions) []string {
 	args := []string{
 		"log",
 		"-p",                             // Include patch/diff
+		"--unified=0",                    // Zero context: parser only needs +/- JSONL lines, not unchanged records (#160)
 		"--follow",                       // Track renames; requires a single pathspec (handled below)
 		"--format=" + gitLogHeaderFormat, // Custom format for commit info
 		"--",
@@ -345,8 +427,20 @@ func (e *Extractor) parseDiff(diffData []byte, info commitInfo, filterBeadID str
 		}
 	}
 
-	// Generate events by comparing old and new states
+	// Generate events by comparing old and new states. Iterate the affected bead
+	// IDs in a deterministic (sorted) order rather than Go's randomized map order:
+	// the within-commit event order is then stable across runs, which (a) makes
+	// the per-commit event cache's replayed order byte-identical to a fresh full
+	// extraction (the incremental path's correctness contract), and (b) removes a
+	// latent run-to-run non-determinism in the emitted event sequence. Downstream
+	// consumers group events by bead ID and timestamps are equal within a commit,
+	// so this does not change any report/golden output — it only fixes the order.
+	sortedBeadIDs := make([]string, 0, len(seenBeads))
 	for beadID := range seenBeads {
+		sortedBeadIDs = append(sortedBeadIDs, beadID)
+	}
+	sort.Strings(sortedBeadIDs)
+	for _, beadID := range sortedBeadIDs {
 		oldSnap, hadOld := oldBeads[beadID]
 		newSnap, hasNew := newBeads[beadID]
 

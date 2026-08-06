@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -187,8 +188,8 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO issues (id, title, description, status, priority, issue_type, assignee, labels, created_at, updated_at, closed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, assignee, labels, created_at, updated_at, closed_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -212,6 +213,9 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 			issue.ID,
 			issue.Title,
 			issue.Description,
+			issue.Design,
+			issue.AcceptanceCriteria,
+			issue.Notes,
 			string(issue.Status),
 			issue.Priority,
 			string(issue.IssueType),
@@ -575,6 +579,15 @@ func (e *SQLiteExporter) chunkIfNeeded(outputDir, dbPath string) error {
 
 	if info.Size() < e.Config.ChunkThreshold {
 		config.Chunked = false
+		// A previous export of a larger DB may have left a chunks/ directory
+		// behind. The config we are about to write says chunked=false, but the
+		// stale chunk files would still be served (HTTP 200), so a client/cache
+		// holding the prior chunked config would reassemble a malformed DB image
+		// ("database disk image is malformed", #175). Remove the chunk artifacts
+		// this exporter owns so the unchunked export leaves nothing behind.
+		if err := removeChunkArtifacts(filepath.Join(outputDir, "chunks")); err != nil {
+			return err
+		}
 		return writeJSON(filepath.Join(outputDir, "beads.sqlite3.config.json"), config)
 	}
 
@@ -611,6 +624,17 @@ func (e *SQLiteExporter) chunkIfNeeded(outputDir, dbPath string) error {
 		}
 	}
 
+	// Remove any orphaned chunks from a previous, larger export so chunks/ holds
+	// exactly the chunks this export produced. Without this, a DB that shrinks
+	// across a chunk boundary (e.g. after a recovery/rebuild/VACUUM) leaves stale
+	// higher-numbered chunk files behind; a client/cache still holding the prior
+	// chunk config then splices new[0..N-1] + stale[N..M-1] into a malformed
+	// SQLite image (#175). Pruning happens after the new chunks are written so a
+	// reader is never left without the low-numbered chunks mid-export.
+	if err := pruneStaleChunks(chunksDir, chunkNum); err != nil {
+		return err
+	}
+
 	// Populate chunk metadata
 	config.Chunked = true
 	config.ChunkCount = chunkNum
@@ -635,6 +659,70 @@ func (e *SQLiteExporter) chunkIfNeeded(outputDir, dbPath string) error {
 	}
 
 	return writeJSON(filepath.Join(outputDir, "beads.sqlite3.config.json"), config)
+}
+
+// chunkFileIndex returns the chunk index encoded in a "NNNNN.bin" file name and
+// whether the name matches the exact chunk-file pattern this exporter produces
+// (five digits + ".bin"). This is deliberately strict so chunk cleanup only ever
+// touches files the exporter itself created, never any other file a user may
+// have placed under the export's chunks/ directory.
+func chunkFileIndex(name string) (int, bool) {
+	stem, ok := strings.CutSuffix(name, ".bin")
+	if !ok || len(stem) != 5 {
+		return 0, false
+	}
+	for _, r := range stem {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	idx, err := strconv.Atoi(stem)
+	if err != nil {
+		return 0, false
+	}
+	return idx, true
+}
+
+// pruneStaleChunks removes "NNNNN.bin" chunk files in chunksDir whose index is
+// >= keep. It only removes files matching the exporter's own chunk naming
+// (chunkFileIndex), so it never deletes unrelated content. A missing chunks
+// directory is not an error.
+func pruneStaleChunks(chunksDir string, keep int) error {
+	entries, err := os.ReadDir(chunksDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("list chunks dir: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		idx, ok := chunkFileIndex(entry.Name())
+		if !ok || idx < keep {
+			continue
+		}
+		if err := os.Remove(filepath.Join(chunksDir, entry.Name())); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale chunk %s: %w", entry.Name(), err)
+		}
+	}
+	return nil
+}
+
+// removeChunkArtifacts removes every chunk file this exporter owns from chunksDir
+// and then removes the directory itself if it is left empty. Used when an export
+// falls below the chunk threshold so a prior chunked export leaves nothing
+// behind (#175). os.Remove on the directory only succeeds when it is empty, so
+// any unrelated user file keeps both the file and the directory intact — this
+// never does a recursive delete.
+func removeChunkArtifacts(chunksDir string) error {
+	if err := pruneStaleChunks(chunksDir, 0); err != nil {
+		return err
+	}
+	// Best-effort: drop the directory only if our chunks were the only contents.
+	_ = os.Remove(chunksDir)
+	return nil
 }
 
 // writeJSON writes data as JSON to a file.
@@ -679,17 +767,20 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 	result := make([]ExportIssue, len(e.Issues))
 	for i, issue := range e.Issues {
 		exp := ExportIssue{
-			ID:          issue.ID,
-			Title:       issue.Title,
-			Description: issue.Description,
-			Status:      issue.Status,
-			Priority:    issue.Priority,
-			IssueType:   issue.IssueType,
-			Assignee:    issue.Assignee,
-			Labels:      issue.Labels,
-			CreatedAt:   issue.CreatedAt,
-			UpdatedAt:   issue.UpdatedAt,
-			ClosedAt:    issue.ClosedAt,
+			ID:                 issue.ID,
+			Title:              issue.Title,
+			Description:        issue.Description,
+			Design:             issue.Design,
+			AcceptanceCriteria: issue.AcceptanceCriteria,
+			Notes:              issue.Notes,
+			Status:             issue.Status,
+			Priority:           issue.Priority,
+			IssueType:          issue.IssueType,
+			Assignee:           issue.Assignee,
+			Labels:             issue.Labels,
+			CreatedAt:          issue.CreatedAt,
+			UpdatedAt:          issue.UpdatedAt,
+			ClosedAt:           issue.ClosedAt,
 		}
 
 		if m := e.Metrics; m != nil {

@@ -31,6 +31,11 @@ func TestContainsBlurb(t *testing.T) {
 			content:  "# My AGENTS.md\n\n<!-- bv-agent-instructions-v2 -->\nSome content\n<!-- end-bv-agent-instructions -->",
 			expected: true,
 		},
+		{
+			name:     "has blurb v3",
+			content:  "# My AGENTS.md\n\n<!-- bv-agent-instructions-v3 -->\nSome content\n<!-- end-bv-agent-instructions -->",
+			expected: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -65,6 +70,11 @@ func TestGetBlurbVersion(t *testing.T) {
 			expected: 2,
 		},
 		{
+			name:     "version 3",
+			content:  "<!-- bv-agent-instructions-v3 -->",
+			expected: 3,
+		},
+		{
 			name:     "version 10 (multi-digit)",
 			content:  "<!-- bv-agent-instructions-v10 -->",
 			expected: 10,
@@ -96,8 +106,8 @@ func TestAppendBlurb(t *testing.T) {
 	}
 
 	// Should contain key content
-	if !strings.Contains(result, "br ready") {
-		t.Error("AppendBlurb() result missing 'br ready' command")
+	if !strings.Contains(result, "br ready --json") {
+		t.Error("AppendBlurb() result missing 'br ready --json' command")
 	}
 
 	// Should preserve original content
@@ -207,7 +217,7 @@ func TestUpdateBlurb(t *testing.T) {
 	}
 
 	// Should have current blurb content
-	if !strings.Contains(result, "br ready") {
+	if !strings.Contains(result, "br ready --json") {
 		t.Error("UpdateBlurb() result missing current blurb content")
 	}
 
@@ -230,13 +240,18 @@ func TestNeedsUpdate(t *testing.T) {
 		},
 		{
 			name:     "current version",
+			content:  "<!-- bv-agent-instructions-v3 -->",
+			expected: false, // v3 is current, no update needed
+		},
+		{
+			name:     "old v2 needs update",
 			content:  "<!-- bv-agent-instructions-v2 -->",
-			expected: false, // v2 is current, no update needed
+			expected: true, // v2 has stale JSONL/git guidance
 		},
 		{
 			name:     "old v1 needs update",
 			content:  "<!-- bv-agent-instructions-v1 -->",
-			expected: true, // v1 is old, needs update to v2
+			expected: true, // v1 is old, needs update to v3
 		},
 	}
 
@@ -253,12 +268,12 @@ func TestNeedsUpdate(t *testing.T) {
 func TestAgentBlurbContent(t *testing.T) {
 	// Verify blurb contains essential br AND bv commands
 	essentials := []string{
-		"br ready",
-		"br list",
-		"br show",
+		"br ready --json",
+		"br list --status=open --json",
+		"br show <id> --json",
 		"br create",
-		"br update",
-		"br close",
+		"br update <id> --status=in_progress --json",
+		"br close <id> --reason=\"Completed\" --json",
 		"br sync",
 		"br dep add",
 		"bv --robot-triage",
@@ -279,6 +294,31 @@ func TestAgentBlurbContent(t *testing.T) {
 	}
 	if !strings.HasSuffix(strings.TrimSpace(AgentBlurb), BlurbEndMarker) {
 		t.Error("AgentBlurb should end with BlurbEndMarker")
+	}
+
+	forbidden := []string{
+		"(.beads/beads.jsonl)",
+		"br ready              #",
+		"br list --status=open #",
+		"br show <id>          #",
+		"git commit -m",
+		"git push",
+	}
+	for _, text := range forbidden {
+		if strings.Contains(AgentBlurb, text) {
+			t.Errorf("AgentBlurb contains stale or overbroad guidance: %q", text)
+		}
+	}
+
+	required := []string{
+		".beads/issues.jsonl",
+		"legacy workspaces may use `.beads/beads.jsonl`",
+		"Follow this repository's own git instructions",
+	}
+	for _, text := range required {
+		if !strings.Contains(AgentBlurb, text) {
+			t.Errorf("AgentBlurb missing required v3 guidance: %q", text)
+		}
 	}
 }
 
@@ -479,7 +519,7 @@ func TestUpdateBlurbFromLegacy(t *testing.T) {
 	}
 
 	// Should have current blurb content
-	if !strings.Contains(result, "br ready") {
+	if !strings.Contains(result, "br ready --json") {
 		t.Error("UpdateBlurb() from legacy missing current blurb content")
 	}
 
@@ -506,7 +546,7 @@ func TestNeedsUpdateLegacy(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:     "current blurb v2 no update",
+			name:     "current blurb v3 no update",
 			content:  "# AGENTS.md\n\n" + AgentBlurb,
 			expected: false,
 		},

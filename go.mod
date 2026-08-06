@@ -7,7 +7,7 @@ go 1.25.0
 toolchain go1.25.5
 
 require (
-	git.sr.ht/~sbinet/gg v0.7.0
+	git.sr.ht/~sbinet/gg v0.8.0
 	github.com/Dicklesworthstone/toon-go v0.0.0-20260322013033-4564467a45fb
 	github.com/ajstarks/svgo v0.0.0-20211024235047-1546f124cd8b
 	github.com/atotto/clipboard v0.1.4
@@ -19,16 +19,16 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.1-0.20250404203927-76690c660834
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/goccy/go-json v0.10.6
-	github.com/mattn/go-runewidth v0.0.23
+	github.com/mattn/go-runewidth v0.0.24
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
-	golang.org/x/image v0.40.0
-	golang.org/x/sync v0.20.0
-	golang.org/x/sys v0.44.0
-	golang.org/x/term v0.43.0
+	golang.org/x/image v0.42.0
+	golang.org/x/sync v0.21.0
+	golang.org/x/sys v0.46.0
+	golang.org/x/term v0.44.0
 	gonum.org/v1/gonum v0.17.0
 	gopkg.in/yaml.v3 v3.0.1
-	modernc.org/sqlite v1.50.1
+	modernc.org/sqlite v1.52.0
 	pgregory.net/rapid v1.3.0
 )
 
@@ -76,8 +76,7 @@ require (
 	github.com/yuin/goldmark-emoji v1.0.6 // indirect
 	golang.org/x/exp v0.0.0-20260508232706-74f9aab9d74a // indirect
 	golang.org/x/net v0.54.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
-	golang.org/x/tools v0.45.0 // indirect
+	golang.org/x/text v0.38.0 // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 	modernc.org/gc/v3 v3.1.3 // indirect
 	modernc.org/libc v1.72.3 // indirect

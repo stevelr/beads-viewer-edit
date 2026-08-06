@@ -322,7 +322,7 @@ func TestSQLiteReader_FallbackSchemaLoadsGraphMetadata(t *testing.T) {
 			created_at TEXT NOT NULL
 		);
 		INSERT INTO issues (id, title, description, status, priority, issue_type, assignee, labels, created_at, updated_at)
-		VALUES ('EXP-1', 'Export issue', 'from export schema', 'open', 1, 'task', '', '["graph","sqlite"]', ?, ?);
+		VALUES ('EXP-1', 'Export issue', 'from export schema', 'open', 1, 'task', 'cc11', '["graph","sqlite"]', ?, ?);
 		INSERT INTO issues (id, title, description, status, priority, issue_type, assignee, labels, created_at, updated_at)
 		VALUES ('ROOT-1', 'Root issue', '', 'open', 2, 'task', '', '[]', ?, ?);
 		INSERT INTO dependencies (issue_id, depends_on_id, type)
@@ -349,6 +349,9 @@ func TestSQLiteReader_FallbackSchemaLoadsGraphMetadata(t *testing.T) {
 	}
 	if len(issue.Labels) != 2 || issue.Labels[0] != "graph" || issue.Labels[1] != "sqlite" {
 		t.Fatalf("expected labels from fallback schema, got %#v", issue.Labels)
+	}
+	if issue.Assignee != "cc11" {
+		t.Fatalf("expected assignee from fallback schema, got %q", issue.Assignee)
 	}
 	if len(issue.Dependencies) != 1 {
 		t.Fatalf("expected one dependency from fallback schema, got %#v", issue.Dependencies)

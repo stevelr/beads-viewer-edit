@@ -290,25 +290,30 @@ func TestHistoryCache_Stats(t *testing.T) {
 
 func TestHashBeads(t *testing.T) {
 	beads1 := []BeadInfo{
-		{ID: "bv-1", Status: "open"},
-		{ID: "bv-2", Status: "closed"},
+		{ID: "bv-1", Title: "First", Status: "open"},
+		{ID: "bv-2", Title: "Second", Status: "closed"},
 	}
 	beads2 := []BeadInfo{
-		{ID: "bv-1", Status: "open"},
-		{ID: "bv-2", Status: "closed"},
+		{ID: "bv-1", Title: "First", Status: "open"},
+		{ID: "bv-2", Title: "Second", Status: "closed"},
 	}
 	beads3 := []BeadInfo{
-		{ID: "bv-1", Status: "closed"}, // Different status
-		{ID: "bv-2", Status: "closed"},
+		{ID: "bv-1", Title: "First", Status: "closed"}, // Different status
+		{ID: "bv-2", Title: "Second", Status: "closed"},
+	}
+	beads4 := []BeadInfo{
+		{ID: "bv-1", Title: "First renamed", Status: "open"}, // Different title
+		{ID: "bv-2", Title: "Second", Status: "closed"},
 	}
 	beadsReordered := []BeadInfo{
-		{ID: "bv-2", Status: "closed"},
-		{ID: "bv-1", Status: "open"},
+		{ID: "bv-2", Title: "Second", Status: "closed"},
+		{ID: "bv-1", Title: "First", Status: "open"},
 	}
 
 	hash1 := hashBeads(beads1)
 	hash2 := hashBeads(beads2)
 	hash3 := hashBeads(beads3)
+	hash4 := hashBeads(beads4)
 	hashReordered := hashBeads(beadsReordered)
 
 	// Same input should produce same hash
@@ -321,7 +326,10 @@ func TestHashBeads(t *testing.T) {
 
 	// Different input should produce different hash
 	if hash1 == hash3 {
-		t.Error("Different beads should produce different hash")
+		t.Error("Different bead statuses should produce different hash")
+	}
+	if hash1 == hash4 {
+		t.Error("Different bead titles should produce different hash")
 	}
 
 	// Hash should be 12 chars
@@ -357,12 +365,9 @@ func TestHashOptions(t *testing.T) {
 }
 
 func TestCachedCorrelator_CacheHitAndMiss(t *testing.T) {
-	// Skip if not in a git repo
-	if _, err := getGitHead("."); err != nil {
-		t.Skip("Not in a git repository")
-	}
-
-	correlator := NewCachedCorrelator(".")
+	repoPath := initTempGitRepo(t)
+	correlator := NewCachedCorrelator(repoPath)
+	correlator.shouldRefreshFn = neverRefreshForTest
 	beads := []BeadInfo{{ID: "test-1", Status: "open"}}
 	opts := CorrelatorOptions{Limit: 10}
 
@@ -399,12 +404,9 @@ func TestCachedCorrelator_CacheHitAndMiss(t *testing.T) {
 }
 
 func TestCachedCorrelator_DifferentOptionsMiss(t *testing.T) {
-	// Skip if not in a git repo
-	if _, err := getGitHead("."); err != nil {
-		t.Skip("Not in a git repository")
-	}
-
-	correlator := NewCachedCorrelator(".")
+	repoPath := initTempGitRepo(t)
+	correlator := NewCachedCorrelator(repoPath)
+	correlator.shouldRefreshFn = neverRefreshForTest
 	beads := []BeadInfo{{ID: "test-1", Status: "open"}}
 
 	// First call
@@ -426,12 +428,9 @@ func TestCachedCorrelator_DifferentOptionsMiss(t *testing.T) {
 }
 
 func TestCachedCorrelator_InvalidateCache(t *testing.T) {
-	// Skip if not in a git repo
-	if _, err := getGitHead("."); err != nil {
-		t.Skip("Not in a git repository")
-	}
-
-	correlator := NewCachedCorrelator(".")
+	repoPath := initTempGitRepo(t)
+	correlator := NewCachedCorrelator(repoPath)
+	correlator.shouldRefreshFn = neverRefreshForTest
 	beads := []BeadInfo{{ID: "test-1", Status: "open"}}
 	opts := CorrelatorOptions{Limit: 10}
 
@@ -488,12 +487,9 @@ func TestNewCachedCorrelatorWithOptionsForwardsExplicitBeadsPath(t *testing.T) {
 }
 
 func TestCachedCorrelator_Singleflight(t *testing.T) {
-	// Skip if not in a git repo
-	if _, err := getGitHead("."); err != nil {
-		t.Skip("Not in a git repository")
-	}
-
-	correlator := NewCachedCorrelator(".")
+	repoPath := initTempGitRepo(t)
+	correlator := NewCachedCorrelator(repoPath)
+	correlator.shouldRefreshFn = neverRefreshForTest
 	beads := []BeadInfo{{ID: "test-1", Status: "open"}}
 	opts := CorrelatorOptions{Limit: 10}
 
@@ -959,6 +955,10 @@ func runGit(t *testing.T, repoPath string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, out)
 	}
+}
+
+func neverRefreshForTest(time.Time, time.Duration, float64, time.Time) bool {
+	return false
 }
 
 func TestCacheKey_Empty(t *testing.T) {

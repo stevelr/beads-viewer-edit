@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // TestRobotPlanAndPriorityIncludeMetadata runs the built binary against a tiny fixture project
@@ -133,6 +136,117 @@ func TestTOONOutputFormat(t *testing.T) {
 	// Should contain key: value pattern typical of TOON
 	if !containsKeyValuePattern(toonOut) {
 		t.Fatalf("TOON output doesn't look like TOON: %s", toonOut[:min(200, len(toonOut))])
+	}
+}
+
+func TestRobotNextFailClosedWhenNoClaimableItem(t *testing.T) {
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir beads: %v", err)
+	}
+
+	beads := `{"id":"BLOCKED-1","title":"Blocked high impact","status":"blocked","priority":0,"issue_type":"bug"}
+{"id":"OWNED-1","title":"Already owned","status":"open","assignee":"OtherAgent","priority":1,"issue_type":"task"}
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(beads), 0o644); err != nil {
+		t.Fatalf("write beads: %v", err)
+	}
+
+	exe := buildTestBinary(t)
+	cmd := exec.Command(exe, "--robot-next", "--format=json")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("robot-next failed: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("robot-next json: %v\n%s", err, out)
+	}
+	if got := payload["actionable"]; got != false {
+		t.Fatalf("actionable = %v, want false; payload=%v", got, payload)
+	}
+	if _, ok := payload["claim_command"]; ok {
+		t.Fatalf("fail-closed robot-next must not emit claim_command: %s", out)
+	}
+	if _, ok := payload["status"].(map[string]any); !ok {
+		t.Fatalf("robot-next missing metric status: %s", out)
+	}
+	degraded, ok := payload["degraded"].([]any)
+	if !ok || len(degraded) == 0 {
+		t.Fatalf("robot-next fail-closed response missing degraded[]: %s", out)
+	}
+	first, ok := degraded[0].(map[string]any)
+	if !ok || first["code"] != "no_actionable_recommendation" {
+		t.Fatalf("unexpected degraded payload: %v", degraded)
+	}
+}
+
+func TestRobotNextEmitsClaimOnlyForSafeTopPick(t *testing.T) {
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir beads: %v", err)
+	}
+
+	beads := `{"id":"READY-1","title":"Ready work","status":"open","priority":1,"issue_type":"task"}
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(beads), 0o644); err != nil {
+		t.Fatalf("write beads: %v", err)
+	}
+
+	exe := buildTestBinary(t)
+	cmd := exec.Command(exe, "--robot-next", "--format=json")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("robot-next failed: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("robot-next json: %v\n%s", err, out)
+	}
+	if got := payload["actionable"]; got != true {
+		t.Fatalf("actionable = %v, want true; payload=%v", got, payload)
+	}
+	if got := payload["id"]; got != "READY-1" {
+		t.Fatalf("id = %v, want READY-1; payload=%v", got, payload)
+	}
+	claim, ok := payload["claim_command"].(string)
+	if !ok || !strings.Contains(claim, "READY-1") {
+		t.Fatalf("safe robot-next missing claim command for READY-1: %s", out)
+	}
+	if _, ok := payload["status"].(map[string]any); !ok {
+		t.Fatalf("robot-next missing metric status: %s", out)
+	}
+}
+
+func TestRobotNextClaimablePickRejectsAssignedTopPick(t *testing.T) {
+	picks := []analysis.TopPick{{
+		ID:    "ASSIGNED-1",
+		Title: "Already owned",
+		Score: 100,
+	}}
+	issues := []model.Issue{{
+		ID:        "ASSIGNED-1",
+		Title:     "Already owned",
+		Status:    model.StatusOpen,
+		IssueType: model.TypeTask,
+		Assignee:  " cc11 ",
+	}}
+
+	_, diagnostic, reasons, ok := robotNextClaimablePick(picks, issues)
+	if ok {
+		t.Fatalf("assigned top pick must not be claimable")
+	}
+	if diagnostic == nil || diagnostic.ID != "ASSIGNED-1" {
+		t.Fatalf("diagnostic = %+v, want ASSIGNED-1", diagnostic)
+	}
+	if len(reasons) == 0 || !strings.Contains(strings.Join(reasons, "; "), "assigned") {
+		t.Fatalf("reasons = %v, want assigned reason", reasons)
 	}
 }
 

@@ -1731,6 +1731,12 @@ func (m *InsightsModel) buildDetailMarkdown(selectedID string) string {
 		sb.WriteString(fmt.Sprintf("| **Assignee** | @%s |\n", issue.Assignee))
 	}
 	sb.WriteString(fmt.Sprintf("| **Created** | %s |\n", issue.CreatedAt.Format("2006-01-02")))
+	// External reference (e.g. a linked spec/report path or JIRA ticket).
+	// `br show` surfaces this as a "Ref:" line; mirror it here so the link is
+	// visible in the TUI instead of forcing it into the description (#172).
+	if issue.ExternalRef != nil && *issue.ExternalRef != "" {
+		sb.WriteString(fmt.Sprintf("| **External Ref** | `%s` |\n", *issue.ExternalRef))
+	}
 	sb.WriteString("\n")
 
 	// === Labels ===

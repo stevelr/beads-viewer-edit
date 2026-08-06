@@ -1,0 +1,12 @@
+{
+  "cpu_model": "AMD EPYC 7282 16-Core Processor",
+  "cores": 64,
+  "governor": "unknown",
+  "kernel": "6.17.0-22-generic",
+  "go": "go1.25.5",
+  "git": "2.51.2",
+  "ram_gb": 251,
+  "git_sha": "0ef0e25",
+  "workload": ".beads/issues.jsonl 757 issues / 1.9MB, 1307 commits, 168 correlated",
+  "build": "go build ./cmd/bv (default release)"
+}

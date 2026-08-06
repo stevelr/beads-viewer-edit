@@ -370,6 +370,68 @@ func TestFilterOrphanReportByMinScoreRebuildsDerivedFields(t *testing.T) {
 	}
 }
 
+func TestParseCorrelationArgTrimsAndRejectsEmptyParts(t *testing.T) {
+	commitSHA, beadID, err := parseCorrelationArg("  abc123 : bv-1  ")
+	if err != nil {
+		t.Fatalf("parseCorrelationArg returned error: %v", err)
+	}
+	if commitSHA != "abc123" {
+		t.Fatalf("commit SHA = %q, want abc123", commitSHA)
+	}
+	if beadID != "bv-1" {
+		t.Fatalf("bead ID = %q, want bv-1", beadID)
+	}
+
+	tests := []string{
+		"",
+		"abc123",
+		":bv-1",
+		"abc123:",
+		"   :   ",
+	}
+	for _, input := range tests {
+		t.Run(input, func(t *testing.T) {
+			if _, _, err := parseCorrelationArg(input); err == nil {
+				t.Fatalf("parseCorrelationArg(%q) succeeded, want error", input)
+			}
+		})
+	}
+}
+
+func TestResolveCorrelatedCommitRejectsAmbiguousPrefix(t *testing.T) {
+	commits := []correlation.CorrelatedCommit{
+		{SHA: "abc123def456", ShortSHA: "abc123d", Confidence: 0.8},
+		{SHA: "abc123fff000", ShortSHA: "abc123f", Confidence: 0.7},
+	}
+
+	commit, err := resolveCorrelatedCommit(commits, "abc123d")
+	if err != nil {
+		t.Fatalf("resolveCorrelatedCommit returned error: %v", err)
+	}
+	if commit == nil || commit.SHA != "abc123def456" {
+		t.Fatalf("resolved commit = %#v, want abc123def456", commit)
+	}
+
+	commit, err = resolveCorrelatedCommit(commits, "ABC123F")
+	if err != nil {
+		t.Fatalf("resolveCorrelatedCommit uppercase short SHA returned error: %v", err)
+	}
+	if commit == nil || commit.SHA != "abc123fff000" {
+		t.Fatalf("uppercase resolved commit = %#v, want abc123fff000", commit)
+	}
+
+	commit, err = resolveCorrelatedCommit(commits, "abc123")
+	if err == nil {
+		t.Fatal("expected ambiguous prefix error")
+	}
+	if commit != nil {
+		t.Fatalf("commit = %#v, want nil on ambiguity", commit)
+	}
+	if !strings.Contains(err.Error(), "ambiguous commit SHA prefix") {
+		t.Fatalf("error = %q, want ambiguity message", err.Error())
+	}
+}
+
 func ptrTo[T any](v T) *T {
 	return &v
 }

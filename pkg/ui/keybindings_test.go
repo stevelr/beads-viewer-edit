@@ -664,6 +664,46 @@ func TestKeyDispatch_Regression_HistorySearchConsumesGlobalKeys(t *testing.T) {
 	}
 }
 
+// TestKeyDispatch_Regression_LabelPickerConsumesQKey guards against issue #176:
+// the "Filter by Label" picker has an always-focused text input, so a lowercase
+// q must be typed into the filter rather than triggering the global quit/back
+// shortcut and closing the picker. Esc remains the way to cancel.
+func TestKeyDispatch_Regression_LabelPickerConsumesQKey(t *testing.T) {
+	m := setupTestModel(t)
+
+	updated, _ := m.Update(keyMsg("l"))
+	m = updated.(Model)
+	if m.focused != focusLabelPicker || !m.showLabelPicker {
+		t.Fatalf("expected label picker after 'l', got focused=%v showLabelPicker=%v", m.focused, m.showLabelPicker)
+	}
+
+	// Typing a lowercase q must append to the filter, not quit/close the picker.
+	updated, _ = m.Update(keyMsg("q"))
+	m = updated.(Model)
+	if !m.showLabelPicker || m.focused != focusLabelPicker {
+		t.Fatalf("expected label picker to stay open after typing 'q', got focused=%v showLabelPicker=%v", m.focused, m.showLabelPicker)
+	}
+	if got := m.labelPicker.InputValue(); got != "q" {
+		t.Fatalf("expected label filter input %q after typing 'q', got %q", "q", got)
+	}
+
+	// Subsequent printable chars keep appending (e.g. building "required").
+	for _, k := range []string{"u", "e"} {
+		updated, _ = m.Update(keyMsg(k))
+		m = updated.(Model)
+	}
+	if got := m.labelPicker.InputValue(); got != "que" {
+		t.Fatalf("expected label filter input %q, got %q", "que", got)
+	}
+
+	// Esc still cancels the picker and returns to the list.
+	updated, _ = m.Update(keyMsg("esc"))
+	m = updated.(Model)
+	if m.showLabelPicker || m.focused != focusList {
+		t.Fatalf("expected esc to cancel label picker, got focused=%v showLabelPicker=%v", m.focused, m.showLabelPicker)
+	}
+}
+
 func TestKeyDispatch_Regression_HistorySearchEnterKeepsFilter(t *testing.T) {
 	m := setupTestModel(t)
 

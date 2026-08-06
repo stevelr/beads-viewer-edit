@@ -59,6 +59,61 @@ func TestExportGraph_JSON(t *testing.T) {
 	}
 }
 
+// TestExportGraph_JSON_PreservesEdgeTypes locks in the fix for #167: the JSON
+// adjacency export must preserve the source dependency type rather than
+// collapsing every non-blocking edge into "related". parent-child and
+// discovered-from edges previously appeared as "related", which broke
+// structural/parentage audits built on --robot-graph.
+func TestExportGraph_JSON_PreservesEdgeTypes(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "root", Title: "Root", Status: model.StatusOpen, Priority: 1},
+		{ID: "blk", Title: "Blocks edge", Status: model.StatusOpen, Priority: 2,
+			Dependencies: []*model.Dependency{{IssueID: "blk", DependsOnID: "root", Type: model.DepBlocks}}},
+		{ID: "rel", Title: "Related edge", Status: model.StatusOpen, Priority: 2,
+			Dependencies: []*model.Dependency{{IssueID: "rel", DependsOnID: "root", Type: model.DepRelated}}},
+		{ID: "pc", Title: "Parent-child edge", Status: model.StatusOpen, Priority: 2,
+			Dependencies: []*model.Dependency{{IssueID: "pc", DependsOnID: "root", Type: model.DepParentChild}}},
+		{ID: "df", Title: "Discovered-from edge", Status: model.StatusOpen, Priority: 2,
+			Dependencies: []*model.Dependency{{IssueID: "df", DependsOnID: "root", Type: model.DepDiscoveredFrom}}},
+		// Empty/unset Type is the legacy default for a blocking edge and must
+		// normalize to "blocks".
+		{ID: "def", Title: "Default (empty) edge", Status: model.StatusOpen, Priority: 2,
+			Dependencies: []*model.Dependency{{IssueID: "def", DependsOnID: "root", Type: ""}}},
+	}
+
+	analyzer := analysis.NewAnalyzer(issues)
+	stats := analyzer.Analyze()
+
+	result, err := ExportGraph(issues, &stats, GraphExportConfig{Format: GraphFormatJSON})
+	if err != nil {
+		t.Fatalf("ExportGraph failed: %v", err)
+	}
+	if result.Adjacency == nil {
+		t.Fatal("Expected adjacency to be non-nil for JSON format")
+	}
+
+	gotByFrom := make(map[string]string, len(result.Adjacency.Edges))
+	for _, e := range result.Adjacency.Edges {
+		gotByFrom[e.From] = e.Type
+	}
+
+	want := map[string]string{
+		"blk": "blocks",
+		"rel": "related",
+		"pc":  "parent-child",
+		"df":  "discovered-from",
+		"def": "blocks",
+	}
+	if len(result.Adjacency.Edges) != len(want) {
+		t.Fatalf("expected %d edges, got %d (%+v)", len(want), len(result.Adjacency.Edges), result.Adjacency.Edges)
+	}
+	for from, wantType := range want {
+		if got := gotByFrom[from]; got != wantType {
+			t.Errorf("edge from %q: got type %q, want %q", from, got, wantType)
+		}
+	}
+}
+
 func TestExportGraph_DOT(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "bv-1", Title: "First Issue", Status: model.StatusOpen, Priority: 1},

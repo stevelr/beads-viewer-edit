@@ -6,6 +6,107 @@ All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are
 
 ## [Unreleased]
 
+### Changed — **BREAKING (robot JSON semantics)**
+
+- **Strict count semantics in triage output (#165).** `quick_ref.open_count` /
+  `project_health.counts.open` now count ONLY issues whose status is exactly `open` (previously:
+  every non-closed issue, i.e. `open`+`in_progress`+`blocked`+`deferred`), and
+  `quick_ref.blocked_count` / `counts.blocked` now count ONLY issues whose status is exactly
+  `blocked` (previously: every non-closed, non-actionable issue). Both now always equal the
+  corresponding `counts.by_status` entries. The legacy aggregates are preserved under
+  semantically accurate names: `not_closed_count` / `counts.not_closed` (old `open_count`) and
+  `not_actionable_count` / `counts.dependency_blocked` (old `blocked_count`), with the partition
+  invariant `not_closed == actionable + not_actionable`. Consumers that relied on
+  `counts.open` meaning "non-closed" must switch to `not_closed`; consumers that relied on
+  `counts.blocked` meaning "dependency-blocked" must switch to `dependency_blocked` /
+  `not_actionable_count`. This also aligns the triage counts with the bundled viewer's strict
+  status tiles.
+
+### Changed
+
+- **Better `.gitignore` handling (#179, revisiting #34/#151).** `bv` no longer unconditionally
+  appends `.bv/` to the repo's committed `.gitignore`. It now prefers **`.git/info/exclude`**
+  (no repo litter, invisible to collaborators, shared across linked worktrees — worktree
+  `.git` pointer files and their `commondir` indirection are resolved), skips writing entirely
+  when the project is not a git repository or when `.bv` is already covered by the repo
+  `.gitignore`, `.git/info/exclude`, or the user's global gitignore (`core.excludesFile` from
+  the global git config, or the `$XDG_CONFIG_HOME/git/ignore` default). A new
+  `BV_NO_GITIGNORE` environment variable (any non-empty value) disables all ignore-file
+  management. Everything remains pure file I/O — no `git` subprocess, no git-binary
+  dependency — and `bv` still never deletes or rewrites existing ignore entries; appending to
+  `.gitignore` survives only as a last-resort fallback when `.git` exists but the exclude file
+  is unusable.
+
+### Added
+
+- **Reliable light/dark theme selection (bv-128, idea from PR #178).** New `--theme` flag
+  (`light` | `dark` | `auto`) plus a top-level `theme:` key in `~/.config/bv/config.yaml`,
+  resolved once at startup with the precedence `--theme` → `BV_THEME` → config → auto-detect.
+  The resolved preference is now applied to the **global** lipgloss renderer
+  (`lipgloss.SetHasDarkBackground`), fixing the pre-existing `BV_THEME` override, which only
+  touched per-model renderers while the bulk of the UI (package-global styles, badges, glamour
+  markdown) kept auto-detecting — and auto-detection falls back to *dark* whenever the terminal
+  doesn't answer the background query (common over SSH and in `tmux`/`screen`), leaving light
+  terminals with near-white, unreadable text and no working escape hatch. Invalid `--theme`
+  values warn on stderr and resolve to auto-detect.
+
+- **Bounded robot liveness for the triage history prologue (#166).** The git-history correlation
+  step of `--robot-triage` / `--robot-next` now runs under a hard budget (default 10 s),
+  overridable via `--robot-history-timeout-ms` or `BV_ROBOT_HISTORY_TIMEOUT_MS` (`0` =
+  unbounded). On timeout the in-flight git subprocess is killed (the correlation package now
+  threads a `context.Context` into every `git` invocation via `exec.CommandContext`) and triage
+  proceeds without history. The outcome is surfaced as `meta.history_status`
+  (`ok` | `error` | `timeout`; omitted when history generation was not attempted).
+
+---
+
+## [v0.17.0] -- 2026-06-08 (Release)
+
+Performance release: a profile-driven overhaul of the agent-facing robot path makes repeat
+`--robot-*` calls roughly **25× faster** (warm triage ~2.3 s → ~0.09 s) and cuts git
+subprocesses from ~340 to 3 — all while keeping output byte-identical (verified by golden and
+differential tests). Also bundles the correctness fixes and a fresh-eyes bug-review pass found
+during the optimization work, plus a routine dependency refresh.
+
+### Added
+
+- **TUI:** left-click now focuses a panel and selects the row under the cursor, with precise
+  geometry inversion for split and single-column list views (drags and out-of-range clicks are
+  ignored) (bv-162).
+
+### Performance — Robot Path (`--robot-triage` / `--robot-next` / `--robot-plan` / `--robot-insights`)
+
+- **Correlation (the dominant former hotspot):** replaced ~2 `git show` per commit with 2 batched
+  `git log` calls; extract bead lifecycle via deduped `--raw` blob snapshots instead of
+  `git log -p`; added a persistent correlation result cache keyed on HEAD + beads-hash + opts so
+  repeat calls skip git extraction entirely. Cold-path: split the cache so working-tree bead edits
+  no longer bust the HEAD-only extraction, and added content-addressed per-commit **event** and
+  **co-commit** caches keyed by immutable commit SHA, so advancing HEAD only processes the new
+  commits (#160, #161).
+- **Analysis disk cache:** no longer rewrites the whole cache file on a read-hit; switched to
+  goccy/go-json streaming codec; adopted a columnar struct-of-arrays on-disk shape (v2, ~44 %
+  smaller).
+- **Loader / datasource:** parse `issues.jsonl` once on the robot path (fused load + validation
+  via a typed probe), memoize the data hash per invocation, and added a size-gated
+  (≥ 4 MiB) parallel JSONL parse for large stores.
+
+### Fixed
+
+- **triage:** exclude unblocked parent-child rollup edges from `blocked_by` (#158).
+- **watch:** coalesce `--watch-export` with adaptive backoff and skip exports via the canonical
+  content + dependency hash (#159).
+- **Fresh-eyes review (output-preserving):** restored commit `BeadID`s dropped from the HEAD
+  artifact cache; rejected a fresher empty/non-issue JSONL from shadowing the real `issues.jsonl`;
+  fixed parallel-parser `ParseStats` merge and an off-by-one max-capacity line boundary; stopped a
+  transient git failure from poisoning the co-commit cache; fixed a possible `readBlobs` deadlock
+  on a `cat-file` parse error; fixed a negative-index panic and a per-commit cache self-wipe.
+
+### Dependencies
+
+- Updated 7 direct dependencies (`git.sr.ht/~sbinet/gg`, `mattn/go-runewidth`,
+  `golang.org/x/{image,sync,sys,term}`, `modernc.org/sqlite`) and re-vendored canonically. See
+  `UPGRADE_LOG.md`.
+
 ---
 
 ## [v0.16.2] -- 2026-05-16 (Release)
@@ -795,7 +896,8 @@ Initial release of Beads Viewer -- a keyboard-driven terminal interface for the 
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.16.2...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.17.0...HEAD
+[v0.17.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.16.4...v0.17.0
 [v0.16.2]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.16.1...v0.16.2
 [v0.16.1]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.16.0...v0.16.1
 [v0.16.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.15.2...v0.16.0

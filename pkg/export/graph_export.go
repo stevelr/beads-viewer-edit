@@ -68,7 +68,7 @@ type AdjacencyNode struct {
 type AdjacencyEdge struct {
 	From string `json:"from"`
 	To   string `json:"to"`
-	Type string `json:"type"` // "blocks" or "related"
+	Type string `json:"type"` // source dependency type: "blocks", "related", "parent-child", or "discovered-from"
 }
 
 // ExportGraph exports the dependency graph in the specified format.
@@ -557,9 +557,13 @@ func generateAdjacency(issues []model.Issue, issueIDs map[string]bool, stats *an
 				continue
 			}
 
-			edgeType := "related"
-			if dep.Type.IsBlocking() {
-				edgeType = "blocks"
+			// Preserve the source dependency type so structural audits can
+			// distinguish parent-child / discovered-from from true `related`
+			// edges. An empty/unset Type is the legacy default for a blocking
+			// edge (see DependencyType.IsBlocking), so normalize it to "blocks".
+			edgeType := string(dep.Type)
+			if edgeType == "" {
+				edgeType = string(model.DepBlocks)
 			}
 
 			edges = append(edges, AdjacencyEdge{

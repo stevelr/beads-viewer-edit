@@ -51,45 +51,46 @@ func TestFullUpdateFlow_WithMockServer(t *testing.T) {
 	assetName := getAssetName("v99.0.0")
 	checksumContent := fmt.Sprintf("%s  %s\n", archiveHash, assetName)
 
-	// Create mock server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "releases/latest"):
-			release := Release{
-				TagName: "v99.0.0",
-				HTMLURL: "http://example.com/release",
-				Assets: []Asset{
-					{
-						Name:               assetName,
-						BrowserDownloadURL: "http://localhost/archive",
-						Size:               int64(len(archiveBytes)),
-					},
-					{
-						Name:               "checksums.txt",
-						BrowserDownloadURL: "http://localhost/checksums",
-						Size:               int64(len(checksumContent)),
-					},
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, _ *http.Request) {
+		release := Release{
+			TagName: "v99.0.0",
+			HTMLURL: "http://example.com/release",
+			Assets: []Asset{
+				{
+					Name:               assetName,
+					BrowserDownloadURL: "http://localhost/archive",
+					Size:               int64(len(archiveBytes)),
 				},
-			}
-			json.NewEncoder(w).Encode(release)
-
-		case strings.Contains(r.URL.Path, "archive"):
-			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(archiveBytes)))
-			w.Write(archiveBytes)
-
-		case strings.Contains(r.URL.Path, "checksums"):
-			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(checksumContent)))
-			w.Write([]byte(checksumContent))
-
-		default:
-			http.NotFound(w, r)
+				{
+					Name:               "checksums.txt",
+					BrowserDownloadURL: "http://localhost/checksums",
+					Size:               int64(len(checksumContent)),
+				},
+			},
 		}
-	}))
-	defer server.Close()
+		if err := json.NewEncoder(w).Encode(release); err != nil {
+			t.Errorf("encode release: %v", err)
+		}
+	})
+	mux.HandleFunc("/archive", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(archiveBytes)))
+		if _, err := w.Write(archiveBytes); err != nil {
+			t.Errorf("write archive response: %v", err)
+		}
+	})
+	mux.HandleFunc("/checksums", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(checksumContent)))
+		if _, err := w.Write([]byte(checksumContent)); err != nil {
+			t.Errorf("write checksum response: %v", err)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
 
 	// Test that the mocked release can be parsed
-	client := server.Client()
-	tag, url, err := checkForUpdates(client, server.URL+"/releases/latest")
+	client := srv.Client()
+	tag, url, err := checkForUpdates(client, srv.URL+"/releases/latest")
 	if err != nil {
 		t.Fatalf("checkForUpdates failed: %v", err)
 	}
@@ -104,17 +105,19 @@ func TestFullUpdateFlow_WithMockServer(t *testing.T) {
 
 // TestCheckUpdateAvailable_NoUpdateNeeded verifies no update when remote is older
 func TestCheckUpdateAvailable_NoUpdateNeeded(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		release := Release{
 			TagName: "v0.0.1", // Lower than any real version
 			HTMLURL: "http://example.com/release",
 		}
-		json.NewEncoder(w).Encode(release)
+		if err := json.NewEncoder(w).Encode(release); err != nil {
+			t.Errorf("encode release: %v", err)
+		}
 	}))
-	defer server.Close()
+	defer srv.Close()
 
-	client := server.Client()
-	tag, _, err := checkForUpdates(client, server.URL)
+	client := srv.Client()
+	tag, _, err := checkForUpdates(client, srv.URL)
 	if err != nil {
 		t.Fatalf("checkForUpdates failed: %v", err)
 	}
@@ -206,15 +209,15 @@ func TestExtractBinary_NestedPath(t *testing.T) {
 
 // TestDownloadFile_404_ReturnsError verifies HTTP error handling
 func TestDownloadFile_404_ReturnsError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	}))
-	defer server.Close()
+	defer srv.Close()
 
 	tmpDir := t.TempDir()
 	destPath := filepath.Join(tmpDir, "download.bin")
 
-	err := downloadFile(server.URL, destPath, 0)
+	err := downloadFile(srv.URL, destPath, 0)
 	if err == nil {
 		t.Fatal("expected error for 404 response")
 	}
@@ -229,11 +232,11 @@ func TestParseChecksums_EmptyLinesIgnored(t *testing.T) {
 	tmpDir := t.TempDir()
 	checksumPath := filepath.Join(tmpDir, "checksums.txt")
 
-	content := `abc123  file1.tar.gz
+	content := `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  file1.tar.gz
 
-def456  file2.tar.gz
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  file2.tar.gz
 
-ghi789  file3.tar.gz`
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  file3.tar.gz`
 
 	if err := os.WriteFile(checksumPath, []byte(content), 0o644); err != nil {
 		t.Fatalf("write checksums: %v", err)

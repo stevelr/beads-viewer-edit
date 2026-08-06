@@ -231,3 +231,87 @@ func TestShortcutsSidebar_MatchesRegistry(t *testing.T) {
 		}
 	})
 }
+
+// TestShortcutsSidebarReservesLayoutWidth is the regression test for issue #168:
+// toggling the shortcuts sidebar (`;`) must reserve its own fixed-width column so
+// the main list/detail panes reflow into the remaining width. Previously the body
+// was rendered at the full terminal width and the sidebar was appended after it,
+// producing a composed layout wider than the terminal — which a real terminal
+// then wraps back into the panes, interleaving the sidebar with issue rows.
+//
+// It is driven through the real key path + full View() so it catches any future
+// drift between the body sizing and the sidebar width. The invariant asserted is
+// layout-level (no rendered line exceeds m.width) and so does not depend on a
+// live TTY.
+func TestShortcutsSidebarReservesLayoutWidth(t *testing.T) {
+	maxLineWidth := func(s string) int {
+		mx := 0
+		for _, ln := range strings.Split(s, "\n") {
+			if w := lipgloss.Width(ln); w > mx {
+				mx = w
+			}
+		}
+		return mx
+	}
+
+	cases := []struct {
+		name      string
+		w, h      int
+		wantSplit bool
+	}{
+		{"split_narrow_110", 110, 30, true},
+		{"split_120", 120, 30, true},
+		{"split_wide_200", 200, 40, true},
+		{"mobile_80", 80, 30, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := sizedModel(t, mouseTestIssues(40), tc.w, tc.h)
+			if m.isSplitView != tc.wantSplit {
+				t.Fatalf("w=%d isSplitView=%v want %v", tc.w, m.isSplitView, tc.wantSplit)
+			}
+
+			// Before toggling, the layout must already fit (baseline).
+			if mw := maxLineWidth(m.View()); mw > m.width {
+				t.Fatalf("baseline (no sidebar): max line width %d > terminal width %d", mw, m.width)
+			}
+
+			// Toggle the sidebar on via the real `;` key path.
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(";")})
+			m = updated.(Model)
+			if !m.showShortcutsSidebar {
+				t.Fatalf("`;` did not enable the shortcuts sidebar")
+			}
+
+			view := m.View()
+			if mw := maxLineWidth(view); mw > m.width {
+				t.Errorf("with sidebar open: max line width %d exceeds terminal width %d (#168 overflow)", mw, m.width)
+			}
+
+			// The reflow must keep the sidebar content actually visible rather
+			// than clipping it off the right edge: the body should have shrunk by
+			// at least the sidebar's reserved column.
+			wantBodyWidth := m.width - m.shortcutsSidebar.Width()
+			if m.isSplitView {
+				// list inner width + 4 (border+padding both sides) is the list
+				// panel; it must be well within the reserved body width.
+				if m.list.Width()+4 > wantBodyWidth {
+					t.Errorf("list panel width %d does not leave room for sidebar (reserved body %d)", m.list.Width()+4, wantBodyWidth)
+				}
+			} else if m.list.Width() > wantBodyWidth {
+				t.Errorf("mobile list width %d exceeds reserved body width %d", m.list.Width(), wantBodyWidth)
+			}
+
+			// Toggling off restores the full-width layout.
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(";")})
+			m = updated.(Model)
+			if m.showShortcutsSidebar {
+				t.Fatalf("`;` did not disable the shortcuts sidebar")
+			}
+			if mw := maxLineWidth(m.View()); mw > m.width {
+				t.Errorf("after closing sidebar: max line width %d exceeds terminal width %d", mw, m.width)
+			}
+		})
+	}
+}

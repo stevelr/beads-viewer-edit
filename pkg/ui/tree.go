@@ -116,10 +116,44 @@ func (t *TreeModel) saveState() {
 		return
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := writeTreeStateFile(path, data); err != nil {
 		log.Printf("warning: failed to write tree state to %s: %v", path, err)
 		return
 	}
+}
+
+func writeTreeStateFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary tree state: %w", err)
+	}
+
+	tmpPath := tmpFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("write temporary tree state: %w", err)
+	}
+	if err := tmpFile.Chmod(0644); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("chmod temporary tree state: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temporary tree state: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace tree state: %w", err)
+	}
+
+	cleanup = false
+	return nil
 }
 
 // loadState restores expand/collapse state from disk (bv-afcm).
@@ -135,6 +169,10 @@ func (t *TreeModel) loadState() {
 	var state TreeState
 	if err := json.Unmarshal(data, &state); err != nil {
 		log.Printf("warning: invalid tree state file, using defaults: %v", err)
+		return
+	}
+	if state.Version != TreeStateVersion {
+		log.Printf("warning: unsupported tree state version %d, using defaults", state.Version)
 		return
 	}
 

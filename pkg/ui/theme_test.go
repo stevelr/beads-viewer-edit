@@ -27,6 +27,51 @@ func isColorEmpty(c lipgloss.AdaptiveColor) bool {
 	return c.Light == "" && c.Dark == ""
 }
 
+func TestSetThemeOverride(t *testing.T) {
+	// SetThemeOverride mutates package-global state (BVThemeOverride and the
+	// default lipgloss renderer); restore both afterwards.
+	prevOverride := BVThemeOverride
+	prevDark := lipgloss.HasDarkBackground()
+	defer func() {
+		BVThemeOverride = prevOverride
+		lipgloss.SetHasDarkBackground(prevDark)
+	}()
+
+	cases := []struct {
+		in           string
+		wantOverride string
+		// wantDark is nil when the global renderer must be left untouched.
+		wantDark *bool
+	}{
+		{"light", "light", boolPtrTest(false)},
+		{"dark", "dark", boolPtrTest(true)},
+		{"  LIGHT ", "light", boolPtrTest(false)}, // case/whitespace tolerant
+		{"Dark", "dark", boolPtrTest(true)},
+		{"auto", "", nil},
+		{"", "", nil},
+		{"solarized", "", nil}, // unrecognized clears the override
+	}
+	for _, tc := range cases {
+		// Seed a known-dirty state so "leaves untouched" is observable.
+		lipgloss.SetHasDarkBackground(true)
+		SetThemeOverride(tc.in)
+		if BVThemeOverride != tc.wantOverride {
+			t.Errorf("SetThemeOverride(%q): BVThemeOverride = %q, want %q",
+				tc.in, BVThemeOverride, tc.wantOverride)
+		}
+		if tc.wantDark != nil {
+			if got := lipgloss.HasDarkBackground(); got != *tc.wantDark {
+				t.Errorf("SetThemeOverride(%q): global HasDarkBackground() = %v, want %v",
+					tc.in, got, *tc.wantDark)
+			}
+		} else if !lipgloss.HasDarkBackground() {
+			t.Errorf("SetThemeOverride(%q): global renderer changed, want untouched", tc.in)
+		}
+	}
+}
+
+func boolPtrTest(b bool) *bool { return &b }
+
 func TestGetStatusColor(t *testing.T) {
 	renderer := lipgloss.NewRenderer(nil)
 	theme := DefaultTheme(renderer)

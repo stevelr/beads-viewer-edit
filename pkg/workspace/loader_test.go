@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,11 +13,23 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/workspace"
 )
 
+func requireWorkspaceLoaderString(t *testing.T, name, got, want string) {
+	t.Helper()
+	if strings.Compare(got, want) != 0 {
+		t.Fatalf("expected %s %q, got %q", name, want, got)
+	}
+}
+
 // createTestBeadsFile creates a .beads/beads.jsonl file with test issues
 func createTestBeadsFile(t *testing.T, repoPath string, issues []model.Issue) {
 	t.Helper()
 
-	beadsDir := filepath.Join(repoPath, ".beads")
+	createTestBeadsFileAt(t, filepath.Join(repoPath, ".beads"), issues)
+}
+
+func createTestBeadsFileAt(t *testing.T, beadsDir string, issues []model.Issue) {
+	t.Helper()
+
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -26,7 +39,11 @@ func createTestBeadsFile(t *testing.T, repoPath string, issues []model.Issue) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
 
 	encoder := json.NewEncoder(file)
 	for _, issue := range issues {
@@ -102,6 +119,47 @@ func TestAggregateLoaderLoadAll(t *testing.T) {
 	if !issueIDs["web-UI-1"] {
 		t.Error("Expected to find web-UI-1 (namespaced)")
 	}
+
+	for _, issue := range issues {
+		switch issue.ID {
+		case "api-AUTH-1", "api-AUTH-2":
+			requireWorkspaceLoaderString(t, issue.ID+" SourceRepo", issue.SourceRepo, "api")
+		case "web-UI-1":
+			requireWorkspaceLoaderString(t, issue.ID+" SourceRepo", issue.SourceRepo, "web")
+		}
+	}
+}
+
+func TestAggregateLoaderSourceRepoKeyForHyphenatedDefaultPrefix(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	repoPath := filepath.Join(tmpDir, "backend-service")
+	if err := os.MkdirAll(repoPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	createTestBeadsFile(t, repoPath, []model.Issue{
+		{ID: "AUTH-1", Title: "Auth feature", Status: model.StatusOpen, Priority: 1, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+	})
+
+	config := &workspace.Config{
+		Name: "test-workspace",
+		Repos: []workspace.RepoConfig{
+			{Path: "backend-service"},
+		},
+	}
+
+	loader := workspace.NewAggregateLoader(config, tmpDir)
+	issues, _, err := loader.LoadAll(context.Background())
+	if err != nil {
+		t.Fatalf("LoadAll() error = %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("len(issues) = %d, want 1", len(issues))
+	}
+	if issues[0].ID != "backend-service-AUTH-1" {
+		t.Fatalf("issue ID = %q, want %q", issues[0].ID, "backend-service-AUTH-1")
+	}
+	requireWorkspaceLoaderString(t, "SourceRepo", issues[0].SourceRepo, "backend-service")
 }
 
 func TestAggregateLoaderPartialFailure(t *testing.T) {
@@ -467,6 +525,128 @@ repos:
 	}
 }
 
+func TestLoadAllFromConfigWithDiscovery(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	bvDir := filepath.Join(tmpDir, ".bv")
+	if err := os.MkdirAll(bvDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	apiRepo := filepath.Join(tmpDir, "services", "api")
+	sharedRepo := filepath.Join(tmpDir, "packages", "shared")
+	ignoredRepo := filepath.Join(tmpDir, "node_modules", "ignored")
+	createTestBeadsFileAt(t, filepath.Join(apiRepo, "tracker"), []model.Issue{
+		{
+			ID:       "API-1",
+			Title:    "API needs shared utility",
+			Status:   model.StatusOpen,
+			Priority: 1,
+			Dependencies: []*model.Dependency{
+				{
+					IssueID:     "API-1",
+					DependsOnID: "shared-UTIL-1",
+					Type:        model.DepBlocks,
+				},
+			},
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		},
+	})
+	createTestBeadsFileAt(t, filepath.Join(sharedRepo, "tracker"), []model.Issue{
+		{ID: "UTIL-1", Title: "Shared utility", Status: model.StatusOpen, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+	})
+	createTestBeadsFileAt(t, filepath.Join(ignoredRepo, "tracker"), []model.Issue{
+		{ID: "IGN-1", Title: "Ignored dependency", Status: model.StatusOpen, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+	})
+
+	configPath := filepath.Join(bvDir, "workspace.yaml")
+	configContent := `
+discovery:
+  enabled: true
+  patterns:
+    - "services/*"
+    - "packages/*"
+    - "node_modules/*"
+  exclude:
+    - node_modules
+  max_depth: 2
+defaults:
+  beads_path: tracker
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	issues, results, err := workspace.LoadAllFromConfig(context.Background(), configPath)
+	if err != nil {
+		t.Fatalf("LoadAllFromConfig() error = %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("len(results) = %d, want 2", len(results))
+	}
+
+	byID := make(map[string]model.Issue, len(issues))
+	for _, issue := range issues {
+		byID[issue.ID] = issue
+	}
+	if _, ok := byID["api-API-1"]; !ok {
+		t.Fatal("expected discovered issue api-API-1")
+	}
+	if _, ok := byID["shared-UTIL-1"]; !ok {
+		t.Fatal("expected discovered issue shared-UTIL-1")
+	}
+	if _, ok := byID["ignored-IGN-1"]; ok {
+		t.Fatal("excluded node_modules repo should not be loaded")
+	}
+
+	apiIssue := byID["api-API-1"]
+	if len(apiIssue.Dependencies) != 1 {
+		t.Fatalf("len(apiIssue.Dependencies) = %d, want 1", len(apiIssue.Dependencies))
+	}
+	requireWorkspaceLoaderString(t, "cross-repo dependency", apiIssue.Dependencies[0].DependsOnID, "shared-UTIL-1")
+	requireWorkspaceLoaderString(t, "api SourceRepo", apiIssue.SourceRepo, "api")
+	requireWorkspaceLoaderString(t, "shared SourceRepo", byID["shared-UTIL-1"].SourceRepo, "shared")
+}
+
+func TestAggregateLoaderDiscoveryRespectsDisabledExplicitRepo(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	apiRepo := filepath.Join(tmpDir, "services", "api")
+	webRepo := filepath.Join(tmpDir, "services", "web")
+	createTestBeadsFile(t, apiRepo, []model.Issue{
+		{ID: "API-1", Title: "Disabled API", Status: model.StatusOpen, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+	})
+	createTestBeadsFile(t, webRepo, []model.Issue{
+		{ID: "WEB-1", Title: "Discovered web", Status: model.StatusOpen, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+	})
+
+	disabled := false
+	config := &workspace.Config{
+		Repos: []workspace.RepoConfig{
+			{Path: "services/api", Prefix: "api-", Enabled: &disabled},
+		},
+		Discovery: workspace.DiscoveryConfig{
+			Enabled:  true,
+			Patterns: []string{"services/*"},
+			MaxDepth: 2,
+		},
+	}
+
+	loader := workspace.NewAggregateLoader(config, tmpDir)
+	issues, results, err := loader.LoadAll(context.Background())
+	if err != nil {
+		t.Fatalf("LoadAll() error = %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+	if len(issues) != 1 {
+		t.Fatalf("len(issues) = %d, want 1", len(issues))
+	}
+	requireWorkspaceLoaderString(t, "loaded issue ID", issues[0].ID, "web-WEB-1")
+}
+
 func TestLoadAllFromConfigMissing(t *testing.T) {
 	_, _, err := workspace.LoadAllFromConfig(context.Background(), "/nonexistent/workspace.yaml")
 	if err == nil {
@@ -510,20 +690,9 @@ func TestAggregateLoaderCustomBeadsPath(t *testing.T) {
 	// Repo with custom beads path
 	repoDir := filepath.Join(tmpDir, "svc")
 	customBeads := filepath.Join(repoDir, "custom_beads")
-	if err := os.MkdirAll(customBeads, 0755); err != nil {
-		t.Fatal(err)
-	}
-	// Write beads.jsonl into custom path (not default .beads)
-	beadsFile := filepath.Join(customBeads, "beads.jsonl")
-	f, err := os.Create(beadsFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	enc := json.NewEncoder(f)
-	if err := enc.Encode(model.Issue{ID: "CUST-1", Title: "Custom beads", Status: model.StatusOpen, IssueType: model.TypeTask}); err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
+	createTestBeadsFileAt(t, customBeads, []model.Issue{
+		{ID: "CUST-1", Title: "Custom beads", Status: model.StatusOpen, IssueType: model.TypeTask},
+	})
 
 	config := &workspace.Config{
 		Repos: []workspace.RepoConfig{
@@ -543,4 +712,30 @@ func TestAggregateLoaderCustomBeadsPath(t *testing.T) {
 	if issues[0].ID != "svc-CUST-1" {
 		t.Errorf("expected namespaced ID svc-CUST-1, got %s", issues[0].ID)
 	}
+}
+
+func TestAggregateLoaderDefaultsBeadsPath(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	repoDir := filepath.Join(tmpDir, "svc")
+	createTestBeadsFileAt(t, filepath.Join(repoDir, "tracker"), []model.Issue{
+		{ID: "CUST-1", Title: "Default beads path", Status: model.StatusOpen, IssueType: model.TypeTask},
+	})
+
+	config := &workspace.Config{
+		Defaults: workspace.RepoDefaults{BeadsPath: "tracker"},
+		Repos: []workspace.RepoConfig{
+			{Name: "svc", Path: "svc", Prefix: "svc-"},
+		},
+	}
+
+	loader := workspace.NewAggregateLoader(config, tmpDir)
+	issues, _, err := loader.LoadAll(context.Background())
+	if err != nil {
+		t.Fatalf("LoadAll() error = %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("expected 1 issue, got %d", len(issues))
+	}
+	requireWorkspaceLoaderString(t, "namespaced ID", issues[0].ID, "svc-CUST-1")
 }

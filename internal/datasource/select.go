@@ -50,6 +50,18 @@ type SelectionResult struct {
 	SelectionTime time.Time
 }
 
+// sortByFreshnessThenPriority orders sources in place the same way the default
+// selection does: freshest ModTime first, ties broken by higher Priority. The
+// fused load path uses this to try candidates in selection order.
+func sortByFreshnessThenPriority(sources []DataSource) {
+	sort.Slice(sources, func(i, j int) bool {
+		if sources[i].ModTime.Equal(sources[j].ModTime) {
+			return sources[i].Priority > sources[j].Priority
+		}
+		return sources[i].ModTime.After(sources[j].ModTime)
+	})
+}
+
 // SelectBestSource chooses the best data source from the given list
 func SelectBestSource(sources []DataSource) (DataSource, error) {
 	return SelectBestSourceWithOptions(sources, DefaultSelectionOptions())

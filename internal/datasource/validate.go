@@ -8,10 +8,76 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	json "github.com/goccy/go-json"
 	_ "modernc.org/sqlite"
 )
+
+// validationCacheEntry records a prior validation result for a specific file
+// identity (path + modtime + size). It is keyed so that any on-disk change
+// invalidates the cache and forces a fresh validation.
+type validationCacheEntry struct {
+	modTime    time.Time
+	size       int64
+	valid      bool
+	validErr   string
+	issueCount int
+}
+
+// validationCache memoizes validation results within a single process. The hot
+// robot CLI paths (LoadIssues + resolveSingleRepoWatchFile) each discover and
+// validate the same source files; without this cache the 1.9MB issues.jsonl is
+// fully re-parsed 2-3x per invocation. Keyed by absolute path with a
+// modtime+size guard so a changed file is always re-validated (correctness is
+// preserved across a watch session; within one CLI run the file cannot change).
+var (
+	validationCacheMu sync.Mutex
+	validationCache   = map[string]validationCacheEntry{}
+)
+
+// lookupValidationCache returns a cached validation result for source if one
+// exists and the file identity (modtime+size) still matches.
+func lookupValidationCache(source *DataSource, opts ValidationOptions) (bool, error) {
+	info, err := os.Stat(source.Path)
+	if err != nil {
+		return false, nil
+	}
+	validationCacheMu.Lock()
+	entry, ok := validationCache[source.Path]
+	validationCacheMu.Unlock()
+	if !ok || !entry.modTime.Equal(info.ModTime()) || entry.size != info.Size() {
+		return false, nil
+	}
+	// Cache hit: replay the recorded result onto the source.
+	source.Valid = entry.valid
+	source.ValidationError = entry.validErr
+	if opts.CountIssues {
+		source.IssueCount = entry.issueCount
+	}
+	if entry.valid {
+		return true, nil
+	}
+	return true, fmt.Errorf("%s", entry.validErr)
+}
+
+// storeValidationCache records the outcome of a validation for later reuse.
+func storeValidationCache(source *DataSource) {
+	info, err := os.Stat(source.Path)
+	if err != nil {
+		return
+	}
+	validationCacheMu.Lock()
+	validationCache[source.Path] = validationCacheEntry{
+		modTime:    info.ModTime(),
+		size:       info.Size(),
+		valid:      source.Valid,
+		validErr:   source.ValidationError,
+		issueCount: source.IssueCount,
+	}
+	validationCacheMu.Unlock()
+}
 
 // ValidationOptions configures source validation behavior
 type ValidationOptions struct {
@@ -57,6 +123,20 @@ func ValidateSourceWithOptions(source *DataSource, opts ValidationOptions) error
 		opts.RequiredFields = []string{"id", "title", "status"}
 	}
 
+	// Reuse a prior in-process validation of the same unchanged file. Only the
+	// default-semantics path is cached: custom RequiredFields/error-rate or a
+	// no-count request would change what "valid"/IssueCount mean, so those
+	// always validate freshly. This collapses the redundant 2nd/3rd full parse
+	// of the same source on the warm robot path.
+	cacheable := opts.CountIssues &&
+		opts.MaxJSONLErrorRate == DefaultValidationOptions().MaxJSONLErrorRate &&
+		isDefaultRequiredFields(opts.RequiredFields)
+	if cacheable {
+		if hit, hitErr := lookupValidationCache(source, opts); hit {
+			return hitErr
+		}
+	}
+
 	var err error
 	switch source.Type {
 	case SourceTypeSQLite:
@@ -70,11 +150,17 @@ func ValidateSourceWithOptions(source *DataSource, opts ValidationOptions) error
 	if err != nil {
 		source.Valid = false
 		source.ValidationError = err.Error()
+		if cacheable {
+			storeValidationCache(source)
+		}
 		return err
 	}
 
 	source.Valid = true
 	source.ValidationError = ""
+	if cacheable {
+		storeValidationCache(source)
+	}
 	return nil
 }
 
@@ -166,6 +252,97 @@ func validateSQLite(source *DataSource, opts ValidationOptions) error {
 	return nil
 }
 
+// validationProbe is the minimal view of a JSONL line that validation needs.
+// It only records whether each required field is present, never the full value,
+// so well-formed lines can be checked with the cheap typed structDecoder path
+// instead of the generic interface{}/map reflection path.
+type validationProbe interface {
+	// has reports whether the named field was present in the decoded line.
+	has(field string) bool
+}
+
+// defaultProbe captures presence of the default required fields
+// (id/title/status). It uses NON-pointer json.RawMessage values: an absent field
+// stays nil (len 0), while a PRESENT field — including an explicit `null` — gets
+// its raw bytes (e.g. the 4 bytes "null", len 4). So presence == len(raw) > 0.
+// This matches the old map[string]interface{} semantics (and the rawProbe path),
+// where "id":null counts as present, not missing. goccy decodes this via
+// structDecoder, avoiding interfaceDecoder/mapDecoder.
+type defaultProbe struct {
+	ID     json.RawMessage `json:"id"`
+	Title  json.RawMessage `json:"title"`
+	Status json.RawMessage `json:"status"`
+}
+
+func (p *defaultProbe) has(field string) bool {
+	switch field {
+	case "id":
+		return len(p.ID) > 0
+	case "title":
+		return len(p.Title) > 0
+	case "status":
+		return len(p.Status) > 0
+	default:
+		return false
+	}
+}
+
+// rawProbe handles arbitrary required-field sets. Decoding into
+// map[string]json.RawMessage still avoids interfaceDecoder recursion into nested
+// values (object/array values stay as raw bytes), so it is far cheaper than
+// map[string]interface{} while remaining correct for any field name.
+type rawProbe map[string]json.RawMessage
+
+func (p rawProbe) has(field string) bool {
+	_, ok := p[field]
+	return ok
+}
+
+// isDefaultRequiredFields reports whether fields is exactly the default
+// {id, title, status} set (in any order), enabling the typed fast path.
+func isDefaultRequiredFields(fields []string) bool {
+	if len(fields) != 3 {
+		return false
+	}
+	var id, title, status bool
+	for _, f := range fields {
+		switch f {
+		case "id":
+			id = true
+		case "title":
+			title = true
+		case "status":
+			status = true
+		default:
+			return false
+		}
+	}
+	return id && title && status
+}
+
+// validationProbeForFields returns the cheapest probe capable of checking the
+// given required fields.
+func validationProbeForFields(fields []string) validationProbe {
+	if isDefaultRequiredFields(fields) {
+		return &defaultProbe{}
+	}
+	return rawProbe{}
+}
+
+// unmarshalProbe decodes a single JSONL line into the probe. It dispatches to
+// the concrete probe type so goccy can pick the typed structDecoder for the
+// common default-field case.
+func unmarshalProbe(line []byte, probe validationProbe) error {
+	switch p := probe.(type) {
+	case *defaultProbe:
+		return json.Unmarshal(line, p)
+	case rawProbe:
+		return json.Unmarshal(line, &p)
+	default:
+		return json.Unmarshal(line, probe)
+	}
+}
+
 // validateJSONL validates a JSONL file
 func validateJSONL(source *DataSource, opts ValidationOptions) error {
 	// Check file exists and is readable
@@ -236,9 +413,24 @@ func validateJSONL(source *DataSource, opts ValidationOptions) error {
 			line = line[3:]
 		}
 
-		// Parse JSON
-		var issue map[string]interface{}
-		if err := json.Unmarshal(line, &issue); err != nil {
+		// Parse JSON.
+		//
+		// Validation only needs two guarantees: (1) the line is well-formed
+		// JSON, and (2) the required discriminating fields are present. We do
+		// NOT need to materialize the entire object, so we avoid the slow
+		// generic decode into map[string]interface{} (goccy's
+		// interfaceDecoder/mapDecoder reflection path) and instead decode into
+		// a small typed struct (goccy's structDecoder) that only captures the
+		// required fields. For the default {id,title,status} set, defaultProbe
+		// uses json.RawMessage values so a present field — including an explicit
+		// `null` — counts as present (len(raw) > 0), matching the old
+		// map[string]interface{} semantics; an absent field stays nil (len 0).
+		//
+		// unmarshalProbe uses json.Unmarshal, which rejects any line that is not a
+		// single well-formed JSON value (e.g. trailing garbage), giving the same
+		// strictness the corruption-detection tests expect.
+		probe := validationProbeForFields(opts.RequiredFields)
+		if err := unmarshalProbe(line, probe); err != nil {
 			errorLines++
 			if opts.Verbose {
 				opts.Logger(fmt.Sprintf("Parse error at line %d: %v", lineNum, err))
@@ -249,7 +441,7 @@ func validateJSONL(source *DataSource, opts ValidationOptions) error {
 		// Check required fields
 		missingField := false
 		for _, field := range opts.RequiredFields {
-			if _, ok := issue[field]; !ok {
+			if !probe.has(field) {
 				missingField = true
 				if opts.Verbose {
 					opts.Logger(fmt.Sprintf("Missing field '%s' at line %d", field, lineNum))

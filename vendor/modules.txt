@@ -1,5 +1,5 @@
-# git.sr.ht/~sbinet/gg v0.7.0
-## explicit; go 1.24
+# git.sr.ht/~sbinet/gg v0.8.0
+## explicit; go 1.25.0
 git.sr.ht/~sbinet/gg
 # github.com/Dicklesworthstone/toon-go v0.0.0-20260322013033-4564467a45fb
 ## explicit; go 1.21
@@ -145,7 +145,7 @@ github.com/mattn/go-isatty
 # github.com/mattn/go-localereader v0.0.1
 ## explicit
 github.com/mattn/go-localereader
-# github.com/mattn/go-runewidth v0.0.23
+# github.com/mattn/go-runewidth v0.0.24
 ## explicit; go 1.20
 github.com/mattn/go-runewidth
 # github.com/microcosm-cc/bluemonday v1.0.27
@@ -212,7 +212,7 @@ github.com/yuin/goldmark-emoji/ast
 github.com/yuin/goldmark-emoji/definition
 # golang.org/x/exp v0.0.0-20260508232706-74f9aab9d74a
 ## explicit; go 1.25.0
-# golang.org/x/image v0.40.0
+# golang.org/x/image v0.42.0
 ## explicit; go 1.25.0
 golang.org/x/image/draw
 golang.org/x/image/font
@@ -226,19 +226,19 @@ golang.org/x/image/vector
 ## explicit; go 1.25.0
 golang.org/x/net/html
 golang.org/x/net/html/atom
-# golang.org/x/sync v0.20.0
+# golang.org/x/sync v0.21.0
 ## explicit; go 1.25.0
 golang.org/x/sync/errgroup
 golang.org/x/sync/singleflight
-# golang.org/x/sys v0.44.0
+# golang.org/x/sys v0.46.0
 ## explicit; go 1.25.0
 golang.org/x/sys/plan9
 golang.org/x/sys/unix
 golang.org/x/sys/windows
-# golang.org/x/term v0.43.0
+# golang.org/x/term v0.44.0
 ## explicit; go 1.25.0
 golang.org/x/term
-# golang.org/x/text v0.37.0
+# golang.org/x/text v0.38.0
 ## explicit; go 1.25.0
 golang.org/x/text/cases
 golang.org/x/text/encoding
@@ -252,8 +252,6 @@ golang.org/x/text/internal/tag
 golang.org/x/text/language
 golang.org/x/text/transform
 golang.org/x/text/unicode/norm
-# golang.org/x/tools v0.45.0
-## explicit; go 1.25.0
 # gonum.org/v1/gonum v0.17.0
 ## explicit; go 1.24.0
 gonum.org/v1/gonum/blas
@@ -325,7 +323,7 @@ modernc.org/mathutil
 # modernc.org/memory v1.11.0
 ## explicit; go 1.23.0
 modernc.org/memory
-# modernc.org/sqlite v1.50.1
+# modernc.org/sqlite v1.52.0
 ## explicit; go 1.25.0
 modernc.org/sqlite
 modernc.org/sqlite/lib

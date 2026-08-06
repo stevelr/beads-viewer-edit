@@ -2,12 +2,12 @@
 package correlation
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
-	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -300,7 +300,13 @@ func BuildCacheKey(repoPath string, beads []BeadInfo, opts CorrelatorOptions) (C
 
 // getGitHead returns the current HEAD SHA
 func getGitHead(repoPath string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "HEAD")
+	return getGitHeadContext(context.Background(), repoPath)
+}
+
+// getGitHeadContext returns the current HEAD SHA, bounding the git subprocess
+// by ctx (#166). A nil ctx means context.Background().
+func getGitHeadContext(ctx context.Context, repoPath string) (string, error) {
+	cmd := gitCommand(ctx, "rev-parse", "HEAD")
 	cmd.Dir = repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -309,7 +315,7 @@ func getGitHead(repoPath string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// hashBeads creates a hash of bead IDs and statuses
+// hashBeads creates a hash of all bead fields that are embedded in reports.
 func hashBeads(beads []BeadInfo) string {
 	if len(beads) == 0 {
 		return hex.EncodeToString(sha256.New().Sum(nil))[:12]
@@ -317,7 +323,7 @@ func hashBeads(beads []BeadInfo) string {
 
 	entries := make([]string, 0, len(beads))
 	for _, b := range beads {
-		entries = append(entries, b.ID+"\x00"+b.Status)
+		entries = append(entries, b.ID+"\x00"+b.Title+"\x00"+b.Status)
 	}
 	sort.Strings(entries)
 

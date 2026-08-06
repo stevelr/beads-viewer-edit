@@ -246,12 +246,18 @@ func TestGenerateHeadersFile(t *testing.T) {
 	}
 
 	content := string(data)
+	if strings.Contains(content, "\t") {
+		t.Fatal("_headers should use spaces for Cloudflare header indentation, not tabs")
+	}
 
 	// Check for expected security headers
 	expectedHeaders := []string{
 		"X-Frame-Options: DENY",
 		"X-Content-Type-Options: nosniff",
 		"Referrer-Policy: strict-origin-when-cross-origin",
+		"Cross-Origin-Opener-Policy: same-origin",
+		"Cross-Origin-Embedder-Policy: require-corp",
+		"Cross-Origin-Resource-Policy: same-origin",
 		"Content-Type: application/javascript",
 		"Content-Type: application/wasm",
 	}

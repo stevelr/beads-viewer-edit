@@ -465,6 +465,11 @@ func TestAgentIntentArgRewrite(t *testing.T) {
 			want: []string{"--robot-schema", "--schema-command", "robot-triage", "--format", "json"},
 		},
 		{
+			name: "schema normalizes mixed case command name",
+			args: []string{"schema", "Robot-Triage", "--json"},
+			want: []string{"--robot-schema", "--schema-command", "robot-triage", "--format", "json"},
+		},
+		{
 			name: "search subcommand",
 			args: []string{"search", "login", "oauth", "--json", "--limit=5"},
 			want: []string{"--search", "login oauth", "--robot-search", "--format", "json", "--search-limit=5"},
@@ -510,6 +515,16 @@ func TestAgentIntentArgRewrite(t *testing.T) {
 			want: []string{"--robot-related", "bv-123", "--format", "json", "--related-max-results=2"},
 		},
 		{
+			name: "missing value command keeps required flag after output alias",
+			args: []string{"robot-related", "--json"},
+			want: []string{"--format", "json", "--robot-related"},
+		},
+		{
+			name: "missing value command keeps required flag after native options",
+			args: []string{"robot-confirm-correlation", "--correlation-by", "agent", "--json"},
+			want: []string{"--correlation-by", "agent", "--format", "json", "--robot-confirm-correlation"},
+		},
+		{
 			name: "canonical diff command name",
 			args: []string{"robot-diff", "HEAD~1", "--json"},
 			want: []string{"--robot-diff", "--diff-since", "HEAD~1", "--format", "json"},
@@ -529,12 +544,80 @@ func TestAgentIntentArgRewrite(t *testing.T) {
 			args: []string{"robot-docs", "guide", "--json"},
 			want: []string{"--robot-docs", "guide", "--format", "json"},
 		},
+		{
+			name: "upgrade maps to --update",
+			args: []string{"upgrade"},
+			want: []string{"--update"},
+		},
+		{
+			name: "upgrade --yes skips confirmation",
+			args: []string{"upgrade", "--yes"},
+			want: []string{"--update", "--yes"},
+		},
+		{
+			name: "upgrade -y short flag skips confirmation",
+			args: []string{"upgrade", "-y"},
+			want: []string{"--update", "--yes"},
+		},
+		{
+			name: "upgrade --check maps to --check-update",
+			args: []string{"upgrade", "--check"},
+			want: []string{"--check-update"},
+		},
+		{
+			name: "upgrade check bare word maps to --check-update",
+			args: []string{"upgrade", "check"},
+			want: []string{"--check-update"},
+		},
+		{
+			name: "upgrade --dry-run maps to --update-dry-run",
+			args: []string{"upgrade", "--dry-run"},
+			want: []string{"--update-dry-run"},
+		},
+		{
+			name: "upgrade --rollback maps to --rollback",
+			args: []string{"upgrade", "--rollback"},
+			want: []string{"--rollback"},
+		},
+		{
+			name: "self-update alias maps to --update",
+			args: []string{"self-update"},
+			want: []string{"--update"},
+		},
+		{
+			name: "upgrade passes through unknown flags for cobra to report",
+			args: []string{"upgrade", "--bogus"},
+			want: []string{"--update", "--bogus"},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			requireArgs(t, rewriteAgentIntentArgs(tt.args), tt.want)
 		})
+	}
+}
+
+func TestAgentIntentValueCommandMissingTargetFailsBeforeTUI(t *testing.T) {
+	exe := buildTestBinary(t)
+
+	stdout, stderr, err := runCommandWithTimeout(t, t.TempDir(), exe, "robot-related", "--json")
+	if err == nil {
+		t.Fatalf("expected missing value command to fail\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("expected empty stdout for missing value command, got:\n%s", stdout)
+	}
+	for _, want := range []string{
+		"flag needs an argument: --robot-related",
+		"Use --robot-related VALUE.",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("stderr missing %q\nstderr:\n%s", want, stderr)
+		}
+	}
+	if strings.Contains(stderr, "could not open a new TTY") {
+		t.Fatalf("missing value command fell through to the TUI:\n%s", stderr)
 	}
 }
 
@@ -565,6 +648,7 @@ func TestAgentIntentAliasesOutputJSON(t *testing.T) {
 		{"robot-schema", "triage", "--json"},
 		{"schema", "triage", "--json"},
 		{"schema", "--json", "triage"},
+		{"schema", "Robot-Triage", "--json"},
 		{"robot-graph", "mermaid", "--json"},
 		{"graph", "--json", "mermaid"},
 		{"--name", "backend", "--json"},
@@ -2136,5 +2220,53 @@ func repoRoot(t *testing.T) string {
 			t.Fatalf("could not find go.mod above %s", dir)
 		}
 		dir = parent
+	}
+}
+
+func TestIssuesFingerprintDetectsContentChangesOrderIndependently(t *testing.T) {
+	t1 := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 6, 2, 10, 0, 0, 0, time.UTC)
+	base := []model.Issue{
+		{ID: "A", Status: model.StatusOpen, UpdatedAt: t1},
+		{ID: "B", Status: model.StatusInProgress, UpdatedAt: t1},
+	}
+	// Reordering the same content must not change the fingerprint (#159).
+	reordered := []model.Issue{base[1], base[0]}
+	if issuesFingerprint(base) != issuesFingerprint(reordered) {
+		t.Fatalf("fingerprint must be order-independent")
+	}
+	// A status change must change the fingerprint.
+	statusChanged := []model.Issue{
+		{ID: "A", Status: model.StatusClosed, UpdatedAt: t1},
+		{ID: "B", Status: model.StatusInProgress, UpdatedAt: t1},
+	}
+	if issuesFingerprint(base) == issuesFingerprint(statusChanged) {
+		t.Fatalf("fingerprint must change when an issue's status changes")
+	}
+	// An updated_at change must change the fingerprint.
+	timeChanged := []model.Issue{
+		{ID: "A", Status: model.StatusOpen, UpdatedAt: t2},
+		{ID: "B", Status: model.StatusInProgress, UpdatedAt: t1},
+	}
+	if issuesFingerprint(base) == issuesFingerprint(timeChanged) {
+		t.Fatalf("fingerprint must change when an issue's updated_at changes")
+	}
+	// A title change with NO updated_at bump must still change the fingerprint —
+	// the previous id/status/updated_at-only fingerprint missed this (#159).
+	titleChanged := []model.Issue{
+		{ID: "A", Title: "renamed", Status: model.StatusOpen, UpdatedAt: t1},
+		{ID: "B", Status: model.StatusInProgress, UpdatedAt: t1},
+	}
+	if issuesFingerprint(base) == issuesFingerprint(titleChanged) {
+		t.Fatalf("fingerprint must change when a title changes without an updated_at bump")
+	}
+	// A dependency change with no updated_at bump must also be detected.
+	depChanged := []model.Issue{
+		{ID: "A", Status: model.StatusOpen, UpdatedAt: t1,
+			Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "B", Status: model.StatusInProgress, UpdatedAt: t1},
+	}
+	if issuesFingerprint(base) == issuesFingerprint(depChanged) {
+		t.Fatalf("fingerprint must change when a dependency changes without an updated_at bump")
 	}
 }

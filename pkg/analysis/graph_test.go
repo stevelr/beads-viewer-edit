@@ -269,6 +269,38 @@ func TestGetActionableIssuesParentChildDoesntBlock(t *testing.T) {
 	}
 }
 
+func TestParentsWithOpenChildren(t *testing.T) {
+	// P is a (non-epic) parent of open child P1 and closed child P2.
+	// L is a leaf with no children.
+	issues := []model.Issue{
+		{ID: "P", Status: model.StatusOpen, IssueType: model.TypeTask},
+		{ID: "P1", Status: model.StatusOpen, IssueType: model.TypeTask, Dependencies: []*model.Dependency{
+			{DependsOnID: "P", Type: model.DepParentChild},
+		}},
+		{ID: "P2", Status: model.StatusClosed, IssueType: model.TypeTask, Dependencies: []*model.Dependency{
+			{DependsOnID: "P", Type: model.DepParentChild},
+		}},
+		{ID: "L", Status: model.StatusOpen, IssueType: model.TypeTask},
+	}
+
+	an := analysis.NewAnalyzer(issues)
+	parents := an.ParentsWithOpenChildren()
+
+	if !parents["P"] {
+		t.Errorf("expected P (open child P1) to be a parent-with-open-children, got %v", parents)
+	}
+	if parents["P1"] || parents["P2"] || parents["L"] {
+		t.Errorf("only P should be flagged, got %v", parents)
+	}
+
+	// Close the open child: P is no longer a parent-with-open-children.
+	issues[1].Status = model.StatusClosed
+	an2 := analysis.NewAnalyzer(issues)
+	if len(an2.ParentsWithOpenChildren()) != 0 {
+		t.Errorf("expected no parents-with-open-children after closing P1, got %v", an2.ParentsWithOpenChildren())
+	}
+}
+
 func TestGetActionableIssuesCycle(t *testing.T) {
 	// Cycle: A -> B -> C -> A (all block each other)
 	// All are blocked (none actionable)

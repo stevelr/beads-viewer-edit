@@ -513,14 +513,53 @@ func TestWorkflow_ExportPipeline(t *testing.T) {
 		t.Fatalf("invalid JSON: %v", err)
 	}
 
-	// Cross-check counts
-	if triageData, ok := triage["triage"].(map[string]interface{}); ok {
-		if quickRef, ok := triageData["quick_ref"].(map[string]interface{}); ok {
-			openCount := quickRef["open_count"].(float64)
-			if openCount != 2 { // PROJ-1 is open, PROJ-2 is in_progress (often counted as open)
-				t.Logf("Note: open_count=%v (in_progress may be counted differently)", openCount)
-			}
-		}
+	// Cross-check counts: open_count is the STRICT status count (#165), so
+	// only PROJ-1 (open) counts; PROJ-2 (in_progress) and PROJ-3 (closed)
+	// must not. quick_ref.open_count must equal by_status.open, and the
+	// legacy non-closed aggregate lives on not_closed_count.
+	triageData, ok := triage["triage"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("triage output missing 'triage' object: %v", triage)
+	}
+	quickRef, ok := triageData["quick_ref"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("triage output missing 'quick_ref' object: %v", triageData)
+	}
+	openCount, ok := quickRef["open_count"].(float64)
+	if !ok {
+		t.Fatalf("quick_ref missing numeric open_count: %v", quickRef)
+	}
+	if openCount != 1 {
+		t.Errorf("open_count: got %v, want 1 (strict status==open; PROJ-1 only)", openCount)
+	}
+	notClosedCount, ok := quickRef["not_closed_count"].(float64)
+	if !ok {
+		t.Fatalf("quick_ref missing numeric not_closed_count: %v", quickRef)
+	}
+	if notClosedCount != 2 { // PROJ-1 open + PROJ-2 in_progress
+		t.Errorf("not_closed_count: got %v, want 2 (open + in_progress)", notClosedCount)
+	}
+	health, ok := triageData["project_health"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("triage output missing 'project_health' object: %v", triageData)
+	}
+	counts, ok := health["counts"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("project_health missing 'counts' object: %v", health)
+	}
+	byStatus, ok := counts["by_status"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("counts missing 'by_status' object: %v", counts)
+	}
+	if byStatusOpen, _ := byStatus["open"].(float64); byStatusOpen != openCount {
+		t.Errorf("quick_ref.open_count=%v must equal by_status.open=%v", openCount, byStatusOpen)
+	}
+	// Partition invariant: not_closed == actionable + not_actionable.
+	actionable, _ := quickRef["actionable_count"].(float64)
+	notActionable, _ := quickRef["not_actionable_count"].(float64)
+	if notClosedCount != actionable+notActionable {
+		t.Errorf("partition invariant violated: not_closed_count=%v, actionable_count=%v, not_actionable_count=%v",
+			notClosedCount, actionable, notActionable)
 	}
 }
 

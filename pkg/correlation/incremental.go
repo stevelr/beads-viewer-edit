@@ -3,6 +3,7 @@ package correlation
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -34,6 +35,21 @@ type IncrementalCorrelator struct {
 	increments int64 // Count of successful incremental updates
 	refreshes  int64 // Count of full refreshes
 	mu         sync.Mutex
+
+	// ctx, when set via WithContext, bounds the git subprocesses spawned by
+	// incremental updates (issue #166). nil means context.Background().
+	ctx context.Context
+}
+
+// WithContext binds ctx to the correlator (and its underlying full
+// correlator) so their git subprocesses are cancelled when ctx is done
+// (issue #166). Returns the receiver for chaining.
+func (ic *IncrementalCorrelator) WithContext(ctx context.Context) *IncrementalCorrelator {
+	ic.ctx = ctx
+	if ic.correlator != nil {
+		ic.correlator.WithContext(ctx)
+	}
+	return ic
 }
 
 // NewIncrementalCorrelator creates a correlator with incremental update support.
@@ -169,7 +185,7 @@ func (ic *IncrementalCorrelator) findExistingReport(beads []BeadInfo, opts Corre
 // tryIncrementalUpdate attempts to update an existing report incrementally
 func (ic *IncrementalCorrelator) tryIncrementalUpdate(existing *HistoryReport, beads []BeadInfo, opts CorrelatorOptions) (*IncrementalUpdateResult, error) {
 	// Find new commits since the existing report
-	newCommits, err := getCommitsSince(ic.cache.repoPath, existing.LatestCommitSHA)
+	newCommits, err := getCommitsSince(ic.ctx, ic.cache.repoPath, existing.LatestCommitSHA)
 	if err != nil {
 		return nil, fmt.Errorf("finding new commits: %w", err)
 	}
@@ -196,6 +212,7 @@ func (ic *IncrementalCorrelator) tryIncrementalUpdate(existing *HistoryReport, b
 
 	// Extract co-commits from new events
 	coCommitter := NewCoCommitExtractor(ic.cache.repoPath)
+	coCommitter.ctx = ic.ctx
 	newCorrelatedCommits, err := coCommitter.ExtractAllCoCommits(newEvents)
 	if err != nil {
 		return nil, fmt.Errorf("extracting co-commits: %w", err)
@@ -225,14 +242,15 @@ func (ic *IncrementalCorrelator) incrementalExtractor() *Extractor {
 	return NewExtractor(repoPath)
 }
 
-// getCommitsSince returns commit SHAs since the given commit (exclusive)
-func getCommitsSince(repoPath, sinceSHA string) ([]string, error) {
+// getCommitsSince returns commit SHAs since the given commit (exclusive).
+// ctx bounds the git subprocess (#166); nil means context.Background().
+func getCommitsSince(ctx context.Context, repoPath, sinceSHA string) ([]string, error) {
 	if sinceSHA == "" {
 		return nil, fmt.Errorf("no since SHA provided")
 	}
 
 	// Use git rev-list to get commits since the given SHA
-	cmd := exec.Command("git", "rev-list", "--reverse", fmt.Sprintf("%s..HEAD", sinceSHA))
+	cmd := gitCommand(ctx, "rev-list", "--reverse", fmt.Sprintf("%s..HEAD", sinceSHA))
 	cmd.Dir = repoPath
 
 	out, err := cmd.Output()
@@ -252,13 +270,14 @@ func getCommitsSince(repoPath, sinceSHA string) ([]string, error) {
 	return lines, nil
 }
 
-// countCommitsSince returns the number of commits since the given SHA
-func countCommitsSince(repoPath, sinceSHA string) (int, error) {
+// countCommitsSince returns the number of commits since the given SHA.
+// ctx bounds the git subprocess (#166); nil means context.Background().
+func countCommitsSince(ctx context.Context, repoPath, sinceSHA string) (int, error) {
 	if sinceSHA == "" {
 		return 0, fmt.Errorf("no since SHA provided")
 	}
 
-	cmd := exec.Command("git", "rev-list", "--count", fmt.Sprintf("%s..HEAD", sinceSHA))
+	cmd := gitCommand(ctx, "rev-list", "--count", fmt.Sprintf("%s..HEAD", sinceSHA))
 	cmd.Dir = repoPath
 
 	out, err := cmd.Output()
@@ -292,7 +311,7 @@ func extractEventsFromCommits(extractor *Extractor, commitSHAs []string, filterB
 	args = append(args, commitSHAs...)
 	args = append(args, "--", extractor.primaryBeadsFile())
 
-	cmd := exec.Command("git", withNoColorGit(args)...)
+	cmd := gitCommand(extractor.ctx, withNoColorGit(args)...)
 	cmd.Dir = extractor.repoPath
 
 	out, err := cmd.Output()
@@ -540,7 +559,7 @@ func CanUpdateIncrementally(repoPath string, cachedReport *HistoryReport) (bool,
 		return false, 0, nil
 	}
 
-	count, err := countCommitsSince(repoPath, cachedReport.LatestCommitSHA)
+	count, err := countCommitsSince(context.Background(), repoPath, cachedReport.LatestCommitSHA)
 	if err != nil {
 		return false, 0, err
 	}

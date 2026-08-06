@@ -20,9 +20,9 @@ func writeBeads(t *testing.T, dir, content string) {
 	}
 }
 
-func runRobotJSON(t *testing.T, bv, dir string, flag string, v any) {
+func runRobotJSON(t *testing.T, bv, dir string, flag string, v any, extraFlags ...string) {
 	t.Helper()
-	out, err := runCommand(bv, dir, flag)
+	out, err := runCommand(bv, dir, flag, extraFlags...)
 	if err != nil {
 		t.Fatalf("%s failed: %v\n%s", flag, err, out)
 	}
@@ -31,9 +31,10 @@ func runRobotJSON(t *testing.T, bv, dir string, flag string, v any) {
 	}
 }
 
-// runCommand is a tiny helper to exec the bv binary with a single flag.
-func runCommand(bv, dir, flag string) ([]byte, error) {
-	cmd := execCommand(bv, flag)
+// runCommand is a tiny helper to exec the bv binary with a primary flag plus
+// optional extra flags.
+func runCommand(bv, dir, flag string, extraFlags ...string) ([]byte, error) {
+	cmd := execCommand(bv, append([]string{flag}, extraFlags...)...)
 	cmd.Dir = dir
 	return cmd.CombinedOutput()
 }
@@ -183,6 +184,80 @@ func TestRobotTriageContract(t *testing.T) {
 	// Should have quick_ref.top_picks
 	if len(payload.Triage.QuickRef.TopPicks) == 0 {
 		t.Fatalf("triage missing quick_ref.top_picks")
+	}
+}
+
+// TestRobotTriageBriefContract exercises --robot-triage --brief (#183):
+// the compact payload keeps identity/claim-state/dependency fields and
+// omits the token-heavy full sections (score breakdowns, project health,
+// commands, usage hints).
+func TestRobotTriageBriefContract(t *testing.T) {
+	bv := buildBvBinary(t)
+	env := t.TempDir()
+	writeBeads(t, env, `{"id":"A","title":"Blocker","status":"open","priority":1,"issue_type":"task"}
+{"id":"B","title":"Blocked","status":"open","priority":2,"issue_type":"task","assignee":"agent-7","dependencies":[{"issue_id":"B","depends_on_id":"A","type":"blocks"}]}`)
+
+	var payload map[string]any
+	runRobotJSON(t, bv, env, "--robot-triage", &payload, "--brief")
+
+	if payload["data_hash"] == "" || payload["data_hash"] == nil {
+		t.Fatalf("brief triage missing data_hash")
+	}
+	if payload["brief"] != true {
+		t.Fatalf("brief triage missing brief:true marker, got %v", payload["brief"])
+	}
+	for _, absent := range []string{"triage", "usage_hints", "feedback"} {
+		if _, ok := payload[absent]; ok {
+			t.Fatalf("brief triage must omit %q section", absent)
+		}
+	}
+	quickRef, ok := payload["quick_ref"].(map[string]any)
+	if !ok {
+		t.Fatalf("brief triage missing quick_ref, got %T", payload["quick_ref"])
+	}
+	if _, ok := quickRef["top_picks"]; !ok {
+		t.Fatalf("brief quick_ref missing top_picks")
+	}
+
+	recs, ok := payload["recommendations"].([]any)
+	if !ok || len(recs) == 0 {
+		t.Fatalf("brief triage missing recommendations, got %v", payload["recommendations"])
+	}
+	sawBlockedBy := false
+	for _, r := range recs {
+		rec, ok := r.(map[string]any)
+		if !ok {
+			t.Fatalf("brief recommendation is not an object: %v", r)
+		}
+		for _, required := range []string{"id", "title", "status", "score"} {
+			if _, ok := rec[required]; !ok {
+				t.Fatalf("brief recommendation missing %q: %v", required, rec)
+			}
+		}
+		for _, absent := range []string{"breakdown", "reasons", "action", "labels"} {
+			if _, ok := rec[absent]; ok {
+				t.Fatalf("brief recommendation must omit %q: %v", absent, rec)
+			}
+		}
+		if rec["id"] == "B" {
+			blockedBy, _ := rec["blocked_by"].([]any)
+			if len(blockedBy) != 1 || blockedBy[0] != "A" {
+				t.Fatalf("expected B blocked_by [A], got %v", rec["blocked_by"])
+			}
+			if rec["assignee"] != "agent-7" {
+				t.Fatalf("expected B assignee agent-7, got %v", rec["assignee"])
+			}
+			sawBlockedBy = true
+		}
+		if rec["id"] == "A" {
+			unblocks, _ := rec["unblocks"].([]any)
+			if len(unblocks) != 1 || unblocks[0] != "B" {
+				t.Fatalf("expected A unblocks [B], got %v", rec["unblocks"])
+			}
+		}
+	}
+	if !sawBlockedBy {
+		t.Fatalf("expected recommendation for blocked issue B, got %v", recs)
 	}
 }
 

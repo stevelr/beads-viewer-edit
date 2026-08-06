@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -341,6 +342,18 @@ func LoadHistoryCmd(issues []model.Issue, beadsPath string) tea.Cmd {
 			}
 		}
 
+		// History correlations are derived from the git history of the *JSONL*
+		// export, never the SQLite DB: the correlator runs `git log -p --follow`
+		// over the followed file, and a binary (and usually gitignored) beads.db
+		// yields zero lifecycle events. The smart data-source selector, however,
+		// hands us whatever source has the freshest mtime — and after a normal
+		// `br sync` the DB is routinely a few milliseconds newer than the JSONL,
+		// so beadsPath arrives pointing at beads.db and every correlation is lost
+		// (bv #171). The watch/load paths legitimately prefer the DB, so we scope
+		// the JSONL preference to *this* (correlation) path only and resolve the
+		// git-tracked JSONL ourselves whenever beadsPath is not already one.
+		correlationPath := resolveHistoryCorrelationPath(beadsPath, repoPath)
+
 		// Convert model.Issue to correlation.BeadInfo
 		beads := make([]correlation.BeadInfo, len(issues))
 		for i, issue := range issues {
@@ -351,7 +364,7 @@ func LoadHistoryCmd(issues []model.Issue, beadsPath string) tea.Cmd {
 			}
 		}
 
-		correlator := correlation.NewCorrelator(repoPath, beadsPath)
+		correlator := correlation.NewCorrelator(repoPath, correlationPath)
 		opts := correlation.CorrelatorOptions{
 			Limit: 500, // Reasonable limit for TUI performance
 		}
@@ -359,6 +372,42 @@ func LoadHistoryCmd(issues []model.Issue, beadsPath string) tea.Cmd {
 		report, err := correlator.GenerateReport(beads, opts)
 		return HistoryLoadedMsg{Report: report, Error: err}
 	}
+}
+
+// resolveHistoryCorrelationPath returns the path the History correlator should
+// follow through git history. Correlations come from the git history of the
+// JSONL export, so if the selected source is already a .jsonl we keep it; if it
+// is anything else (most importantly .beads/beads.db, which the freshest-mtime
+// selector picks after sync bookkeeping makes the DB a few ms newer — bv #171),
+// we locate the git-tracked JSONL in the same .beads/ directory instead. When no
+// JSONL can be found we fall back to the original path so the correlator's own
+// default-file logic still runs (it degrades gracefully to "no commits").
+func resolveHistoryCorrelationPath(beadsPath, repoPath string) string {
+	if beadsPath == "" {
+		// Empty path: let the correlator discover the standard beads files.
+		return beadsPath
+	}
+	if strings.EqualFold(filepath.Ext(beadsPath), ".jsonl") {
+		// Already a JSONL export — the correct correlation source.
+		return beadsPath
+	}
+
+	// The selected source is not a JSONL (e.g. beads.db). Find the JSONL that
+	// lives alongside it so History follows git history rather than the binary DB.
+	beadsDir := filepath.Dir(beadsPath)
+	if jsonlPath, err := loader.FindJSONLPath(beadsDir); err == nil && jsonlPath != "" {
+		return jsonlPath
+	}
+	// As a secondary attempt, try the repo's standard .beads/ directory in case
+	// beadsPath used a non-standard layout.
+	if repoPath != "" {
+		if jsonlPath, err := loader.FindJSONLPath(filepath.Join(repoPath, ".beads")); err == nil && jsonlPath != "" {
+			return jsonlPath
+		}
+	}
+	// No JSONL found: preserve original behavior (correlator falls back to its
+	// own default beads-file resolution).
+	return beadsPath
 }
 
 func cloneIssuesForAsync(issues []model.Issue) []model.Issue {
@@ -874,7 +923,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 			Issue:      issues[i],
 			GraphScore: graphStats.GetPageRankScore(issues[i].ID),
 			Impact:     graphStats.GetCriticalPathScore(issues[i].ID),
-			RepoPrefix: ExtractRepoPrefix(issues[i].ID),
+			RepoPrefix: issueRepoKey(issues[i]),
 		}
 	}
 
@@ -2235,7 +2284,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Issue:      m.issues[i],
 				GraphScore: m.analysis.GetPageRankScore(m.issues[i].ID),
 				Impact:     m.analysis.GetCriticalPathScore(m.issues[i].ID),
-				RepoPrefix: ExtractRepoPrefix(m.issues[i].ID),
+				RepoPrefix: issueRepoKey(m.issues[i]),
 			}
 			item.TriageScore = m.triageScores[m.issues[i].ID]
 			if reasons, exists := m.triageReasons[m.issues[i].ID]; exists {
@@ -2810,6 +2859,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Handle shortcuts sidebar toggle (; or F2) - bv-3qi5
 		if (msg.String() == ";" || msg.String() == "f2") && m.list.FilterState() != list.Filtering {
 			m.showShortcutsSidebar = !m.showShortcutsSidebar
+			// Reflow the main panes for the new content width so the sidebar
+			// reserves its own column instead of overflowing/wrapping into the
+			// panes (#168). Without this the body stays sized to the full width
+			// and the appended sidebar pushes lines past the terminal edge.
+			m.applyContentSizing()
 			if m.showShortcutsSidebar {
 				m.shortcutsSidebar.ResetScroll()
 				m.statusMsg = "Shortcuts sidebar: ; hide | ctrl+j/k scroll"
@@ -3010,6 +3064,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			m = m.handleHistoryKeys(msg)
+			return m, nil
+		}
+		// The label picker overlay has an always-focused text input. Like the
+		// search submodes above, it must consume keys BEFORE the global key
+		// block; otherwise printable input — most notably a lowercase q — leaks
+		// into the global q/esc view-toggle handlers and closes the picker
+		// instead of being typed into the filter (issue #176). Esc still cancels
+		// and enter still applies via handleLabelPickerKeys.
+		if m.focused == focusLabelPicker && m.showLabelPicker {
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			m = m.handleLabelPickerKeys(msg)
 			return m, nil
 		}
 
@@ -3724,6 +3791,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.flowMatrix.MoveDown()
 			}
 			return m, nil
+
+		case tea.MouseButtonLeft:
+			// Left-click to focus a panel and select the row under the cursor
+			// (bv-162). WithMouseCellMotion also delivers motion and release
+			// events for the left button, so only act on a press.
+			if msg.Action != tea.MouseActionPress {
+				return m, nil
+			}
+			m = m.handleLeftClick(msg.X, msg.Y)
+			return m, nil
 		}
 
 	case tea.WindowSizeMsg:
@@ -3731,52 +3808,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.isSplitView = msg.Width > SplitViewThreshold
 		m.ready = true
-		bodyHeight := m.height - 1 // keep 1 row for footer
-		if bodyHeight < 5 {
-			bodyHeight = 5
-		}
-
-		if m.isSplitView {
-			// Calculate dimensions accounting for 2 panels with borders(2)+padding(2) = 4 overhead each
-			// Total overhead = 8
-			availWidth := msg.Width - 8
-			if availWidth < 10 {
-				availWidth = 10
-			}
-
-			// Use configurable split ratio (default 0.4, adjustable via [ and ])
-			listInnerWidth := int(float64(availWidth) * m.splitPaneRatio)
-			detailInnerWidth := availWidth - listInnerWidth
-
-			// listHeight fits header (1) + page line (1) inside a panel with Border (2)
-			listHeight := bodyHeight - 4
-			if listHeight < 3 {
-				listHeight = 3
-			}
-
-			m.list.SetSize(listInnerWidth, listHeight)
-			m.viewport = viewport.New(detailInnerWidth, bodyHeight-2) // Account for border
-
-			m.renderer.SetWidthWithTheme(detailInnerWidth, m.theme)
-		} else {
-			listHeight := bodyHeight - 2
-			if listHeight < 3 {
-				listHeight = 3
-			}
-			m.list.SetSize(msg.Width, listHeight)
-			m.viewport = viewport.New(msg.Width, bodyHeight-1)
-
-			// Update renderer for full width
-			m.renderer.SetWidthWithTheme(msg.Width, m.theme)
-		}
-
-		m.updateListDelegate()
-
-		// Resize label dashboard table and modal overlay sizing
-		m.labelDashboard.SetSize(m.width, bodyHeight)
-
-		m.insightsPanel.SetSize(m.width, bodyHeight)
-		m.updateViewportContent()
+		m.applyContentSizing()
 	}
 
 	// Update list for navigation, but NOT for WindowSizeMsg
@@ -4413,6 +4445,11 @@ func (m Model) handleHistoryKeys(msg tea.KeyMsg) Model {
 
 // getCommitURL returns the GitHub/GitLab commit URL for a SHA (bv-xf4p)
 func (m Model) getCommitURL(sha string) string {
+	sha = strings.TrimSpace(sha)
+	if sha == "" {
+		return ""
+	}
+
 	// Get git remote URL
 	cmd := exec.Command("git", "remote", "get-url", "origin")
 	cmd.Dir = m.workDir
@@ -4437,6 +4474,11 @@ func (m Model) getCommitURL(sha string) string {
 
 // gitRemoteToWebURL converts a git remote URL to a web URL (bv-xf4p)
 func gitRemoteToWebURL(remote string) string {
+	remote = strings.TrimSpace(remote)
+	if remote == "" {
+		return ""
+	}
+
 	// Handle SSH URLs: git@github.com:user/repo.git
 	if strings.HasPrefix(remote, "git@") {
 		// Remove git@ prefix and .git suffix
@@ -4444,16 +4486,41 @@ func gitRemoteToWebURL(remote string) string {
 		remote = strings.TrimSuffix(remote, ".git")
 		// Replace : with /
 		remote = strings.Replace(remote, ":", "/", 1)
-		return "https://" + remote
+		return normalizeGitRemoteWebURL("https://" + remote)
 	}
 
 	// Handle HTTPS URLs: https://github.com/user/repo.git
-	if strings.HasPrefix(remote, "https://") || strings.HasPrefix(remote, "http://") {
-		remote = strings.TrimSuffix(remote, ".git")
-		return remote
+	if strings.HasPrefix(remote, "https://") || strings.HasPrefix(remote, "http://") ||
+		strings.HasPrefix(remote, "ssh://") {
+		return normalizeGitRemoteWebURL(remote)
 	}
 
 	return ""
+}
+
+func normalizeGitRemoteWebURL(remote string) string {
+	u, err := url.Parse(remote)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+
+	switch u.Scheme {
+	case "https", "http":
+	case "ssh":
+		u.Scheme = "https"
+		u.User = nil
+		u.Host = u.Hostname()
+	default:
+		return ""
+	}
+
+	u.RawQuery = ""
+	u.Fragment = ""
+	u.Path = strings.TrimSuffix(strings.TrimRight(u.Path, "/"), ".git")
+	if u.Path == "" || u.Path == "/" {
+		return ""
+	}
+	return u.String()
 }
 
 // openBrowserURL opens a URL in the default browser (bv-xf4p)
@@ -5061,12 +5128,28 @@ func (m Model) renderListWithHeader() string {
 		availableHeight = m.height - 3 // fallback
 	}
 
-	// Render column header
+	// Width available to this (single-column) body. When the shortcuts sidebar
+	// is open it reserves its own column, so the header/page lines and the final
+	// clamp below must shrink to the reserved width — otherwise the body is drawn
+	// at the full terminal width and JoinHorizontal(body, sidebar) in View()
+	// overflows past the terminal edge and wraps back into the panes (#168). The
+	// list itself was already sized to mainContentWidth() in applyContentSizing.
+	bodyWidth := m.mainContentWidth()
+
+	// Render column header.
+	//
+	// Clamp to a single line (Height/MaxHeight 1): the header strings below are
+	// ~65 columns wide, so on a narrow terminal (bodyWidth-2 < header width) they
+	// would otherwise wrap to a 2nd line, misaligning columns AND shifting every
+	// list row down by a line, which broke the click->row mapping in
+	// handleLeftClick (bv-164). See listChromeLines().
 	headerStyle := t.Renderer.NewStyle().
 		Background(t.Primary).
 		Foreground(lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#282A36"}).
 		Bold(true).
-		Width(m.width - 2)
+		Width(bodyWidth - 2).
+		Height(1).
+		MaxHeight(1)
 
 	headerText := "  TYPE PRI STATUS      ID                                   TITLE"
 	if m.workspaceMode {
@@ -5101,7 +5184,7 @@ func (m Model) renderListWithHeader() string {
 	pageStyle := t.Renderer.NewStyle().
 		Foreground(t.Secondary).
 		Align(lipgloss.Right).
-		Width(m.width - 2)
+		Width(bodyWidth - 2)
 
 	// Combine header with page info on the right
 	headerLine := lipgloss.JoinHorizontal(lipgloss.Top,
@@ -5125,9 +5208,11 @@ func (m Model) renderListWithHeader() string {
 	// Header (1) + List + PageLine (1) must fit in bodyHeight
 	content := lipgloss.JoinVertical(lipgloss.Left, headerLine, listView, pageLine)
 
-	// Force exact height to prevent overflow
+	// Force exact width/height to prevent overflow. Width is the reserved body
+	// width (mainContentWidth) so the appended shortcuts sidebar fits within the
+	// terminal rather than overflowing it (#168).
 	return lipgloss.NewStyle().
-		Width(m.width).
+		Width(bodyWidth).
 		Height(bodyHeight).
 		MaxHeight(bodyHeight).
 		Render(content)
@@ -5150,12 +5235,21 @@ func (m Model) renderSplitView() string {
 	listInnerWidth := m.list.Width()
 	panelHeight := m.height - 1
 
-	// Create header row for list
+	// Create header row for list.
+	//
+	// Clamp to a single line (Height/MaxHeight 1): the header string is ~51
+	// columns wide, so on a narrow list pane (listInnerWidth < ~51) it would
+	// otherwise wrap to a 2nd line. That wrap both misaligns the columns AND
+	// shifts every list row down by a line, breaking the click->row mapping in
+	// handleLeftClick (bv-164). Clamping keeps the chrome above the first row at
+	// a constant height regardless of width; see listChromeLines().
 	headerStyle := t.Renderer.NewStyle().
 		Background(t.Primary).
 		Foreground(lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#282A36"}).
 		Bold(true).
-		Width(listInnerWidth)
+		Width(listInnerWidth).
+		Height(1).
+		MaxHeight(1)
 
 	header := headerStyle.Render("  TYPE PRI STATUS      ID                     TITLE")
 
@@ -6617,7 +6711,7 @@ func (m *Model) setActiveRecipe(r *recipe.Recipe) {
 func (m *Model) matchesCurrentFilter(issue model.Issue) bool {
 	// Workspace repo filter (nil = all repos)
 	if m.workspaceMode && m.activeRepos != nil {
-		repoKey := strings.ToLower(ExtractRepoPrefix(issue.ID))
+		repoKey := issueRepoKey(issue)
 		if repoKey != "" && !m.activeRepos[repoKey] {
 			return false
 		}
@@ -6665,7 +6759,7 @@ func (m *Model) filteredIssuesForActiveView() []model.Issue {
 	if recipeFilterActive {
 		for _, issue := range m.issues {
 			if m.workspaceMode && m.activeRepos != nil {
-				repoKey := strings.ToLower(ExtractRepoPrefix(issue.ID))
+				repoKey := issueRepoKey(issue)
 				if repoKey != "" && !m.activeRepos[repoKey] {
 					continue
 				}
@@ -6738,7 +6832,7 @@ func (m *Model) applyFilter() {
 				GraphScore: m.analysis.GetPageRankScore(issue.ID),
 				Impact:     m.analysis.GetCriticalPathScore(issue.ID),
 				DiffStatus: m.getDiffStatus(issue.ID),
-				RepoPrefix: ExtractRepoPrefix(issue.ID),
+				RepoPrefix: issueRepoKey(issue),
 			}
 			// Add triage data (bv-151)
 			item.TriageScore = m.triageScores[issue.ID]
@@ -6926,7 +7020,7 @@ func (m *Model) applyRecipe(r *recipe.Recipe) {
 
 		// Workspace repo filter (nil = all repos)
 		if m.workspaceMode && m.activeRepos != nil {
-			repoKey := strings.ToLower(ExtractRepoPrefix(issue.ID))
+			repoKey := issueRepoKey(issue)
 			if repoKey != "" && !m.activeRepos[repoKey] {
 				include = false
 			}
@@ -6992,7 +7086,7 @@ func (m *Model) applyRecipe(r *recipe.Recipe) {
 				GraphScore: m.analysis.GetPageRankScore(issue.ID),
 				Impact:     m.analysis.GetCriticalPathScore(issue.ID),
 				DiffStatus: m.getDiffStatus(issue.ID),
-				RepoPrefix: ExtractRepoPrefix(issue.ID),
+				RepoPrefix: issueRepoKey(issue),
 			}
 			// Add triage data (bv-151)
 			item.TriageScore = m.triageScores[issue.ID]
@@ -7142,6 +7236,101 @@ func (m *Model) applyRecipe(r *recipe.Recipe) {
 	m.updateViewportContent()
 }
 
+// shortcutsSidebarGap is the number of extra columns the rendered shortcuts
+// sidebar occupies beyond its content Width(). The body is sized down by the
+// sidebar's content width PLUS this gap so that JoinHorizontal(body, sidebar)
+// never exceeds m.width — otherwise the terminal wraps the overflow back into
+// the panes (bv-3qi5 / issue #168).
+//
+// The sidebar's View() wraps its content in a lipgloss box with
+// Width(s.width) and a RoundedBorder(). In lipgloss, Width() sets the *content*
+// width and the border is drawn *outside* it, so the rendered sidebar is
+// s.width + 2 cells wide (one border column on each side). The reserved column
+// must therefore include those 2 border columns, hence gap = 2. (The earlier
+// value of 0 left the joined layout 2 cells over the terminal width, so the
+// sidebar still overflowed by its right border on a real TTY.)
+const shortcutsSidebarGap = 2
+
+// mainContentWidth returns the width available to the main body (list/detail
+// panes and full-screen views). When the shortcuts sidebar is open it reserves
+// the sidebar's column so the body is laid out into the remaining width instead
+// of being drawn full-width and then overflowing once the sidebar is appended.
+//
+// It never returns less than a small floor so downstream sizing math stays
+// positive on very narrow terminals (where the sidebar realistically can't be
+// shown anyway, but we must not produce negative widths).
+func (m Model) mainContentWidth() int {
+	w := m.width
+	if m.showShortcutsSidebar {
+		w -= m.shortcutsSidebar.Width() + shortcutsSidebarGap
+	}
+	if w < 20 {
+		w = 20
+	}
+	return w
+}
+
+// applyContentSizing (re)computes the list, viewport, renderer, and auxiliary
+// panel dimensions from the current m.width / m.height / m.isSplitView and the
+// current shortcuts-sidebar visibility. It is the single sizing path shared by
+// the WindowSizeMsg handler and the sidebar toggle so that opening/closing the
+// sidebar reflows the body immediately (without waiting for a terminal resize)
+// and never leaves the panes sized for a width the sidebar then overflows (#168).
+func (m *Model) applyContentSizing() {
+	bodyHeight := m.height - 1 // keep 1 row for footer
+	if bodyHeight < 5 {
+		bodyHeight = 5
+	}
+
+	// Width available to the main body, reserving the shortcuts sidebar column
+	// when it is open (#168) so the body never overflows once the sidebar is
+	// appended in View().
+	contentWidth := m.mainContentWidth()
+
+	if m.isSplitView {
+		// Calculate dimensions accounting for 2 panels with borders(2)+padding(2) = 4 overhead each
+		// Total overhead = 8
+		availWidth := contentWidth - 8
+		if availWidth < 10 {
+			availWidth = 10
+		}
+
+		// Use configurable split ratio (default 0.4, adjustable via [ and ])
+		listInnerWidth := int(float64(availWidth) * m.splitPaneRatio)
+		detailInnerWidth := availWidth - listInnerWidth
+
+		// listHeight fits header (1) + page line (1) inside a panel with Border (2)
+		listHeight := bodyHeight - 4
+		if listHeight < 3 {
+			listHeight = 3
+		}
+
+		m.list.SetSize(listInnerWidth, listHeight)
+		m.viewport = viewport.New(detailInnerWidth, bodyHeight-2) // Account for border
+
+		m.renderer.SetWidthWithTheme(detailInnerWidth, m.theme)
+	} else {
+		listHeight := bodyHeight - 2
+		if listHeight < 3 {
+			listHeight = 3
+		}
+		m.list.SetSize(contentWidth, listHeight)
+		m.viewport = viewport.New(contentWidth, bodyHeight-1)
+
+		// Update renderer for full width
+		m.renderer.SetWidthWithTheme(contentWidth, m.theme)
+	}
+
+	m.updateListDelegate()
+
+	// Resize label dashboard table and modal overlay sizing. These full-screen
+	// panels are drawn at full m.width (the sidebar does not currently overlay
+	// them), so they keep using m.width rather than the reserved content width.
+	m.labelDashboard.SetSize(m.width, bodyHeight)
+	m.insightsPanel.SetSize(m.width, bodyHeight)
+	m.updateViewportContent()
+}
+
 // recalculateSplitPaneSizes updates list and viewport dimensions after pane ratio changes
 func (m *Model) recalculateSplitPaneSizes() {
 	if !m.isSplitView {
@@ -7153,8 +7342,10 @@ func (m *Model) recalculateSplitPaneSizes() {
 		bodyHeight = 5
 	}
 
-	// Calculate dimensions accounting for 2 panels with borders(2)+padding(2) = 4 overhead each
-	availWidth := m.width - 8
+	// Calculate dimensions accounting for 2 panels with borders(2)+padding(2) = 4 overhead each.
+	// Reserve the shortcuts sidebar column when it is open (#168) so the joined
+	// body+sidebar fits the terminal.
+	availWidth := m.mainContentWidth() - 8
 	if availWidth < 10 {
 		availWidth = 10
 	}
@@ -7171,6 +7362,146 @@ func (m *Model) recalculateSplitPaneSizes() {
 	m.viewport = viewport.New(detailInnerWidth, bodyHeight-2)
 	m.renderer.SetWidthWithTheme(detailInnerWidth, m.theme)
 	m.updateViewportContent()
+}
+
+// listChromeLines returns the number of non-row lines rendered above the first
+// list row, in the currently-active layout. It is the single source of truth
+// shared by the renderers' geometry and handleLeftClick's click->row mapping
+// (bv-164), so the two can never drift.
+//
+// The lines accounted for, top to bottom, are:
+//
+//	+1  panel top border        — split view only (rounded-border panel; the
+//	                              mobile/single-column view has no border).
+//	+1  column header           — the "TYPE PRI STATUS ..." line that both
+//	                              renderSplitView and renderListWithHeader draw
+//	                              before m.list.View(). It is clamped to a single
+//	                              line (MaxHeight(1)) so it cannot wrap on a
+//	                              narrow pane and is therefore always exactly 1.
+//	+1  list title/filter bar   — bubbles' list.View() always emits a leading
+//	                              title/filter section when
+//	                              showTitle || (showFilter && filteringEnabled).
+//	                              This list sets ShowTitle(false) but keeps the
+//	                              default ShowFilter(true) + FilteringEnabled(true)
+//	                              (the "/" search input must stay available), so
+//	                              the guard is true and a 1-line section is always
+//	                              rendered — blank when not actively filtering,
+//	                              the single-line FilterInput while typing — even
+//	                              though titleView() returns "". JoinVertical
+//	                              still renders it as one line.
+//
+// Mirroring bubbles' exact guard (list.go View): the filter-bar term is only
+// added when that condition holds, so disabling filtering later would
+// automatically drop it without touching this math.
+func (m Model) listChromeLines() int {
+	lines := 1 // column header (clamped to 1 line; never wraps)
+	if m.isSplitView {
+		lines++ // top border of the rounded-border list panel
+	}
+	if m.list.ShowTitle() || (m.list.ShowFilter() && m.list.FilteringEnabled()) {
+		lines++ // bubbles' always-present leading title/filter bar line
+	}
+	return lines
+}
+
+// handleLeftClick maps a left-click at terminal cell (x, y) to a focus change
+// and/or row selection in the currently-rendered view (bv-162, bv-164).
+//
+// The mapping mirrors the geometry produced by View(). The number of non-row
+// lines above the first list row is computed once by listChromeLines() so the
+// click math and the renderers share a single source of truth:
+//
+//   - Split view (m.isSplitView): the list panel is drawn on the left wrapped
+//     in a rounded-border panel of total width listInnerWidth+4 (1 border + 1
+//     style-content padding column on each side, with the list rendered at
+//     listInnerWidth). A click with x inside that span focuses the list; any
+//     other x focuses the detail panel. Within the list panel the lines above
+//     the first row are: the top border, the column header, and the list's
+//     always-present title/filter bar (listChromeLines() == 3), so the clicked
+//     row offset is y-listChromeLines() relative to the first row of the
+//     current pagination page.
+//
+//   - Mobile / single-column list view (renderListWithHeader): no border, so
+//     the lines above the first row are the column header and the filter bar
+//     (listChromeLines() == 2).
+//
+// Both headers are clamped to one line, so the offset is constant across wide
+// and narrow terminals (previously a narrow pane wrapped the header, shifting
+// every row down by an extra line — the off-by-two part of bv-164).
+//
+// For the absolute item index we add the current page's starting offset
+// (Paginator.Page * Paginator.PerPage), exactly the same slice start that
+// list.populatedView() uses to render the page.
+//
+// Modes other than the list (board, tree, graph, insights, history, sprint,
+// flow-matrix) are full-screen single panels with their own internal layout;
+// they are already focused, so a click there is treated as a no-op rather than
+// guessing at their internal geometry. The viewer stays read-only.
+func (m Model) handleLeftClick(x, y int) Model {
+	// Ignore clicks while any overlay/modal is up: the main list isn't drawn,
+	// so there is nothing meaningful to focus or select.
+	if m.showQuitConfirm || m.showAgentPrompt || m.showCassModal ||
+		m.showUpdateModal || m.showLabelHealthDetail || m.showLabelGraphAnalysis ||
+		m.showLabelDrilldown || m.showAlertsPanel || m.showTimeTravelPrompt ||
+		m.showRecipePicker || m.showRepoPicker || m.showLabelPicker ||
+		m.showHelp || m.showTutorial {
+		return m
+	}
+
+	// Full-screen single-panel views: nothing to re-focus (already focused),
+	// and their internal layouts aren't inverted here. No-op, read-only.
+	if m.focused == focusInsights || m.focused == focusFlowMatrix ||
+		m.focused == focusTree || m.isGraphView || m.isBoardView ||
+		m.isActionableView || m.isHistoryView || m.isSprintView ||
+		m.focused == focusLabelDashboard {
+		return m
+	}
+
+	// selectListRow selects the list item at rowOffset within the current page
+	// and syncs the detail pane when in split view. Out-of-range clicks (e.g.
+	// the page-indicator line or empty padding rows) are ignored.
+	selectListRow := func(rowOffset int) {
+		if rowOffset < 0 {
+			return
+		}
+		total := len(m.list.Items())
+		if total == 0 {
+			return
+		}
+		start := m.list.Paginator.Page * m.list.Paginator.PerPage
+		idx := start + rowOffset
+		if idx < 0 || idx >= total || idx >= start+m.list.Paginator.PerPage {
+			return
+		}
+		m.list.Select(idx)
+		if m.isSplitView {
+			m.updateViewportContent()
+		}
+	}
+
+	if m.isSplitView {
+		// Total width of the bordered list panel: list rendered at
+		// listInnerWidth, wrapped by a style of Width(listInnerWidth+2) plus a
+		// 1-cell rounded border on each side => listInnerWidth+4 total.
+		listPanelWidth := m.list.Width() + 4
+		if x < listPanelWidth {
+			m.focused = focusList
+			// Lines above the first row: border + header + list filter bar.
+			selectListRow(y - m.listChromeLines())
+		} else {
+			m.focused = focusDetail
+		}
+		return m
+	}
+
+	// Single-column mobile list view. Only meaningful when the list (not the
+	// detail viewport) is showing.
+	if !m.showDetails {
+		m.focused = focusList
+		// Lines above the first row: header + list filter bar (no border).
+		selectListRow(y - m.listChromeLines())
+	}
+	return m
 }
 
 func (m *Model) updateViewportContent() {
@@ -7517,8 +7848,13 @@ func (m *Model) enterHistoryView() {
 		}
 	}
 
-	// Load correlation data
-	correlator := correlation.NewCorrelator(cwd, m.beadsPath)
+	// Load correlation data. History correlations come from the git history of
+	// the JSONL export, so redirect a DB (or other non-JSONL) selection to the
+	// git-tracked JSONL — see resolveHistoryCorrelationPath and bv #171. Without
+	// this, a beads.db that is a few ms newer than issues.jsonl (the normal state
+	// after `br sync`) silently yields a correlation-free history view.
+	correlationPath := resolveHistoryCorrelationPath(m.beadsPath, cwd)
+	correlator := correlation.NewCorrelator(cwd, correlationPath)
 	opts := correlation.CorrelatorOptions{
 		Limit: 500, // Reasonable limit for TUI performance
 	}

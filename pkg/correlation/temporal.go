@@ -4,6 +4,7 @@ package correlation
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os/exec"
 	"regexp"
@@ -17,6 +18,21 @@ type TemporalCorrelator struct {
 	coCommitter  *CoCommitExtractor // For getting file changes
 	seenCommits  map[string]bool    // Track commits already correlated by higher-confidence methods
 	activeByAuth map[string]int     // Count of active beads per author (for confidence scoring)
+
+	// ctx, when set via WithContext, bounds the git subprocesses spawned by
+	// the correlator (issue #166). nil means context.Background().
+	ctx context.Context
+}
+
+// WithContext binds ctx to the correlator (and its co-commit extractor) so
+// their git subprocesses are cancelled when ctx is done (issue #166). Returns
+// the receiver for chaining.
+func (t *TemporalCorrelator) WithContext(ctx context.Context) *TemporalCorrelator {
+	t.ctx = ctx
+	if t.coCommitter != nil {
+		t.coCommitter.ctx = ctx
+	}
+	return t
 }
 
 // NewTemporalCorrelator creates a new temporal correlator
@@ -69,7 +85,7 @@ func (t *TemporalCorrelator) FindCommitsInWindow(window TemporalWindow) ([]Corre
 		"--no-merges",
 	}
 
-	cmd := exec.Command("git", args...)
+	cmd := gitCommand(t.ctx, args...)
 	cmd.Dir = t.repoPath
 
 	out, err := cmd.Output()
@@ -158,7 +174,7 @@ func gitAuthorRegex(author, authorEmail string) string {
 
 // touchesBeadsFile checks if a commit modifies any beads file
 func (t *TemporalCorrelator) touchesBeadsFile(sha string) bool {
-	cmd := exec.Command("git", "show", "--name-only", "--format=", sha)
+	cmd := gitCommand(t.ctx, "show", "--name-only", "--format=", sha)
 	cmd.Dir = t.repoPath
 
 	out, err := cmd.Output()

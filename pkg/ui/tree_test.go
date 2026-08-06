@@ -974,6 +974,32 @@ func TestSaveStateOnlyNonDefault(t *testing.T) {
 	}
 }
 
+func TestWriteTreeStateFileCleansTempOnReplaceFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create beads dir: %v", err)
+	}
+
+	statePath := filepath.Join(beadsDir, "tree-state.json")
+	if err := os.MkdirAll(statePath, 0755); err != nil {
+		t.Fatalf("Failed to create destination directory: %v", err)
+	}
+
+	err := writeTreeStateFile(statePath, []byte(`{"version":1,"expanded":{}}`))
+	if err == nil {
+		t.Fatal("Expected writeTreeStateFile to fail when destination is a directory")
+	}
+
+	matches, err := filepath.Glob(filepath.Join(beadsDir, "tree-state.json.tmp-*"))
+	if err != nil {
+		t.Fatalf("Glob temporary state files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("Expected failed save to clean temporary state files, found %v", matches)
+	}
+}
+
 // TestSetBeadsDir tests the SetBeadsDir method
 func TestSetBeadsDir(t *testing.T) {
 	theme := DefaultTheme(lipgloss.NewRenderer(nil))
@@ -1122,6 +1148,42 @@ func TestLoadStateCorrupted(t *testing.T) {
 	}
 	if !tree.issueMap["root"].Expanded {
 		t.Error("Expected root to be expanded (default) after corrupted state file")
+	}
+}
+
+func TestLoadStateUnsupportedVersion(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create beads dir: %v", err)
+	}
+
+	state := TreeState{
+		Version: TreeStateVersion + 1,
+		Expanded: map[string]bool{
+			"root": false,
+		},
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		t.Fatalf("Failed to marshal state: %v", err)
+	}
+	statePath := filepath.Join(beadsDir, "tree-state.json")
+	if err := os.WriteFile(statePath, data, 0644); err != nil {
+		t.Fatalf("Failed to write state file: %v", err)
+	}
+
+	issues := []model.Issue{
+		{ID: "root", Title: "Root", Status: model.StatusOpen, IssueType: model.TypeEpic},
+	}
+
+	theme := DefaultTheme(lipgloss.NewRenderer(nil))
+	tree := NewTreeModel(theme)
+	tree.SetBeadsDir(beadsDir)
+	tree.Build(issues)
+
+	if !tree.issueMap["root"].Expanded {
+		t.Error("Expected unsupported state version to be ignored")
 	}
 }
 

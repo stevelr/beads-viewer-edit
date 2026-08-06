@@ -1049,7 +1049,27 @@ function countIssues(filters = {}) {
  */
 function getIssue(id) {
   const results = execQuery(`SELECT * FROM issue_overview_mv WHERE id = ?`, [id]);
-  return results[0] || null;
+  const issue = results[0] || null;
+  if (issue) {
+    issue.comments = getIssueComments(id);
+  }
+  return issue;
+}
+
+/**
+ * Fetch discussion comments for an issue (bv-52 comments table, issue #187).
+ * Returns [] when the bundle predates the comments table or the query fails,
+ * so older exports keep working.
+ */
+function getIssueComments(id) {
+  try {
+    return execQuery(
+      `SELECT author, text, created_at FROM comments WHERE issue_id = ? ORDER BY created_at ASC, id ASC`,
+      [id]
+    );
+  } catch {
+    return [];
+  }
 }
 
 // ============================================================================
@@ -1923,6 +1943,26 @@ const ROUTES = [
   { pattern: '/graph', view: 'graph' },
 ];
 
+const DIRECT_VIEW_ROUTES = new Set(['issues', 'insights', 'graph']);
+
+/**
+ * Resolve a static view from the final URL path segment.
+ *
+ * Static hosts can rewrite paths such as /project/graph to index.html. The
+ * viewer keeps hash routing for in-app navigation, but honors that clean path
+ * on the initial load when no hash route is present.
+ */
+function routeHashFromPathname(pathname) {
+  const segments = (pathname || '/').split('/').filter(Boolean);
+  const finalSegment = segments[segments.length - 1] || '';
+
+  if (DIRECT_VIEW_ROUTES.has(finalSegment)) {
+    return `#/${finalSegment}`;
+  }
+
+  return '#/';
+}
+
 /**
  * Parse hash into view and params
  */
@@ -2561,11 +2601,6 @@ function beadsApp() {
         // Load issues for list view (initial data)
         this.loadIssues();
 
-        // Handle initial route from URL hash
-        if (window.location.hash) {
-          this.handleHashChange();
-        }
-
         // Initialize WASM graph engine (non-blocking)
         this.loadingMessage = 'Loading graph engine...';
         this.graphReady = await initGraphEngine();
@@ -2583,6 +2618,11 @@ function beadsApp() {
           this.articulationPoints = getArticulationPoints();
           this.criticalPathSlack = getIssuesBySlack(10, true); // Zero slack = critical path
         }
+
+        // Handle the initial hash route or a host-rewritten clean path after
+        // the graph engine is ready, so direct graph entry cannot start a
+        // second concurrent WASM initialization.
+        this.handleHashChange();
 
         // Listen for hash changes (browser back/forward)
         window.addEventListener('hashchange', () => this.handleHashChange());
@@ -2632,7 +2672,7 @@ function beadsApp() {
       const hash = window.location.hash;
 
       // Parse route
-      const route = parseRoute(hash);
+      const route = parseRoute(hash || routeHashFromPathname(window.location.pathname));
 
       // Handle route
       switch (route.view) {
@@ -3492,6 +3532,7 @@ window.beadsViewer = {
   filtersFromURL,
   syncFiltersToURL,
   parseRoute,
+  routeHashFromPathname,
   matchPattern,
   navigate,
   navigateToIssue,

@@ -73,6 +73,90 @@ func TestComputeTriage_BasicIssues(t *testing.T) {
 	}
 }
 
+// TestComputeTriage_CountSemantics pins the strict count semantics from
+// issue #165 on a mixed-status fixture: open_count/blocked_count must equal
+// the canonical by_status counts, the legacy aggregates live on
+// not_closed/not_actionable, and the partition invariant
+// not_closed == actionable + not_actionable holds.
+func TestComputeTriage_CountSemantics(t *testing.T) {
+	now := time.Now()
+	issues := []model.Issue{
+		// 2 strictly open: one actionable, one dependency-blocked.
+		{ID: "open-1", Title: "Open actionable", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, UpdatedAt: now},
+		{ID: "open-2", Title: "Open but dep-blocked", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{DependsOnID: "open-1", Type: model.DepBlocks}}},
+		// 1 in_progress.
+		{ID: "wip-1", Title: "In progress", Status: model.StatusInProgress, Priority: 1, IssueType: model.TypeBug, UpdatedAt: now},
+		// 1 status-blocked (also dependency-blocked).
+		{ID: "blk-1", Title: "Status blocked", Status: model.StatusBlocked, Priority: 2, IssueType: model.TypeTask, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{DependsOnID: "open-1", Type: model.DepBlocks}}},
+		// 1 deferred.
+		{ID: "def-1", Title: "Deferred", Status: model.StatusDeferred, Priority: 3, IssueType: model.TypeTask, UpdatedAt: now},
+		// 1 closed + 1 tombstone (both closed-like).
+		{ID: "done-1", Title: "Closed", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, UpdatedAt: now},
+		{ID: "ghost-1", Title: "Tombstone", Status: model.StatusTombstone, Priority: 1, IssueType: model.TypeTask, UpdatedAt: now},
+	}
+
+	triage := ComputeTriage(issues)
+	counts := triage.ProjectHealth.Counts
+	qr := triage.QuickRef
+
+	// Strict status counts must mirror by_status exactly.
+	if counts.Open != counts.ByStatus["open"] {
+		t.Errorf("counts.open=%d must equal by_status.open=%d", counts.Open, counts.ByStatus["open"])
+	}
+	if counts.Blocked != counts.ByStatus["blocked"] {
+		t.Errorf("counts.blocked=%d must equal by_status.blocked=%d", counts.Blocked, counts.ByStatus["blocked"])
+	}
+	if qr.OpenCount != counts.ByStatus["open"] {
+		t.Errorf("quick_ref.open_count=%d must equal by_status.open=%d", qr.OpenCount, counts.ByStatus["open"])
+	}
+	if qr.BlockedCount != counts.ByStatus["blocked"] {
+		t.Errorf("quick_ref.blocked_count=%d must equal by_status.blocked=%d", qr.BlockedCount, counts.ByStatus["blocked"])
+	}
+
+	// Absolute expectations for this fixture.
+	if counts.Open != 2 {
+		t.Errorf("expected 2 strictly open, got %d", counts.Open)
+	}
+	if counts.Blocked != 1 {
+		t.Errorf("expected 1 status-blocked, got %d", counts.Blocked)
+	}
+	if counts.Closed != 2 {
+		t.Errorf("expected 2 closed-like (closed+tombstone), got %d", counts.Closed)
+	}
+	if counts.NotClosed != 5 {
+		t.Errorf("expected 5 not closed, got %d", counts.NotClosed)
+	}
+	// Legacy aggregates survive under the new names: not_closed is the old
+	// "open" (open+in_progress+blocked+deferred) and dependency_blocked is
+	// the old "blocked" (non-closed && !actionable).
+	if counts.NotClosed != counts.Total-counts.Closed {
+		t.Errorf("not_closed=%d must equal total-closed=%d", counts.NotClosed, counts.Total-counts.Closed)
+	}
+
+	// Partition invariant: not_closed == actionable + not_actionable.
+	if counts.NotClosed != counts.Actionable+counts.DependencyBlocked {
+		t.Errorf("partition invariant violated: not_closed=%d, actionable=%d, dependency_blocked=%d",
+			counts.NotClosed, counts.Actionable, counts.DependencyBlocked)
+	}
+	if qr.NotClosedCount != qr.ActionableCount+qr.NotActionableCount {
+		t.Errorf("quick_ref partition invariant violated: not_closed_count=%d, actionable_count=%d, not_actionable_count=%d",
+			qr.NotClosedCount, qr.ActionableCount, qr.NotActionableCount)
+	}
+
+	// QuickRef mirrors HealthCounts.
+	if qr.NotClosedCount != counts.NotClosed {
+		t.Errorf("quick_ref.not_closed_count=%d must equal counts.not_closed=%d", qr.NotClosedCount, counts.NotClosed)
+	}
+	if qr.NotActionableCount != counts.DependencyBlocked {
+		t.Errorf("quick_ref.not_actionable_count=%d must equal counts.dependency_blocked=%d", qr.NotActionableCount, counts.DependencyBlocked)
+	}
+	if qr.InProgressCount != counts.ByStatus["in_progress"] {
+		t.Errorf("quick_ref.in_progress_count=%d must equal by_status.in_progress=%d", qr.InProgressCount, counts.ByStatus["in_progress"])
+	}
+}
+
 func TestComputeTriage_IgnoresTombstoneIssues(t *testing.T) {
 	issues := []model.Issue{
 		{
@@ -105,6 +189,9 @@ func TestComputeTriage_IgnoresTombstoneIssues(t *testing.T) {
 	}
 	if triage.QuickRef.BlockedCount != 0 {
 		t.Errorf("expected 0 blocked (tombstone blockers ignored), got %d", triage.QuickRef.BlockedCount)
+	}
+	if triage.QuickRef.NotActionableCount != 0 {
+		t.Errorf("expected 0 not actionable (tombstone blockers ignored), got %d", triage.QuickRef.NotActionableCount)
 	}
 
 	for _, rec := range triage.Recommendations {
@@ -149,9 +236,13 @@ func TestComputeTriage_WithDependencies(t *testing.T) {
 
 	triage := ComputeTriage(issues)
 
-	// One should be blocked
-	if triage.QuickRef.BlockedCount != 1 {
-		t.Errorf("expected 1 blocked, got %d", triage.QuickRef.BlockedCount)
+	// One should be dependency-blocked (not actionable). Both issues have
+	// status "open", so the strict blocked_count stays 0 (#165).
+	if triage.QuickRef.NotActionableCount != 1 {
+		t.Errorf("expected 1 not actionable, got %d", triage.QuickRef.NotActionableCount)
+	}
+	if triage.QuickRef.BlockedCount != 0 {
+		t.Errorf("expected 0 status-blocked, got %d", triage.QuickRef.BlockedCount)
 	}
 	if triage.QuickRef.ActionableCount != 1 {
 		t.Errorf("expected 1 actionable, got %d", triage.QuickRef.ActionableCount)
@@ -413,8 +504,14 @@ func TestComputeTriage_ParentBlockedChildNotTopPickOrClaim(t *testing.T) {
 	if triage.QuickRef.ActionableCount != 1 {
 		t.Fatalf("expected only the root blocker to be actionable, got %d", triage.QuickRef.ActionableCount)
 	}
-	if triage.QuickRef.BlockedCount != 2 {
-		t.Fatalf("expected parent and child blocked, got %d", triage.QuickRef.BlockedCount)
+	// Parent and child are dependency-blocked but their status is "open",
+	// so they count under not_actionable_count, not the strict
+	// blocked_count (#165).
+	if triage.QuickRef.NotActionableCount != 2 {
+		t.Fatalf("expected parent and child not actionable, got %d", triage.QuickRef.NotActionableCount)
+	}
+	if triage.QuickRef.BlockedCount != 0 {
+		t.Fatalf("expected 0 status-blocked, got %d", triage.QuickRef.BlockedCount)
 	}
 
 	for _, pick := range triage.QuickRef.TopPicks {
@@ -455,7 +552,28 @@ func TestComputeTriage_ParentBlockedChildNotTopPickOrClaim(t *testing.T) {
 	}
 }
 
-func TestComputeTriage_ParentChildParentBlocksChildClaim(t *testing.T) {
+// TestComputeTriage_ParentChildOpenParentDoesNotBlockChild verifies that
+// when a child has ONLY a parent-child rollup edge to an OPEN, UNBLOCKED
+// parent, the child is treated as ready work — not as "blocked by parent".
+// This matches `br ready`'s semantics (beads_rust's
+// compute_blocked_issues_map_impl excludes parent-child from direct blocker
+// edges; an open parent only propagates blocking down to its descendants
+// when the parent ITSELF is transitively blocked).
+//
+// History:
+//
+//   - bv-96 / a010545 added an aggressive rule that treated every open
+//     parent-child parent as a claim blocker; this test originally asserted
+//     that the child must not appear in top picks while the parent was
+//     open, encoding that aggressive behavior.
+//   - beads_viewer#158 reported this as the inverse of `br ready` — a
+//     standalone open parent (rollup container) never gates its child's
+//     readiness, and the inverted advice ("Work on parent first to unblock
+//     child") was actively misleading agents.
+//
+// The transitive-blocked case (parent has a real `blocks` predecessor) is
+// covered by TestComputeTriage_ParentBlockedChildNotTopPickOrClaim.
+func TestComputeTriage_ParentChildOpenParentDoesNotBlockChild(t *testing.T) {
 	now := time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC)
 	issues := []model.Issue{
 		{
@@ -481,18 +599,16 @@ func TestComputeTriage_ParentChildParentBlocksChildClaim(t *testing.T) {
 
 	triage := ComputeTriageWithOptionsAndTime(issues, TriageOptions{WaitForPhase2: true}, now)
 
-	for _, pick := range triage.QuickRef.TopPicks {
-		if pick.ID == "child" {
-			t.Fatalf("parent-child child must not appear in top picks while parent is open")
-		}
+	// Both parent and child are actionable: the parent has no edges at all,
+	// and the child's only edge is a rollup that never gates it.
+	if triage.QuickRef.ActionableCount != 2 {
+		t.Fatalf("expected both parent and child actionable, got %d", triage.QuickRef.ActionableCount)
 	}
-	if len(triage.QuickRef.TopPicks) == 0 || triage.QuickRef.TopPicks[0].ID != "parent" {
-		t.Fatalf("expected parent to be the claimable top pick, got %+v", triage.QuickRef.TopPicks)
+	if triage.QuickRef.BlockedCount != 0 {
+		t.Fatalf("expected zero blocked issues, got %d", triage.QuickRef.BlockedCount)
 	}
-
-	expectedClaim := "CI=1 br update parent --status in_progress --json"
-	if triage.Commands.ClaimTop != expectedClaim {
-		t.Fatalf("expected claim_top %q, got %q", expectedClaim, triage.Commands.ClaimTop)
+	if triage.QuickRef.NotActionableCount != 0 {
+		t.Fatalf("expected zero not-actionable issues, got %d", triage.QuickRef.NotActionableCount)
 	}
 
 	var childRec *Recommendation
@@ -503,10 +619,10 @@ func TestComputeTriage_ParentChildParentBlocksChildClaim(t *testing.T) {
 		}
 	}
 	if childRec == nil {
-		t.Fatal("expected child recommendation to remain visible with blocked_by context")
+		t.Fatal("expected child recommendation to be present")
 	}
-	if len(childRec.BlockedBy) != 1 || childRec.BlockedBy[0] != "parent" {
-		t.Fatalf("expected child blocked_by parent, got %v", childRec.BlockedBy)
+	if len(childRec.BlockedBy) != 0 {
+		t.Fatalf("child.BlockedBy = %v, want empty (parent-child to open parent is not a blocker)", childRec.BlockedBy)
 	}
 }
 
@@ -1280,7 +1396,7 @@ func TestTriageGroupByTrack_SingleTrack(t *testing.T) {
 		totalRecs += len(g.Recommendations)
 		hasClaimableRec := false
 		for _, rec := range g.Recommendations {
-			if isClaimableRecommendation(rec) {
+			if isClaimableRecommendation(rec, nil, nil) {
 				hasClaimableRec = true
 				break
 			}
@@ -1447,7 +1563,7 @@ func TestTriageGroupByTrack_TopPickHasHighestScore(t *testing.T) {
 		}
 		// Top pick should have the highest score in the group
 		for _, rec := range g.Recommendations {
-			if !isClaimableRecommendation(rec) {
+			if !isClaimableRecommendation(rec, nil, nil) {
 				continue
 			}
 			if rec.Score > g.TopPick.Score {
@@ -1608,7 +1724,7 @@ func TestBuildTopPicks_FiltersBlockedItems(t *testing.T) {
 	}
 
 	// Test with limit of 3
-	picks := buildTopPicks(recommendations, 3)
+	picks := buildTopPicks(recommendations, 3, nil, nil)
 
 	// Should have exactly 3 picks (all actionable items)
 	if len(picks) != 3 {
@@ -1769,7 +1885,7 @@ func TestBuildTopPicks_LimitRespected(t *testing.T) {
 	}
 
 	// Limit of 2
-	picks := buildTopPicks(recommendations, 2)
+	picks := buildTopPicks(recommendations, 2, nil, nil)
 	if len(picks) != 2 {
 		t.Errorf("expected 2 picks with limit=2, got %d", len(picks))
 	}
@@ -1787,7 +1903,7 @@ func TestBuildTopPicks_AllBlocked(t *testing.T) {
 		{ID: "b2", Title: "Blocked 2", Status: string(model.StatusOpen), Score: 90.0, BlockedBy: []string{"y"}},
 	}
 
-	picks := buildTopPicks(recommendations, 10)
+	picks := buildTopPicks(recommendations, 10, nil, nil)
 	if len(picks) != 0 {
 		t.Errorf("expected 0 picks when all are blocked, got %d", len(picks))
 	}
@@ -1810,19 +1926,126 @@ func TestBuildTopPicks_SkipsBlockedStatusAndAssigned(t *testing.T) {
 			Score:    90.0,
 		},
 		{
+			ID:     "open-epic",
+			Title:  "Open epic wrapper",
+			Type:   string(model.TypeEpic),
+			Status: string(model.StatusOpen),
+			Score:  80.0,
+		},
+		{
 			ID:     "ready-open",
 			Title:  "Ready open",
+			Type:   string(model.TypeTask),
 			Status: string(model.StatusOpen),
 			Score:  10.0,
 		},
 	}
 
-	picks := buildTopPicks(recommendations, 3)
+	picks := buildTopPicks(recommendations, 3, nil, nil)
 	if len(picks) != 1 {
 		t.Fatalf("expected only the claimable open issue, got %d picks: %#v", len(picks), picks)
 	}
 	if picks[0].ID != "ready-open" {
 		t.Fatalf("expected ready-open top pick, got %q", picks[0].ID)
+	}
+}
+
+// TestComputeTriage_NotReadyLabelExcludedFromTopPicks covers issue #173: an
+// open, unblocked, non-epic leaf carrying a configured not-ready label must not
+// be the claimable top pick, while behavior is unchanged when no labels are
+// configured.
+func TestComputeTriage_NotReadyLabelExcludedFromTopPicks(t *testing.T) {
+	now := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID:        "RAW-1",
+			Title:     "Raw reopened leaf (not ready)",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			Labels:    []string{"needs-polish"},
+			UpdatedAt: now,
+		},
+		{
+			ID:        "READY-1",
+			Title:     "Ready leaf",
+			Status:    model.StatusOpen,
+			Priority:  4,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+		},
+	}
+
+	// Default (no not-ready labels): RAW-1 is the higher-priority top pick.
+	base := ComputeTriageWithOptionsAndTime(issues, TriageOptions{WaitForPhase2: true}, now)
+	if len(base.QuickRef.TopPicks) == 0 || base.QuickRef.TopPicks[0].ID != "RAW-1" {
+		t.Fatalf("default: expected RAW-1 as top pick, got %#v", base.QuickRef.TopPicks)
+	}
+
+	// With needs-polish configured (case-insensitive): RAW-1 is excluded.
+	got := ComputeTriageWithOptionsAndTime(issues, TriageOptions{
+		WaitForPhase2:  true,
+		NotReadyLabels: []string{"NEEDS-POLISH"},
+	}, now)
+	if len(got.QuickRef.TopPicks) == 0 {
+		t.Fatalf("expected READY-1 top pick, got none")
+	}
+	if got.QuickRef.TopPicks[0].ID != "READY-1" {
+		t.Fatalf("expected READY-1 top pick after excluding needs-polish, got %q", got.QuickRef.TopPicks[0].ID)
+	}
+	for _, pick := range got.QuickRef.TopPicks {
+		if pick.ID == "RAW-1" {
+			t.Fatalf("RAW-1 (needs-polish) must not appear in claimable top picks")
+		}
+	}
+}
+
+// TestComputeTriage_ParentWithOpenChildrenNotTopPick covers issue #17 parity:
+// a non-epic parent with an OPEN child must not be the claimable top pick (the
+// epic-type gate alone misses non-epic parents). It remains actionable in the
+// count (beads_viewer#158 contract) and re-becomes claimable once its child
+// closes.
+func TestComputeTriage_ParentWithOpenChildrenNotTopPick(t *testing.T) {
+	now := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
+	parent := model.Issue{
+		ID:        "PARENT-1",
+		Title:     "Non-epic parent",
+		Status:    model.StatusOpen,
+		Priority:  1,
+		IssueType: model.TypeTask,
+		UpdatedAt: now,
+	}
+	child := model.Issue{
+		ID:        "PARENT-1.1",
+		Title:     "Open child",
+		Status:    model.StatusOpen,
+		Priority:  2,
+		IssueType: model.TypeTask,
+		UpdatedAt: now,
+		Dependencies: []*model.Dependency{
+			{DependsOnID: "PARENT-1", Type: model.DepParentChild},
+		},
+	}
+
+	openChild := ComputeTriageWithOptionsAndTime([]model.Issue{parent, child}, TriageOptions{WaitForPhase2: true}, now)
+	// Both remain in the actionable count (rollup edge doesn't gate readiness).
+	if openChild.QuickRef.ActionableCount != 2 {
+		t.Fatalf("expected both parent and child actionable, got %d", openChild.QuickRef.ActionableCount)
+	}
+	if len(openChild.QuickRef.TopPicks) == 0 || openChild.QuickRef.TopPicks[0].ID != "PARENT-1.1" {
+		t.Fatalf("expected child PARENT-1.1 as claimable top pick, got %#v", openChild.QuickRef.TopPicks)
+	}
+	for _, pick := range openChild.QuickRef.TopPicks {
+		if pick.ID == "PARENT-1" {
+			t.Fatalf("parent with open children must not be a claimable top pick")
+		}
+	}
+
+	// Close the child: the parent becomes claimable again.
+	child.Status = model.StatusClosed
+	closedChild := ComputeTriageWithOptionsAndTime([]model.Issue{parent, child}, TriageOptions{WaitForPhase2: true}, now)
+	if len(closedChild.QuickRef.TopPicks) == 0 || closedChild.QuickRef.TopPicks[0].ID != "PARENT-1" {
+		t.Fatalf("expected PARENT-1 claimable after child closed, got %#v", closedChild.QuickRef.TopPicks)
 	}
 }
 
