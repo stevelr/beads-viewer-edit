@@ -2,7 +2,7 @@
 
 ## Overview
 
-The human-edit feature adds in-TUI issue editing to beads_viewer (bv). Users can modify individual fields via quick-edit pickers, edit titles inline, or open a full per-issue markdown file in a terminal editor. All mutations go through the `br` CLI as a subprocess — bv never writes to JSONL or SQLite directly.
+The human-edit feature adds in-TUI issue editing to beads_viewer (bv). Users can modify individual fields via quick-edit pickers, edit titles inline, or open a full per-issue markdown file in a terminal editor. All mutations go through the `br` CLI as a subprocess — bv never writes to JSONL or SQLite directly. The current fork is based on upstream bv v0.19.0.
 
 ---
 
@@ -14,6 +14,7 @@ All edit hotkeys are **configurable** via `bv-edit.yaml`. Defaults shown. Active
 | ----------- | ---------------- | ---------------------------------------------------- |
 | `ctrl+p`    | edit_priority    | Open priority picker                                 |
 | `ctrl+o`    | edit_status      | Open status picker                                   |
+| `ctrl+y`    | edit_type        | Open issue-type picker                               |
 | `ctrl+a`    | edit_assignee    | Open assignee picker                                 |
 | `ctrl+t`    | edit_title       | Inline title edit                                    |
 | `O`         | open_editor      | Open issue in terminal editor (smart dispatch)       |
@@ -43,6 +44,7 @@ extra_assignees:
 hotkeys:
   edit_priority: "ctrl+p"
   edit_status: "ctrl+o"
+  edit_type: "ctrl+y"
   edit_assignee: "ctrl+a"
   open_editor: "O"
   edit_title: "ctrl+t"
@@ -65,6 +67,7 @@ type EditConfig struct {
 type HotkeyConfig struct {
     EditPriority   string `yaml:"edit_priority"`
     EditStatus     string `yaml:"edit_status"`
+    EditType       string `yaml:"edit_type"`
     EditAssignee   string `yaml:"edit_assignee"`
     OpenEditor     string `yaml:"open_editor"`
     EditTitle      string `yaml:"edit_title"`
@@ -89,7 +92,7 @@ bv has **no write path** of its own. All mutations go through the `br` CLI tool:
 - `br create "title" -p N -s status --silent` for new issues
 - `br comments add ID -f FILE` for adding comments
 
-All `br` subprocess calls include `--no-auto-import` to avoid prefix-mismatch errors in mixed-prefix workspaces (where the JSONL contains issues from multiple prefix namespaces like `bd-*` and `bv-*`).
+Commands intentionally do not pass `--no-auto-import`. Allowing `br` to perform its normal import/export cycle keeps edits persistent and the active database synchronized with JSONL.
 
 After `br update` succeeds, bv triggers a `FileChangedMsg` which reloads all issues from the data source (JSONL/SQLite). bv also has a file watcher that reloads when JSONL changes.
 
@@ -97,7 +100,7 @@ After `br update` succeeds, bv triggers a `FileChangedMsg` which reloads all iss
 
 ```go
 func FetchBrJSON(brPath, issueID string) (string, error)
-// exec: br show ID --json --no-auto-import
+// exec: br show ID --json
 
 func RunBrUpdate(argv []string) error
 // exec: argv[0] argv[1:]...
@@ -105,16 +108,17 @@ func RunBrUpdate(argv []string) error
 
 func SetPriority(brPath, issueID string, modelPriority int) error
 func SetStatus(brPath, issueID, status string) error
+func SetType(brPath, issueID, issueType string) error
 func SetAssignee(brPath, issueID, assignee string) error
 func SetTitle(brPath, issueID, title string) error
-// Each calls RunBrUpdate with appropriate args + --no-auto-import
+// Each calls RunBrUpdate with the appropriate br update arguments
 
 func CreateIssue(brPath string, parentID *string) (string, error)
-// exec: br create "New Issue" -p 2 -s open --silent --no-auto-import [--parent ID]
+// exec: br create "New Issue" -p 2 -s open --silent [--parent ID]
 // Returns trimmed stdout as new issue ID
 
 func AddBrComment(brPath, issueID, filePath string) error
-// exec: br comments add ISSUE -f FILE --no-auto-import
+// exec: br comments add ISSUE -f FILE
 ```
 
 ### 3.2 Error Handling
@@ -131,10 +135,12 @@ func AddBrComment(brPath, issueID, filePath string) error
 type IssueSnapshot struct {
     ID, Title, Description, Design, AcceptanceCriteria, Notes string
     Status string
+    IssueType string
     Priority int
     Assignee string
     Labels []string
     SourceRepo string
+    Comments []*model.Comment
 }
 ```
 
@@ -154,6 +160,7 @@ Two constructors:
 id: BD-123
 title: "Fix the widget: a [tricky] one"
 status: open
+type: bug
 priority: 2
 assignee: alice
 labels: bug, ux
@@ -182,6 +189,10 @@ Widget works.
 See also BD-456.
 
 </notes>
+
+<comment date="2026-08-06T12:34:56Z">
+Existing comments are exported here as read-only context.
+</comment>
 ```
 
 **Frontmatter fields:**
@@ -189,6 +200,7 @@ See also BD-456.
 - `id` — read-only identifier (changes ignored on parse)
 - `title` — YAML-escaped via `yaml.Marshal` when it contains special chars (colons, brackets, quotes, etc.)
 - `status` — one of: open, in_progress, blocked, deferred, pinned, hooked, review, closed, tombstone
+- `type` — issue type; changes are applied with `br update ID --type=VALUE`
 - `priority` — integer 0-4 (P0=0 is highest, same as `br` CLI)
 - `assignee` — free text
 - `labels` — comma-separated string
@@ -196,7 +208,9 @@ See also BD-456.
 
 **Body sections use XML-style tags**, not markdown headings. This is critical: field content (especially `description` and `notes`) routinely contains markdown headings (`## heading`, `# heading`). Using `## heading` as section delimiters would cause the parser to split content at those headings, silently losing data. XML-style tags are unambiguous.
 
-**Known section tags:** `description`, `design`, `acceptance_criteria`, `notes`. Only these exact tag names are recognized as section delimiters. All other `<` and `>` occurrences (HTML tags, comparisons like `x < 10`, unknown tags) are treated as literal content.
+**Known section tags:** `description`, `design`, `acceptance_criteria`, `notes`. Only these exact tag names are recognized as editable section delimiters. Inside a section, other `<` and `>` occurrences (HTML tags, comparisons like `x < 10`, unknown tags) are literal content. Outside a section they are ignored, apart from the read-only comment suffix described below.
+
+**Comments are read-only context:** Each existing comment is emitted after `</notes>` as its own `<comment date="RFC3339_TIMESTAMP">...</comment>` block. Comment text and tag attributes are never imported or diffed. The parser stops processing editable body fields at the first comment block, so edits to comments—even text resembling known section tags—cannot overwrite issue fields.
 
 **Blank line before closing tag:** A blank line is emitted before each `</tag>` to prevent markdown LSP formatters (e.g. format-on-save in helix or other editors) from indenting the closing tag. The parser uses `strings.TrimSpace()` on each line before comparing, so indented closing tags parse correctly regardless.
 
@@ -213,7 +227,8 @@ See also BD-456.
    - A closing tag for a _different_ known tag is treated as content (e.g. `</notes>` inside `<description>` is literal text)
    - Content is trimmed (leading/trailing whitespace removed via `strings.TrimSpace`)
    - If file ends without closing tag, content is captured as-is
-5. Labels string split on commas, each trimmed, empty strings filtered out
+5. The first `<comment ...>` starts the read-only comment suffix; it and everything after it are ignored
+6. Labels string split on commas, each trimmed, empty strings filtered out
 
 ### 5.3 Parsing Rules for `<` and `>` in Content
 
@@ -236,16 +251,18 @@ When **outside** a section:
 Compares each field between original and edited snapshots:
 
 - String fields compared after `strings.TrimSpace()` (whitespace-insensitive)
+- Issue type compared as a trimmed string
 - Priority compared as integers
 - Labels compared as `[]string` (order-sensitive)
+- Comments are deliberately excluded from the diff
 - Returns `IssueDiff` with `*T` for each field (`nil` = unchanged)
 - `IsEmpty()` and `FieldCount()` methods
 
 ### 6.2 Build Update Command (`BuildUpdateArgv`)
 
-Produces: `br update ISSUE_ID --no-auto-import [--field=value ...]`
+Produces: `br update ISSUE_ID [--field=value ...]`
 
-Flag format: `--title=VALUE`, `--description=VALUE`, `--design=VALUE`, `--acceptance-criteria=VALUE`, `--notes=VALUE`, `--status=VALUE`, `--priority=N`, `--assignee=VALUE`, `--set-labels=LABEL` (one per label).
+Flag format: `--title=VALUE`, `--description=VALUE`, `--design=VALUE`, `--acceptance-criteria=VALUE`, `--notes=VALUE`, `--status=VALUE`, `--type=VALUE`, `--priority=N`, `--assignee=VALUE`, `--set-labels=LABEL` (one per label).
 
 Priority: bv model uses 0-4, same as `br` — no conversion needed.
 
@@ -255,7 +272,7 @@ Priority: bv model uses 0-4, same as `br` — no conversion needed.
 
 ### 7.1 EditPickerModal
 
-A generic list-selection modal reused for priority, status, and assignee pickers. The caller interprets the selected `Cursor` index based on context.
+A generic list-selection modal reused for priority, status, type, and assignee pickers. The caller interprets the selected `Cursor` index based on context.
 
 ```go
 type EditPickerModal struct {
@@ -283,11 +300,19 @@ Items: `["open", "in_progress", "blocked", "deferred", "pinned", "hooked", "revi
 
 Pre-positioned to current issue status. On accept: `br update ID --status=VALUE`.
 
-### 7.4 Assignee Picker (`ctrl+a`)
+### 7.4 Type Picker (`ctrl+y`)
+
+Preset items: `["bug", "chore", "epic", "task", "review", "ofi"]`.
+
+The picker is pre-positioned to the current issue type. If the selected issue has a different non-empty type, such as `docs`, that value is appended to a fresh per-picker copy and selected. The custom value is not added to `KnownIssueTypes` and therefore does not appear for other issues. On accept: `br update ID --type=VALUE`.
+
+`ctrl+y` was chosen because `ctrl+t` is already used for title editing and `ctrl+i` aliases Tab in terminals.
+
+### 7.5 Assignee Picker (`ctrl+a`)
 
 Items: sorted unique assignees from all loaded issues + `extra_assignees` from config. If empty, shows "No assignees found" in status bar. Pre-positioned to current assignee. On accept: `br update ID --assignee=VALUE`.
 
-### 7.5 Integration
+### 7.6 Integration
 
 Model fields: `editPicker EditPickerModal`, `editPickerKind editPickerKind`, `showEditPicker bool`.
 
@@ -424,7 +449,7 @@ On any `br update` failure during the full-editor flow:
 
 ### 10.1 `ctrl+n` — New top-level issue
 
-1. Run `br create "New Issue" -p 2 -s open --silent --no-auto-import`
+1. Run `br create "New Issue" -p 2 -s open --silent`
 2. Capture new issue ID from stdout (`createAndEditMsg`)
 3. Fetch fresh data via `br show NEW_ID --json`
 4. Build snapshot, serialize to markdown
@@ -442,20 +467,22 @@ When creating a new issue (`ctrl+n` / `ctrl+g`), if the user closes the editor w
 
 ## 11. Add Comment (`ctrl+x`)
 
-Opens `$EDITOR` with an empty temp file (`/tmp/bv-comment-{ISSUE_ID}.md`) for the user to compose a markdown comment. Requires a terminal editor.
+Opens the configured `editor_path` (defaulting from `$EDITOR`, then `$VISUAL`, then `vi`) with an empty temp file (`/tmp/bv-comment-{ISSUE_ID}.md`) for the user to compose a markdown comment. Requires a terminal editor.
 
 **Flow:**
 
-1. Check that `$EDITOR` is a terminal editor (error if not)
+1. Check that the configured editor is a terminal editor (error if not)
 2. Write empty temp file
 3. Launch editor via `tea.ExecProcess` (synchronous suspend/resume)
 4. On editor exit, read file and trim whitespace
 5. If empty → "Comment empty — not added", remove temp file
-6. If non-empty → `br comments add ISSUE_ID -f FILE --no-auto-import`
+6. If non-empty → `br comments add ISSUE_ID -f FILE`
 7. On success → remove temp file, trigger data reload
 8. On failure → show error in status bar (temp file preserved for recovery)
 
-**Why `ctrl+x` and not `ctrl+m`?** `ctrl+m` sends the same byte as Enter (carriage return, ASCII 0x0D) in terminals. Bubble Tea reports it as `"enter"`, making it unusable as a distinct hotkey.
+The external-editor workflow is intentional: it provides native multiline editing, familiar save/cancel behavior, and avoids reimplementing a text editor inside the TUI. Comment content is passed to `br` through the `-f` file argument via `exec.Command`, never through a shell. Quotes, backquotes, dollar signs, and newlines are therefore literal and safe from zsh expansion.
+
+**Why `ctrl+x` and not `ctrl+m`?** `ctrl+x` was already the fork's comment binding and is now documented prominently. `ctrl+m` sends the same byte as Enter (carriage return, ASCII 0x0D) in terminals; Bubble Tea reports it as `"enter"`, making it unusable as a distinct hotkey.
 
 **Message type:** `commentEditorFinishedMsg` — carries `err`, `mdPath`, `issueID`, `brPath`. Handler: `handleCommentEditorFinished`.
 
@@ -487,7 +514,7 @@ For full-editor snapshots:
 
 ### 14.1 Help Overlay (`?` key)
 
-An "Editing" panel is added to the `?` help overlay (`renderHelpOverlay` in model.go), showing all 8 edit hotkeys with descriptions. Rendered as a bordered panel matching the existing style.
+An "Editing" panel is added to the `?` help overlay (`renderHelpOverlay` in model.go), showing all 9 edit hotkeys with descriptions. It includes `Ctrl+y — Set type` and identifies `Ctrl+x` as `Add comment (editor)`. The panel is rendered with the same bordered style as the rest of the help overlay.
 
 ### 14.2 Help Overlay Column Balancing
 
@@ -498,12 +525,16 @@ The `?` overlay arranges panels into 2 or 3 columns depending on terminal width.
 Edit keys are documented in the **List** and **Board** context help strings (`context_help.go`), appended to the Actions section in compact form:
 
 ```
-Ctrl+p/o/a Set priority/status/assignee
+Ctrl+p/o/y/a Set priority/status/type/assignee
 Ctrl+t    Edit title │ O  Edit issue
-Ctrl+n/g  New issue/sub │ Ctrl+x  Comment
+Ctrl+n/g  New issue/sub │ Ctrl+x  Comment (editor)
 ```
 
 The **Detail** context help updates the `O` key description from "Open in editor" to "Edit issue (terminal editor)".
+
+### 14.4 Detail Metadata
+
+The issue detail metadata table displays `ID`, `Status`, `Type`, `Priority`, `Assignee`, and `Created`, in that order. Type is intentionally adjacent to status and before priority so the editable classification fields are visible together.
 
 ---
 
@@ -567,7 +598,7 @@ This placement is critical: the global key switch has `case "esc"` (quit confirm
 
 **Inside the non-filtering block, before focus-specific dispatch:**
 ```go
-// Edit hotkey dispatch (ctrl+p, ctrl+o, ctrl+a, ctrl+t, O, ctrl+n, ctrl+g, ctrl+x)
+// Edit hotkey dispatch (ctrl+p, ctrl+o, ctrl+y, ctrl+a, ctrl+t, O, ctrl+n, ctrl+g, ctrl+x)
 if m2, cmd, handled := m.tryEditKeyHandler(msg.String()); handled { ... }
 ```
 
@@ -606,9 +637,9 @@ The existing `openInEditor()` function and its `case "O"` in `handleListKeys` ar
 
 ## 16. Known Issues and Workarounds
 
-### 16.1 Mixed-Prefix Workspaces
+### 16.1 Normal `br` Import/Export
 
-When the JSONL file contains issues with different ID prefixes (e.g. `bd-*` and `bv-*`), `br`'s auto-import fails with "Prefix mismatch". All `br` subprocess calls from bv include `--no-auto-import` to bypass this. This is safe because bv only needs to write via the SQLite DB, not re-import from JSONL.
+Human-edit subprocesses no longer add `--no-auto-import`. The earlier workaround could make an update appear successful in the database without persisting it through the normal JSONL import/export lifecycle. Current commands let `br` perform its standard synchronization so edits remain visible after reload and across sessions.
 
 ### 16.2 br stderr Corruption
 
@@ -624,24 +655,29 @@ Markdown LSP formatters (e.g. in helix with format-on-save) may indent closing t
 
 Some `ctrl+` combinations send the same byte as common keys and cannot be used as distinct hotkeys: `ctrl+m` = Enter (0x0D), `ctrl+i` = Tab (0x09), `ctrl+h` = Backspace (0x08), `ctrl+[` = Escape (0x1B). The hotkey system avoids all of these.
 
+### 16.5 Fork Update Source
+
+The update-available notification and explicit self-update flow both query the fork's releases at `github.com/stevelr/beads-viewer-edit`, not the upstream `Dicklesworthstone/beads_viewer` repository. Both paths share the same production latest-release URL in `pkg/updater` to prevent them from drifting apart.
+
 ---
 
 ## 17. Test Coverage
 
 ### 17.1 human_edit_test.go
 
-- Config: default values (including `AddComment`), loading from file, fallback for unset fields
-- Snapshot: construction from `model.Issue`, parsing from JSON (object and array), empty/invalid JSON
-- Markdown: serialization (frontmatter fields, XML tags, repo omission, special chars in title), parsing (all fields, indented closing tags, markdown headings inside content, angle brackets inside/outside sections, nested known tag names as content, closing tag only matching current section, missing closing tag)
+- Config: default values (including `EditType` and `AddComment`), loading from file, fallback for unset fields
+- Snapshot: construction from `model.Issue`, including type/comments; parsing from JSON (object and array), empty/invalid JSON
+- Markdown: serialization (type frontmatter, dated comment tags after notes, repo omission, special chars in title), parsing (all editable fields, read-only comment suffix, indented closing tags, markdown headings inside content, angle brackets inside/outside sections, nested known tag names as content, closing tag only matching current section, missing closing tag)
 - Roundtrip: full roundtrip with all fields, empty sections, content with markdown headings + HTML + comparisons
 - Diff: no changes, all changed, whitespace trimming, partial change
-- BuildUpdateArgv: all fields, empty diff, single field, `--no-auto-import` always present
+- BuildUpdateArgv: all fields including `--type`, empty diff, and single-field updates
 - Assignee collection: dedup, sort, extras, empty
 - Label parsing: commas, single, empty, whitespace
 - `IsTerminalEditor()`: hx, vim, nvim, vi, nano, emacs, pico, joe, ne, code, gedit, paths
 - YAML escaping: roundtrip for titles with colons, brackets, quotes, dashes, spaces
 - Error extraction: valid JSON envelope, plain text, empty message, malformed JSON
-- Known constants: statuses count, priority labels count
+- Known constants: statuses, exact type presets, priority labels
+- Type picker: custom current type is appended per issue without mutating or leaking into the preset list
 
 ### 17.2 edit_modal_test.go
 
@@ -661,3 +697,8 @@ Some `ctrl+` combinations send the same byte as common keys and cannot be used a
 - Rune insert: middle, end
 - Inactive state returns unhandled
 - UTF-8 multi-byte character handling
+
+### 17.4 Integration and Updater Tests
+
+- `update_keys_test.go`: detail metadata orders Type between Status and Priority; the Editing help panel includes `Ctrl+y` and `Ctrl+x`
+- `updater_test.go`: the production latest-release endpoint is pinned to `https://api.github.com/repos/stevelr/beads-viewer-edit/releases/latest`
