@@ -24,9 +24,10 @@ import (
 )
 
 const (
-	repoOwner = "Dicklesworthstone"
-	repoName  = "beads_viewer"
-	baseURL   = "https://api.github.com/repos/" + repoOwner + "/" + repoName
+	repoOwner        = "stevelr"
+	repoName         = "beads-viewer-edit"
+	baseURL          = "https://api.github.com/repos/" + repoOwner + "/" + repoName
+	latestReleaseURL = baseURL + "/releases/latest"
 
 	maxReleaseMetadataBytes = 1 << 20
 	maxDownloadBytes        = 512 << 20
@@ -128,7 +129,7 @@ func CheckForUpdates() (string, string, error) {
 	client := &http.Client{
 		Timeout: 2 * time.Second,
 	}
-	return checkForUpdates(client, "https://api.github.com/repos/Dicklesworthstone/beads_viewer/releases/latest")
+	return checkForUpdates(client, latestReleaseURL)
 }
 
 func checkForUpdates(client *http.Client, url string) (string, string, error) {
@@ -393,7 +394,7 @@ func compareVersions(v1, v2 string) int {
 // GetLatestRelease fetches full release info including assets
 func GetLatestRelease() (*Release, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, baseURL+"/releases/latest", nil)
+	req, err := http.NewRequest(http.MethodGet, latestReleaseURL, nil)
 	if err != nil {
 		return nil, err
 	}

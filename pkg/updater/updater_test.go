@@ -288,6 +288,13 @@ func TestRelease_Fields(t *testing.T) {
 	}
 }
 
+func TestProductionReleaseTarget(t *testing.T) {
+	const want = "https://api.github.com/repos/stevelr/beads-viewer-edit/releases/latest"
+	if latestReleaseURL != want {
+		t.Fatalf("latestReleaseURL = %q, want %q", latestReleaseURL, want)
+	}
+}
+
 // ============================================================================
 // Version comparison with current version (integration-like tests)
 // ============================================================================
