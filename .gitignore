@@ -22,6 +22,9 @@ benchmarks/current.txt
 .bv/
 beads_report_beads_viewer_*.md
 
+# don't track upstream .beads
+.beads/
+
 # Nix build artifacts
 result
 result-*
@@ -36,7 +39,6 @@ beads_viewer_graph*.html
 test-results/
 
 # Nested beads state
-.beads/.write.lock
 pkg/ui/.beads/
 
 # Large benchmark test data (generated)
