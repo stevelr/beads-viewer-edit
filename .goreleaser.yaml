@@ -4,6 +4,12 @@ project_name: bv
 builds:
   - main: ./cmd/bv
     binary: bv
+    # Pure-Go build (modernc sqlite, no cgo): CGO_ENABLED=0 yields fully
+    # static Linux binaries that run on any distro (incl. NixOS) without
+    # patchelf or a matching glibc. Without this, the native linux/amd64
+    # build on the runner links glibc dynamically.
+    env:
+      - CGO_ENABLED=0
     ldflags:
       - -s -w
       - -X github.com/Dicklesworthstone/beads_viewer/pkg/version.version=v{{.Version}}
