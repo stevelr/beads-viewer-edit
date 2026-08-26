@@ -35,11 +35,11 @@ func mouseTestIssues(n int) []model.Issue {
 
 // sizedModel returns a Model that has processed a WindowSizeMsg so the list
 // dimensions / pagination are initialized exactly as they would be at runtime.
-func sizedModel(t *testing.T, issues []model.Issue, width, height int) Model {
+func sizedModel(t *testing.T, issues []model.Issue, width, height int) *Model {
 	t.Helper()
 	m := NewModel(issues, nil, "")
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: width, Height: height})
-	return updated.(Model)
+	return updated.(*Model)
 }
 
 // TestLeftClickSelectsListRowInSplitView verifies that a left-click inside the
@@ -160,7 +160,7 @@ func TestLeftClickNoopInFullScreenView(t *testing.T) {
 	m := sizedModel(t, mouseTestIssues(10), 120, 30)
 	// Enter board view.
 	updated, _ := m.Update(keyMsgRune('b'))
-	m = updated.(Model)
+	m = updated.(*Model)
 	if !m.isBoardView {
 		t.Fatalf("expected board view after 'b'")
 	}
@@ -181,7 +181,7 @@ func TestMouseLeftClickThroughUpdate(t *testing.T) {
 	// A motion event (no button) must NOT change selection.
 	motion := tea.MouseMsg{X: 5, Y: 5, Button: tea.MouseButtonLeft, Action: tea.MouseActionMotion}
 	updated, _ := m.Update(motion)
-	m = updated.(Model)
+	m = updated.(*Model)
 	if m.list.Index() != 0 {
 		t.Errorf("motion event changed selection to %d, want 0", m.list.Index())
 	}
@@ -189,7 +189,7 @@ func TestMouseLeftClickThroughUpdate(t *testing.T) {
 	// A genuine press selects the row under the cursor. The first row sits at
 	// y == listChromeLines(); row 5 is that plus 5.
 	updated, _ = m.Update(leftClick(5, m.listChromeLines()+5))
-	m = updated.(Model)
+	m = updated.(*Model)
 	if m.list.Index() != 5 {
 		t.Errorf("press event: index = %d, want 5", m.list.Index())
 	}

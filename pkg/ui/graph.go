@@ -66,8 +66,7 @@ func (g *GraphModel) SetSnapshot(snapshot *DataSnapshot) {
 
 	g.issues = snapshot.Issues
 	g.issueMap = snapshot.IssueMap
-	ins := snapshot.GetInsights()
-	g.insights = &ins
+	g.insights = &snapshot.insights
 
 	if g.issueMap == nil {
 		g.issueMap = make(map[string]*model.Issue, len(g.issues))

@@ -110,6 +110,46 @@ func TestPooledIssueEmptySlicesDropPooledCapacity(t *testing.T) {
 	}
 }
 
+func TestIssueStringInterner_DeduplicatesAndStaysBounded(t *testing.T) {
+	var interner issueStringInterner
+	first := strings.Clone("shared-label")
+	second := strings.Clone("shared-label")
+
+	if got := interner.intern(first); got != first {
+		t.Fatalf("first intern=%q, want %q", got, first)
+	}
+	if got := interner.intern(second); got != first {
+		t.Fatalf("duplicate intern=%q, want canonical %q", got, first)
+	}
+
+	occupied := 0
+	for _, value := range interner.slots {
+		if value != "" {
+			occupied++
+		}
+	}
+	if occupied != 1 {
+		t.Fatalf("occupied slots=%d, want 1", occupied)
+	}
+
+	for i := 0; i < issueStringInternerSlots*2; i++ {
+		value := fmt.Sprintf("unique-%d", i)
+		if got := interner.intern(value); got != value {
+			t.Fatalf("intern(%q)=%q", value, got)
+		}
+	}
+
+	occupied = 0
+	for _, value := range interner.slots {
+		if value != "" {
+			occupied++
+		}
+	}
+	if occupied != issueStringInternerSlots {
+		t.Fatalf("occupied slots=%d, want bounded capacity %d", occupied, issueStringInternerSlots)
+	}
+}
+
 // TestPooledIssueRaceDetector runs concurrent operations on pooled issues and
 // the returned issues slice to verify there are no data races.
 // This test MUST pass with -race.

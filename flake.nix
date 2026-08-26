@@ -13,7 +13,7 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        version = "0.16.1";
+        version = "0.22.0";
 
         # To update vendorHash after go.mod/go.sum changes:
         # 1. Set vendorHash to: pkgs.lib.fakeHash
@@ -44,7 +44,13 @@
             meta = with pkgs.lib; {
               description = "Terminal UI for the Beads issue tracker with graph-aware triage";
               homepage = "https://github.com/Dicklesworthstone/beads_viewer";
-              license = licenses.mit;
+              license = {
+                fullName = "MIT License with OpenAI/Anthropic Rider";
+                shortName = "MIT+OpenAI-Anthropic-Rider";
+                url = "https://github.com/Dicklesworthstone/beads_viewer/blob/v${version}/LICENSE";
+                free = false;
+                redistributable = false;
+              };
               maintainers = [ ];
               mainProgram = "bv";
               platforms = platforms.unix;

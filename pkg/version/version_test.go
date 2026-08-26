@@ -1,6 +1,13 @@
 package version
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+	"testing"
+)
 
 func TestIsUsableVersion(t *testing.T) {
 	tests := []struct {
@@ -60,5 +67,34 @@ func TestVersionIsNeverEmpty(t *testing.T) {
 func TestFallbackHasVPrefix(t *testing.T) {
 	if fallback[0] != 'v' {
 		t.Errorf("fallback constant %q must start with 'v'", fallback)
+	}
+}
+
+func TestReleaseVersionSourcesStayAligned(t *testing.T) {
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate version test source")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(testFile), "..", ".."))
+
+	flake, err := os.ReadFile(filepath.Join(repoRoot, "flake.nix"))
+	if err != nil {
+		t.Fatalf("read flake.nix: %v", err)
+	}
+	match := regexp.MustCompile(`(?m)^\s*version = "([^"]+)";`).FindSubmatch(flake)
+	if len(match) != 2 {
+		t.Fatal("flake.nix must declare a literal package version")
+	}
+	if got, want := string(match[1]), strings.TrimPrefix(fallback, "v"); got != want {
+		t.Fatalf("flake.nix version %q does not match fallback %q", got, want)
+	}
+
+	goreleaser, err := os.ReadFile(filepath.Join(repoRoot, ".goreleaser.yaml"))
+	if err != nil {
+		t.Fatalf("read .goreleaser.yaml: %v", err)
+	}
+	const injection = "pkg/version.version=v{{.Version}}"
+	if !strings.Contains(string(goreleaser), injection) {
+		t.Fatalf("GoReleaser must inject the validated version variable with %q", injection)
 	}
 }

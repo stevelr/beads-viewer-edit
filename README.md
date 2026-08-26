@@ -212,8 +212,9 @@ bv --robot-triage --format toon
 export BV_OUTPUT_FORMAT=toon
 bv --robot-next
 
-Before claiming, verify the current bead state with `br show <id> --json` or
-`br ready --json`. `recommendations` can include graph-important blocked or
+Before claiming, verify the current bead state with the configured tracker:
+`br show <id> --json` / `br ready --json`, or `bd show <id> --json` /
+`bd ready --json`. `recommendations` can include graph-important blocked or
 assigned work; only `quick_ref.top_picks` and non-empty `claim_command` fields
 represent claimable work.
 
@@ -264,6 +265,7 @@ bv --robot-triage --robot-triage-by-label    # Group by domain
 - `data_hash` — Fingerprint of the source JSONL issue file (verify consistency across calls)
 - `status` — Per-metric state: `computed|approx|timeout|skipped` + elapsed ms
 - `as_of` / `as_of_commit` — Present when using `--as-of`; contains ref and resolved SHA
+- `load_stats` — Present only when issue records were dropped during load (malformed JSON or failed validation, e.g. `updated_at < created_at`): `{source_path, valid, errors, skipped, warnings}`. Check `.load_stats.errors > 0` to distinguish "issue absent from data" from "issue dropped by the loader"; stderr stays clean either way (#190)
 
 **Two-phase analysis:**
 - **Phase 1 (instant):** degree, topo sort, density — always available immediately
@@ -313,7 +315,7 @@ bv --agents-dry-run           # Show what would happen without executing
 
 The blurb uses HTML comment markers for version tracking:
 ```
-<!-- bv-agent-instructions-v3 -->
+<!-- bv-agent-instructions-v4 -->
 ... content ...
 <!-- end-bv-agent-instructions -->
 ```
@@ -3593,14 +3595,18 @@ For Nix users, `bv` provides a flake for reproducible builds and development env
 
 ```bash
 # Run directly
-nix run github:Dicklesworthstone/beads_viewer
+NIXPKGS_ALLOW_UNFREE=1 nix run --impure github:Dicklesworthstone/beads_viewer
 
 # Install to profile
-nix profile install github:Dicklesworthstone/beads_viewer
+NIXPKGS_ALLOW_UNFREE=1 nix profile install --impure github:Dicklesworthstone/beads_viewer
 
 # Development shell with Go toolchain
-nix develop github:Dicklesworthstone/beads_viewer
+NIXPKGS_ALLOW_UNFREE=1 nix develop --impure github:Dicklesworthstone/beads_viewer
 ```
+
+The opt-in is required because Nix correctly treats the OpenAI/Anthropic rider as nonfree. When
+adding `bv` as a flake input, configure the consuming `nixpkgs` import with `allowUnfree = true`
+or a narrow `allowUnfreePredicate` for `bv`.
 
 Or add to your flake inputs:
 ```nix
@@ -3823,7 +3829,7 @@ theme: light   # light | dark | auto
 
 MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE).
 
-Copyright (c) 2025 Jeffrey Emanuel
+Copyright (c) 2026 Jeffrey Emanuel
 
 ---
 
@@ -3970,23 +3976,8 @@ Copyright (c) 2025 Jeffrey Emanuel
 
 ## 📄 License
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+MIT License with an OpenAI/Anthropic rider. The rider is part of the license and restricts use
+by the named parties; see [LICENSE](LICENSE) for the complete controlling terms.
 
 ## 🤖 Robot JSON contract — quick cheat sheet
 

@@ -122,6 +122,68 @@ func TestRobotFlagsOutputJSON(t *testing.T) {
 	}
 }
 
+func TestRobotCPUProfileFinalizedBeforeExit(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestBeadsFixture(t, tmpDir)
+	exe := buildTestBinary(t)
+
+	t.Run("successful registry command", func(t *testing.T) {
+		profilePath := filepath.Join(t.TempDir(), "cpu.pprof")
+		stdout, stderr, err := runCommandWithTimeout(
+			t,
+			tmpDir,
+			exe,
+			"--cpu-profile", profilePath,
+			"--robot-insights",
+			"--format=json",
+		)
+		if err != nil {
+			t.Fatalf("profiled robot command failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+		}
+		if !json.Valid([]byte(stdout)) {
+			t.Fatalf("profiled robot command returned invalid JSON: %s", stdout)
+		}
+
+		profileInfo, err := os.Stat(profilePath)
+		if err != nil {
+			t.Fatalf("stat CPU profile: %v", err)
+		}
+		if profileInfo.Size() == 0 {
+			t.Fatal("CPU profile is empty; profiling was not finalized before process exit")
+		}
+
+		pprofCmd := exec.Command("go", "tool", "pprof", "-top", exe, profilePath)
+		pprofOutput, err := pprofCmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("read CPU profile with go tool pprof: %v\n%s", err, pprofOutput)
+		}
+		if !bytes.Contains(pprofOutput, []byte("Type: cpu")) {
+			t.Fatalf("go tool pprof did not identify a CPU profile:\n%s", pprofOutput)
+		}
+	})
+
+	t.Run("invalid destination fails before success output", func(t *testing.T) {
+		profileDir := t.TempDir()
+		stdout, stderr, err := runCommandWithTimeout(
+			t,
+			tmpDir,
+			exe,
+			"--cpu-profile", profileDir,
+			"--robot-insights",
+			"--format=json",
+		)
+		if err == nil {
+			t.Fatalf("invalid CPU profile destination unexpectedly succeeded\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+		}
+		if stdout != "" {
+			t.Fatalf("invalid CPU profile destination emitted success output:\n%s", stdout)
+		}
+		if !strings.Contains(stderr, "Could not create CPU profile") {
+			t.Fatalf("missing CPU profile creation error\nstderr:\n%s", stderr)
+		}
+	})
+}
+
 func TestCLIFlagCompatibility(t *testing.T) {
 	tmpDir := t.TempDir()
 	writeTestBeadsFixture(t, tmpDir)

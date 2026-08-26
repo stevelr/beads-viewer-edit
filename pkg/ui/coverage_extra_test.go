@@ -307,42 +307,42 @@ func TestViewTogglesGraphBoardInsightsActionable(t *testing.T) {
 
 	// Graph toggle
 	modelAny, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
-	m = modelAny.(Model)
+	m = modelAny.(*Model)
 	if !m.isGraphView || m.focused != focusGraph {
 		t.Fatalf("graph view not activated")
 	}
 
 	// Board toggle
 	modelAny, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
-	m = modelAny.(Model)
+	m = modelAny.(*Model)
 	if !m.isBoardView || m.focused != focusBoard {
 		t.Fatalf("board view not activated")
 	}
 
 	// Insights toggle
 	modelAny, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
-	m = modelAny.(Model)
+	m = modelAny.(*Model)
 	if m.focused != focusInsights {
 		t.Fatalf("insights not focused after toggle")
 	}
 
 	// Actionable toggle
 	modelAny, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
-	m = modelAny.(Model)
+	m = modelAny.(*Model)
 	if !m.isActionableView || m.focused != focusActionable {
 		t.Fatalf("actionable view not activated")
 	}
 
 	// Priority hints toggle
 	modelAny, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
-	m = modelAny.(Model)
+	m = modelAny.(*Model)
 	if !m.showPriorityHints {
 		t.Fatalf("priority hints should toggle on with 'p'")
 	}
 
 	// Recipe picker toggle (' key)
 	modelAny, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'\''}})
-	m = modelAny.(Model)
+	m = modelAny.(*Model)
 	if !m.showRecipePicker || m.focused != focusRecipePicker {
 		t.Fatalf("recipe picker not opened correctly")
 	}
@@ -582,7 +582,7 @@ func TestView_LoadingScreen_TransitionsOnFirstSnapshotOrError(t *testing.T) {
 
 	// Error should exit the loading screen (we already have initial data).
 	modelAny, _ := m.Update(SnapshotErrorMsg{Err: errors.New("boom"), Recoverable: true})
-	mErr := modelAny.(Model)
+	mErr := modelAny.(*Model)
 	if out := mErr.View(); strings.Contains(out, "Loading beads") {
 		t.Fatalf("expected loading screen to clear on error, got: %q", out)
 	}
@@ -591,7 +591,7 @@ func TestView_LoadingScreen_TransitionsOnFirstSnapshotOrError(t *testing.T) {
 	m.snapshotInitPending = true
 	snap := NewSnapshotBuilder(issues).Build()
 	modelAny, _ = m.Update(SnapshotReadyMsg{Snapshot: snap})
-	mOK := modelAny.(Model)
+	mOK := modelAny.(*Model)
 	if out := mOK.View(); strings.Contains(out, "Loading beads") {
 		t.Fatalf("expected loading screen to clear on first snapshot, got: %q", out)
 	}
@@ -824,7 +824,7 @@ func TestRenderSplitAndListViews(t *testing.T) {
 
 	// Prime layout into split view
 	modelAny, _ := m.Update(tea.WindowSizeMsg{Width: 180, Height: 40})
-	m = modelAny.(Model)
+	m = modelAny.(*Model)
 	m.isSplitView = true
 	out := m.renderSplitView()
 	if !strings.Contains(out, "Alpha") || !strings.Contains(out, "Beta") {
@@ -1159,7 +1159,7 @@ func TestOverlaysAndWorkspaceHelpers(t *testing.T) {
 	}
 	m := NewModel(issues, nil, "")
 	if updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30}); updated != nil {
-		m = updated.(Model)
+		m = updated.(*Model)
 	}
 
 	// Workspace state
@@ -1578,7 +1578,7 @@ Description.
 	}
 
 	result, _ := m.Update(msg)
-	resultModel := result.(Model)
+	resultModel := result.(*Model)
 	if resultModel.statusIsError {
 		t.Fatalf("expected no error, got %q", resultModel.statusMsg)
 	}
@@ -1604,7 +1604,7 @@ func TestEditorExitMsgWithError(t *testing.T) {
 	}
 
 	result, _ := m.Update(msg)
-	resultModel := result.(Model)
+	resultModel := result.(*Model)
 	if !resultModel.statusIsError {
 		t.Fatal("expected error status")
 	}
@@ -1646,7 +1646,7 @@ func TestEditorExitMsgSuccessTriggersReload(t *testing.T) {
 		original: original,
 		err:      nil,
 	})
-	resultModel := result.(Model)
+	resultModel := result.(*Model)
 	if resultModel.statusIsError {
 		t.Fatalf("expected successful update, got %q", resultModel.statusMsg)
 	}

@@ -172,11 +172,11 @@ func TestAttentionView_CloseRestoresInsightsPanel(t *testing.T) {
 
 	m := NewModel(issues, nil, "")
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
-	m = updated.(Model)
+	m = updated.(*Model)
 	m.insightsPanel.focusedPanel = PanelCycles
 
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("]")})
-	m = updated.(Model)
+	m = updated.(*Model)
 	if !m.showAttentionView {
 		t.Fatal("Expected attention view to open")
 	}
@@ -188,7 +188,7 @@ func TestAttentionView_CloseRestoresInsightsPanel(t *testing.T) {
 	}
 
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	m = updated.(Model)
+	m = updated.(*Model)
 	if m.showAttentionView {
 		t.Fatal("Expected attention view to close")
 	}

@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -130,6 +131,76 @@ func TestGenerateAdvancedInsightsWithCycles(t *testing.T) {
 	}
 	if insights.CycleBreak.Advisory == "" {
 		t.Error("expected advisory text")
+	}
+}
+
+func TestGenerateAdvancedInsightsFromStatsUsesProvidedCyclesAndPreservesCaps(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen},
+		{ID: "B", Status: model.StatusOpen},
+		{ID: "C", Status: model.StatusOpen},
+		{ID: "D", Status: model.StatusOpen},
+	}
+	an := NewAnalyzer(issues)
+	provided := NewGraphStatsForTest(
+		nil, nil, nil, nil, nil, nil,
+		nil, nil,
+		[][]string{{"A", "B", "C"}, {"A", "B", "D"}},
+		0, nil,
+	)
+	cfg := DefaultAdvancedInsightsConfig()
+	cfg.CycleBreakLimit = 1
+
+	insights := an.GenerateAdvancedInsightsFromStats(provided, cfg)
+	cycleBreak := insights.CycleBreak
+	if cycleBreak.CycleCount != 2 {
+		t.Fatalf("CycleCount: expected supplied count 2, got %d", cycleBreak.CycleCount)
+	}
+	if len(cycleBreak.Suggestions) != 1 {
+		t.Fatalf("suggestions: expected cap of 1, got %d", len(cycleBreak.Suggestions))
+	}
+	got := cycleBreak.Suggestions[0]
+	if got.EdgeFrom != "A" || got.EdgeTo != "B" || got.Impact != 2 {
+		t.Fatalf("top suggestion: expected supplied shared edge A->B with impact 2, got %+v", got)
+	}
+	if !cycleBreak.Status.Capped || cycleBreak.Status.Limited != 5 {
+		t.Fatalf("status: expected capped=true limited=5, got %+v", cycleBreak.Status)
+	}
+	if got.InCycles == nil || len(got.InCycles) != 2 || got.InCycles[0] != 0 || got.InCycles[1] != 1 {
+		t.Fatalf("cycle ordering: expected [0 1], got %v", got.InCycles)
+	}
+}
+
+func TestGenerateAdvancedInsightsFromStatsPreservesFullOutputAndNilFallback(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Title: "Alpha", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "B", Title: "Beta", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "C", Type: model.DepBlocks}}},
+		{ID: "C", Title: "Gamma", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+		{ID: "D", Title: "Delta", Status: model.StatusClosed},
+	}
+	an := NewAnalyzer(issues)
+	cfg := DefaultAdvancedInsightsConfig()
+	stats := an.Analyze()
+
+	want := an.GenerateAdvancedInsights(cfg)
+	fromStats := an.GenerateAdvancedInsightsFromStats(&stats, cfg)
+	fromNil := an.GenerateAdvancedInsightsFromStats(nil, cfg)
+
+	wantJSON, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal ordinary insights: %v", err)
+	}
+	for name, got := range map[string]*AdvancedInsights{
+		"provided stats": fromStats,
+		"nil fallback":   fromNil,
+	} {
+		gotJSON, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("marshal %s insights: %v", name, err)
+		}
+		if string(gotJSON) != string(wantJSON) {
+			t.Fatalf("%s changed full output or deterministic ordering\nwant: %s\n got: %s", name, wantJSON, gotJSON)
+		}
 	}
 }
 

@@ -16,7 +16,7 @@ type TitleEditState struct {
 }
 
 // StartTitleEdit activates inline title editing for the selected issue.
-func (m Model) startTitleEdit() (Model, tea.Cmd) {
+func (m *Model) startTitleEdit() (*Model, tea.Cmd) {
 	issue := m.getSelectedIssue()
 	if issue == nil {
 		m.statusMsg = "No issue selected"
@@ -38,7 +38,7 @@ func (m Model) startTitleEdit() (Model, tea.Cmd) {
 // Returns (Model, tea.Cmd, handled). If handled is true, the caller should
 // return immediately.
 // fork: human-edit
-func (m Model) handleTitleEditKey(msg tea.KeyMsg) (Model, tea.Cmd, bool) {
+func (m *Model) handleTitleEditKey(msg tea.KeyMsg) (*Model, tea.Cmd, bool) {
 	if !m.titleEditState.Active {
 		return m, nil, false
 	}

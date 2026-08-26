@@ -15,7 +15,7 @@ func TestDetailMetadataShowsTypeBetweenStatusAndPriority(t *testing.T) {
 		IssueType: model.IssueType("review"), Priority: 2, Assignee: "alice",
 	}}, nil, "")
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
-	m = updated.(Model)
+	m = updated.(*Model)
 	m.updateViewportContent()
 	detail := m.viewport.View()
 
@@ -55,16 +55,16 @@ func TestUpdateHelpQuitAndTabFocus(t *testing.T) {
 
 	// Make model ready and split view
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	// Help toggle via ? then dismiss with another key
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
-	m = updated.(Model)
+	m = updated.(*Model)
 	if !m.showHelp || m.focused != focusHelp {
 		t.Fatalf("expected help overlay shown")
 	}
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
-	m = updated.(Model)
+	m = updated.(*Model)
 	if m.showHelp || m.focused != focusList {
 		t.Fatalf("expected help overlay dismissed")
 	}
@@ -74,19 +74,19 @@ func TestUpdateHelpQuitAndTabFocus(t *testing.T) {
 		t.Fatalf("expected list focus before tab")
 	}
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
-	m = updated.(Model)
+	m = updated.(*Model)
 	if m.focused != focusDetail {
 		t.Fatalf("expected detail focus after tab")
 	}
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
-	m = updated.(Model)
+	m = updated.(*Model)
 	if m.focused != focusList {
 		t.Fatalf("expected list focus after second tab")
 	}
 
 	// Escape should show quit confirm, 'y' should issue tea.Quit
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	m = updated.(Model)
+	m = updated.(*Model)
 	if !m.showQuitConfirm {
 		t.Fatalf("expected quit confirm after esc")
 	}
@@ -99,7 +99,7 @@ func TestUpdateHelpQuitAndTabFocus(t *testing.T) {
 func TestUpdateMsgSetsUpdateAvailable(t *testing.T) {
 	m := NewModel([]model.Issue{{ID: "1", Title: "One", Status: model.StatusOpen}}, nil, "")
 	updated, _ := m.Update(UpdateMsg{TagName: "v9.9.9", URL: "https://example"})
-	m = updated.(Model)
+	m = updated.(*Model)
 	if !m.updateAvailable || m.updateTag != "v9.9.9" {
 		t.Fatalf("update flag not set")
 	}
@@ -108,7 +108,7 @@ func TestUpdateMsgSetsUpdateAvailable(t *testing.T) {
 func TestUpdateMsgIgnoresCurrentVersion(t *testing.T) {
 	m := NewModel([]model.Issue{{ID: "1", Title: "One", Status: model.StatusOpen}}, nil, "")
 	updated, _ := m.Update(UpdateMsg{TagName: version.Version, URL: "https://example"})
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if m.updateAvailable || m.updateTag != "" || m.updateURL != "" {
 		t.Fatalf("current-version update message should be ignored: available=%v tag=%q url=%q",
@@ -123,7 +123,7 @@ func TestUpdateMsgClearsStaleEqualVersionNotice(t *testing.T) {
 	m.updateURL = "https://example/old"
 
 	updated, _ := m.Update(UpdateMsg{TagName: version.Version, URL: "https://example/current"})
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if m.updateAvailable || m.updateTag != "" || m.updateURL != "" {
 		t.Fatalf("equal-version update message should clear stale notice: available=%v tag=%q url=%q",
@@ -139,7 +139,7 @@ func TestHistoryViewToggle(t *testing.T) {
 
 	// Make model ready
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	// h should toggle history view on
 	if m.isHistoryView {
@@ -147,7 +147,7 @@ func TestHistoryViewToggle(t *testing.T) {
 	}
 
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if !m.isHistoryView {
 		t.Fatalf("expected history view to be on after h key")
@@ -158,7 +158,7 @@ func TestHistoryViewToggle(t *testing.T) {
 
 	// h again should toggle off
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if m.isHistoryView {
 		t.Fatalf("expected history view to be off after second h key")
@@ -176,15 +176,15 @@ func TestHistoryViewKeys(t *testing.T) {
 
 	// Make model ready
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	// Enter history view
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	// Esc should close history view
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if m.isHistoryView {
 		t.Fatalf("expected history view to be closed after Esc")
@@ -192,11 +192,11 @@ func TestHistoryViewKeys(t *testing.T) {
 
 	// Re-enter and test 'c' key cycles confidence
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	initialConf := m.historyView.GetMinConfidence()
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if m.historyView.GetMinConfidence() == initialConf {
 		t.Fatalf("expected confidence to change after 'c' key")

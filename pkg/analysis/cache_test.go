@@ -2,6 +2,8 @@ package analysis_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -14,6 +16,14 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+// robotCacheEntryPath mirrors the v3 per-entry disk-cache layout (issue #192):
+// one JSON file per key, named by the first 16 bytes of sha256(key), under
+// <cacheDir>/analysis_cache/.
+func robotCacheEntryPath(cacheDir, fullKey string) string {
+	sum := sha256.Sum256([]byte(fullKey))
+	return filepath.Join(cacheDir, "analysis_cache", hex.EncodeToString(sum[:16])+".json")
+}
 
 func TestComputeDataHash_Empty(t *testing.T) {
 	hash := analysis.ComputeDataHash(nil)
@@ -335,6 +345,63 @@ func TestComputeIssueFingerprint_Deterministic(t *testing.T) {
 	}
 }
 
+func TestComputeIssueFingerprint_CommentTieOrderIndependent(t *testing.T) {
+	ts := time.Date(2024, 2, 10, 12, 0, 0, 0, time.UTC)
+	alice := &model.Comment{ID: "same", IssueID: "A", Author: "alice", Text: "first", CreatedAt: ts}
+	bob := &model.Comment{ID: "same", IssueID: "A", Author: "bob", Text: "second", CreatedAt: ts}
+
+	issueA := model.Issue{ID: "A", Comments: []*model.Comment{alice, bob}}
+	issueB := model.Issue{ID: "A", Comments: []*model.Comment{bob, alice}}
+
+	fpA := analysis.ComputeIssueFingerprint(issueA)
+	fpB := analysis.ComputeIssueFingerprint(issueB)
+	if fpA.ContentHash != fpB.ContentHash {
+		t.Fatalf("comment input order changed ContentHash: %s vs %s", fpA.ContentHash, fpB.ContentHash)
+	}
+}
+
+func TestComputeIssueFingerprint_NilDependenciesIgnored(t *testing.T) {
+	withoutDependencies := analysis.ComputeIssueFingerprint(model.Issue{ID: "A"})
+	withNilDependency := analysis.ComputeIssueFingerprint(model.Issue{
+		ID:           "A",
+		Dependencies: []*model.Dependency{nil},
+	})
+
+	if withoutDependencies.DependencyHash != withNilDependency.DependencyHash {
+		t.Fatalf("nil dependency changed DependencyHash: %s vs %s", withoutDependencies.DependencyHash, withNilDependency.DependencyHash)
+	}
+}
+
+func TestComputeIssueFingerprint_PointerPresenceChangesContentHash(t *testing.T) {
+	empty := ""
+	zero := 0
+	zeroTime := time.Time{}
+	tests := []struct {
+		name   string
+		mutate func(*model.Issue)
+	}{
+		{name: "external ref", mutate: func(issue *model.Issue) { issue.ExternalRef = &empty }},
+		{name: "estimated minutes", mutate: func(issue *model.Issue) { issue.EstimatedMinutes = &zero }},
+		{name: "due date", mutate: func(issue *model.Issue) { issue.DueDate = &zeroTime }},
+		{name: "defer until", mutate: func(issue *model.Issue) { issue.DeferUntil = &zeroTime }},
+		{name: "closed at", mutate: func(issue *model.Issue) { issue.ClosedAt = &zeroTime }},
+		{name: "compacted at", mutate: func(issue *model.Issue) { issue.CompactedAt = &zeroTime }},
+		{name: "compacted at commit", mutate: func(issue *model.Issue) { issue.CompactedAtCommit = &empty }},
+	}
+
+	baseHash := analysis.ComputeIssueFingerprint(model.Issue{ID: "A"}).ContentHash
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issue := model.Issue{ID: "A"}
+			tt.mutate(&issue)
+			got := analysis.ComputeIssueFingerprint(issue).ContentHash
+			if got == baseHash {
+				t.Fatalf("present empty/zero pointer did not change ContentHash %q", got)
+			}
+		})
+	}
+}
+
 func TestComputeIssueDiff(t *testing.T) {
 	ts := time.Date(2024, 3, 10, 12, 0, 0, 0, time.UTC)
 	oldIssues := []model.Issue{
@@ -390,6 +457,51 @@ func TestComputeIssueDiff(t *testing.T) {
 	}
 }
 
+func TestComputeIssueDiff_OrderIndependent(t *testing.T) {
+	oldIssues := []model.Issue{
+		{ID: "A", Title: "changed"},
+		{ID: "B", Title: "removed"},
+		{ID: "C", Title: "unchanged"},
+	}
+	newIssues := []model.Issue{
+		{ID: "D", Title: "added"},
+		{ID: "C", Title: "unchanged"},
+		{ID: "A", Title: "updated"},
+	}
+	want := analysis.ComputeIssueDiff(oldIssues, newIssues)
+
+	permutedOld := []model.Issue{oldIssues[2], oldIssues[0], oldIssues[1]}
+	permutedNew := []model.Issue{newIssues[2], newIssues[0], newIssues[1]}
+	got := analysis.ComputeIssueDiff(permutedOld, permutedNew)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("input order changed diff:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestComputeIssueDiff_ContentAndDependencyChange(t *testing.T) {
+	oldIssues := []model.Issue{{
+		ID:           "A",
+		Title:        "before",
+		Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}},
+	}}
+	newIssues := []model.Issue{{
+		ID:           "A",
+		Title:        "after",
+		Dependencies: []*model.Dependency{{DependsOnID: "C", Type: model.DepBlocks}},
+	}}
+
+	diff := analysis.ComputeIssueDiff(oldIssues, newIssues)
+	if !reflect.DeepEqual(diff.Modified, []string{"A"}) {
+		t.Fatalf("Modified=%v, want [A] exactly once", diff.Modified)
+	}
+	if !reflect.DeepEqual(diff.ContentChanged, []string{"A"}) {
+		t.Fatalf("ContentChanged=%v, want [A]", diff.ContentChanged)
+	}
+	if !reflect.DeepEqual(diff.DependencyChanged, []string{"A"}) {
+		t.Fatalf("DependencyChanged=%v, want [A]", diff.DependencyChanged)
+	}
+}
+
 func TestGlobalCache(t *testing.T) {
 	cache := analysis.GetGlobalCache()
 	if cache == nil {
@@ -440,23 +552,23 @@ func TestRobotDiskCache_WritesAndHits(t *testing.T) {
 	configHash := analysis.ComputeConfigHash(&config)
 	fullKey := dataHash + "|" + configHash
 
-	cachePath := filepath.Join(cacheDir, "analysis_cache.json")
+	cachePath := robotCacheEntryPath(cacheDir, fullKey)
 	raw, err := os.ReadFile(cachePath)
 	if err != nil {
-		t.Fatalf("reading cache file: %v", err)
+		t.Fatalf("reading cache entry file: %v", err)
 	}
-	var cf struct {
-		Version int                        `json:"version"`
-		Entries map[string]json.RawMessage `json:"entries"`
+	var entry struct {
+		Version int    `json:"version"`
+		Key     string `json:"key"`
 	}
-	if err := json.Unmarshal(raw, &cf); err != nil {
-		t.Fatalf("parsing cache json: %v", err)
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		t.Fatalf("parsing cache entry json: %v", err)
 	}
-	if cf.Version != 2 {
-		t.Fatalf("cache version: got %d, want %d", cf.Version, 2)
+	if entry.Version != 3 {
+		t.Fatalf("cache entry version: got %d, want %d", entry.Version, 3)
 	}
-	if _, ok := cf.Entries[fullKey]; !ok {
-		t.Fatalf("expected cache entry for key %q", fullKey)
+	if entry.Key != fullKey {
+		t.Fatalf("cache entry key: got %q, want %q", entry.Key, fullKey)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -534,24 +646,14 @@ func TestRobotDiskCache_BeadsDBDirectoryUsesChildModTime(t *testing.T) {
 	stats1 := an.AnalyzeAsyncWithConfig(context.Background(), config)
 	stats1.WaitForPhase2()
 
-	cachePath := filepath.Join(cacheDir, "analysis_cache.json")
+	cachePath := robotCacheEntryPath(cacheDir, fullKey)
 	raw, err := os.ReadFile(cachePath)
 	if err != nil {
-		t.Fatalf("reading cache file: %v", err)
+		t.Fatalf("reading cache entry file: %v", err)
 	}
-	var cf struct {
-		Version int                                   `json:"version"`
-		Entries map[string]map[string]json.RawMessage `json:"entries"`
-	}
-	if err := json.Unmarshal(raw, &cf); err != nil {
-		t.Fatalf("parsing cache json: %v", err)
-	}
-	if cf.Version != 2 {
-		t.Fatalf("cache version: got %d, want %d", cf.Version, 2)
-	}
-	entry, ok := cf.Entries[fullKey]
-	if !ok {
-		t.Fatalf("expected cache entry for key %q", fullKey)
+	var entry map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		t.Fatalf("parsing cache entry json: %v", err)
 	}
 	createdAtRaw, err := json.Marshal(staleCreatedAt)
 	if err != nil {
@@ -562,15 +664,13 @@ func TestRobotDiskCache_BeadsDBDirectoryUsesChildModTime(t *testing.T) {
 		t.Fatalf("marshalling compute duration: %v", err)
 	}
 	entry["created_at"] = createdAtRaw
-	entry["accessed_at"] = createdAtRaw
 	entry["compute_duration"] = zeroDurationRaw
-	cf.Entries[fullKey] = entry
-	raw, err = json.Marshal(cf)
+	raw, err = json.Marshal(entry)
 	if err != nil {
-		t.Fatalf("marshalling cache json: %v", err)
+		t.Fatalf("marshalling cache entry json: %v", err)
 	}
 	if err := os.WriteFile(cachePath, raw, 0o644); err != nil {
-		t.Fatalf("writing cache file: %v", err)
+		t.Fatalf("writing cache entry file: %v", err)
 	}
 
 	an2 := analysis.NewAnalyzer(issues)
@@ -582,22 +682,16 @@ func TestRobotDiskCache_BeadsDBDirectoryUsesChildModTime(t *testing.T) {
 
 	raw, err = os.ReadFile(cachePath)
 	if err != nil {
-		t.Fatalf("reading rewritten cache file: %v", err)
+		t.Fatalf("reading rewritten cache entry file: %v", err)
 	}
 	var updated struct {
-		Entries map[string]struct {
-			CreatedAt time.Time `json:"created_at"`
-		} `json:"entries"`
+		CreatedAt time.Time `json:"created_at"`
 	}
 	if err := json.Unmarshal(raw, &updated); err != nil {
-		t.Fatalf("parsing rewritten cache json: %v", err)
+		t.Fatalf("parsing rewritten cache entry json: %v", err)
 	}
-	updatedEntry, ok := updated.Entries[fullKey]
-	if !ok {
-		t.Fatalf("expected rewritten cache entry for key %q", fullKey)
-	}
-	if !updatedEntry.CreatedAt.After(staleCreatedAt) {
-		t.Fatalf("expected child file mtime to invalidate stale cache entry, got CreatedAt %v", updatedEntry.CreatedAt)
+	if !updated.CreatedAt.After(staleCreatedAt) {
+		t.Fatalf("expected child file mtime to invalidate stale cache entry, got CreatedAt %v", updated.CreatedAt)
 	}
 }
 
@@ -621,48 +715,43 @@ func TestRobotDiskCache_XFetchRefreshRecomputes(t *testing.T) {
 	dataHash := analysis.ComputeDataHash(issues)
 	configHash := analysis.ComputeConfigHash(&config)
 	fullKey := dataHash + "|" + configHash
-	cachePath := filepath.Join(cacheDir, "analysis_cache.json")
+	cachePath := robotCacheEntryPath(cacheDir, fullKey)
 
-	type cacheEntry struct {
-		CreatedAt       time.Time `json:"created_at"`
-		AccessedAt      time.Time `json:"accessed_at"`
-		ComputeDuration int64     `json:"compute_duration"`
-	}
-	type cacheFile struct {
-		Version int                   `json:"version"`
-		Entries map[string]cacheEntry `json:"entries"`
-	}
-
-	readCache := func() cacheFile {
+	readEntry := func() map[string]json.RawMessage {
 		t.Helper()
 		raw, err := os.ReadFile(cachePath)
 		if err != nil {
-			t.Fatalf("reading cache file: %v", err)
+			t.Fatalf("reading cache entry file: %v", err)
 		}
-		var cf cacheFile
-		if err := json.Unmarshal(raw, &cf); err != nil {
-			t.Fatalf("parsing cache json: %v", err)
+		var entry map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			t.Fatalf("parsing cache entry json: %v", err)
 		}
-		return cf
+		return entry
 	}
 
-	cf := readCache()
-	entry, ok := cf.Entries[fullKey]
-	if !ok {
-		t.Fatalf("expected cache entry for key %q", fullKey)
-	}
-	staleCreatedAt := time.Now().Add(-365 * 24 * time.Hour).UTC()
-	entry.CreatedAt = staleCreatedAt
-	entry.AccessedAt = staleCreatedAt
-	entry.ComputeDuration = int64(time.Millisecond)
-	cf.Entries[fullKey] = entry
-
-	raw, err := json.Marshal(cf)
+	entry := readEntry()
+	// A year-old CreatedAt would trip the max-age prune, which reaps the entry
+	// instead of serving it; XFetch needs a *served* entry whose refresh window
+	// has certainly elapsed, so age it one hour with a 1ms compute duration.
+	staleCreatedAt := time.Now().Add(-time.Hour).UTC()
+	createdAtRaw, err := json.Marshal(staleCreatedAt)
 	if err != nil {
-		t.Fatalf("marshalling cache json: %v", err)
+		t.Fatalf("marshalling stale timestamp: %v", err)
+	}
+	durationRaw, err := json.Marshal(int64(time.Millisecond))
+	if err != nil {
+		t.Fatalf("marshalling compute duration: %v", err)
+	}
+	entry["created_at"] = createdAtRaw
+	entry["compute_duration"] = durationRaw
+
+	raw, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("marshalling cache entry json: %v", err)
 	}
 	if err := os.WriteFile(cachePath, raw, 0o644); err != nil {
-		t.Fatalf("writing cache file: %v", err)
+		t.Fatalf("writing cache entry file: %v", err)
 	}
 
 	time.Sleep(10 * time.Millisecond)
@@ -674,10 +763,18 @@ func TestRobotDiskCache_XFetchRefreshRecomputes(t *testing.T) {
 		t.Fatal("expected recomputed stats to reach phase2 ready")
 	}
 
-	cf = readCache()
-	entry = cf.Entries[fullKey]
-	if !entry.CreatedAt.After(staleCreatedAt) {
-		t.Fatalf("expected xfetch refresh to rewrite CreatedAt, got %v", entry.CreatedAt)
+	var refreshed struct {
+		CreatedAt time.Time `json:"created_at"`
+	}
+	raw, err = os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("reading refreshed cache entry file: %v", err)
+	}
+	if err := json.Unmarshal(raw, &refreshed); err != nil {
+		t.Fatalf("parsing refreshed cache entry json: %v", err)
+	}
+	if !refreshed.CreatedAt.After(staleCreatedAt) {
+		t.Fatalf("expected xfetch refresh to rewrite CreatedAt, got %v", refreshed.CreatedAt)
 	}
 }
 
@@ -694,43 +791,34 @@ func TestRobotDiskCache_EvictsToMaxEntries(t *testing.T) {
 		stats.WaitForPhase2()
 	}
 
-	cachePath := filepath.Join(cacheDir, "analysis_cache.json")
-	raw, err := os.ReadFile(cachePath)
+	entries, err := os.ReadDir(filepath.Join(cacheDir, "analysis_cache"))
 	if err != nil {
-		t.Fatalf("reading cache file: %v", err)
+		t.Fatalf("reading cache dir: %v", err)
 	}
-	var cf struct {
-		Version int                        `json:"version"`
-		Entries map[string]json.RawMessage `json:"entries"`
+	count := 0
+	for _, de := range entries {
+		if !de.IsDir() && strings.HasSuffix(de.Name(), ".json") {
+			count++
+		}
 	}
-	if err := json.Unmarshal(raw, &cf); err != nil {
-		t.Fatalf("parsing cache json: %v", err)
-	}
-	if cf.Version != 2 {
-		t.Fatalf("cache version: got %d, want %d", cf.Version, 2)
-	}
-	if len(cf.Entries) > 10 {
-		t.Fatalf("expected <= 10 entries after eviction, got %d", len(cf.Entries))
-	}
-	if len(cf.Entries) != 10 {
-		t.Fatalf("expected 10 entries after eviction, got %d", len(cf.Entries))
+	if count != 10 {
+		t.Fatalf("expected 10 entry files after eviction, got %d", count)
 	}
 }
 
 // BenchmarkRobotDiskCache_ReadHit measures the steady-state read-hit path: a
-// large graph's stats are already cached, the context is cancelled (so XFetch
-// never forces a recompute), and the entry count stays at 1 (so LRU eviction is
-// a no-op on both baseline and candidate). This isolates the cost the
-// DiskCache-NoRewriteOnHit optimization targets: rewriting the whole multi-MB
-// cache file on every hit just to bump the LRU AccessedAt timestamp. Run on
-// baseline vs candidate to compare.
+// large graph's stats are already cached and analyzer/key/context setup is
+// complete before the timer starts. The cancelled context guarantees XFetch
+// cannot turn a hit into a recompute. The timed region therefore measures the
+// entry read, JSON decode, and GraphStats reconstruction rather than rebuilding
+// and hashing the 4,000-issue analyzer on every iteration.
 func BenchmarkRobotDiskCache_ReadHit(b *testing.B) {
 	b.Setenv("BV_ROBOT", "1")
 	cacheDir := b.TempDir()
 	b.Setenv("BV_CACHE_DIR", cacheDir)
 
 	// A large dependency graph so the cached GraphStats payload (PageRank,
-	// betweenness, etc. maps) is multi-MB, like the real cache.
+	// betweenness, etc. maps) is hundreds of KB, like a large real cache entry.
 	const n = 4000
 	issues := make([]model.Issue, 0, n)
 	for i := 0; i < n; i++ {
@@ -749,20 +837,38 @@ func BenchmarkRobotDiskCache_ReadHit(b *testing.B) {
 	stats1 := an.AnalyzeAsyncWithConfig(context.Background(), config)
 	stats1.WaitForPhase2()
 
-	cachePath := filepath.Join(cacheDir, "analysis_cache.json")
-	if fi, err := os.Stat(cachePath); err == nil {
-		b.Logf("cache size: %d bytes", fi.Size())
+	dataHash := analysis.ComputeDataHash(issues)
+	configHash := analysis.ComputeConfigHash(&config)
+	if fi, err := os.Stat(robotCacheEntryPath(cacheDir, dataHash+"|"+configHash)); err == nil {
+		b.Logf("cache entry size: %d bytes", fi.Size())
+	}
+
+	// Prepare the read-side analyzer, key, and context outside the timed region.
+	// Seeding uses the same hash that names the populated cache entry.
+	readAnalyzer := analysis.NewAnalyzer(issues)
+	readAnalyzer.SeedDataHash(dataHash)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	const sampleID = "ISSUE-02000"
+	wantPageRank := stats1.GetPageRankScore(sampleID)
+	wantBetweenness := stats1.GetBetweennessScore(sampleID)
+	if wantPageRank == 0 || wantBetweenness == 0 {
+		b.Fatalf("benchmark setup produced empty sample scores: pagerank=%v betweenness=%v", wantPageRank, wantBetweenness)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel() // cancelled ctx => XFetch never triggers recompute: pure read-hit
-		an2 := analysis.NewAnalyzer(issues)
-		s := an2.AnalyzeAsyncWithConfig(ctx, config)
+		s := readAnalyzer.AnalyzeAsyncWithConfig(ctx, config)
 		s.WaitForPhase2()
-		if !s.IsPhase2Ready() {
-			b.Fatal("expected phase2 ready on cache hit")
+		if !s.IsPhase2Ready() || s.NodeCount != n || s.EdgeCount != n-1 {
+			b.Fatalf("invalid cache result: ready=%v nodes=%d edges=%d", s.IsPhase2Ready(), s.NodeCount, s.EdgeCount)
+		}
+		if got := s.GetPageRankScore(sampleID); got != wantPageRank {
+			b.Fatalf("cached pagerank[%s] = %v, want %v", sampleID, got, wantPageRank)
+		}
+		if got := s.GetBetweennessScore(sampleID); got != wantBetweenness {
+			b.Fatalf("cached betweenness[%s] = %v, want %v", sampleID, got, wantBetweenness)
 		}
 	}
 }

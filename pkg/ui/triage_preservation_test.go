@@ -59,7 +59,7 @@ func TestFileChangedPreservesTriageData(t *testing.T) {
 	m.insightsPanel.triageDataHash = "keep"
 
 	next, _ := m.Update(FileChangedMsg{})
-	updated := next.(Model)
+	updated := next.(*Model)
 
 	items := updated.list.Items()
 	if len(items) != 1 {
@@ -135,7 +135,7 @@ func TestDataSnapshotPreservesTriageWhenPhase1(t *testing.T) {
 	}
 
 	nextModel, _ := m.Update(SnapshotReadyMsg{Snapshot: snapshot})
-	updated := nextModel.(Model)
+	updated := nextModel.(*Model)
 
 	if updated.triageScores[issue.ID] != 0.75 {
 		t.Errorf("triage score should be preserved: got %v, want 0.75", updated.triageScores[issue.ID])

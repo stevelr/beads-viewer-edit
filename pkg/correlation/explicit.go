@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,8 +30,44 @@ func (m *ExplicitMatcher) WithContext(ctx context.Context) *ExplicitMatcher {
 	return m
 }
 
-// DefaultPatterns returns the default set of bead ID patterns.
+// customIDPatterns holds user-supplied bead ID patterns registered via
+// SetCustomIDPatterns (the --id-pattern CLI flag, #188). Guarded by a RWMutex
+// per the shared-state convention; writes happen once at CLI startup.
+var (
+	customIDPatternsMu sync.RWMutex
+	customIDPatterns   []*regexp.Regexp
+)
+
+// SetCustomIDPatterns registers additional bead ID patterns used alongside the
+// defaults by every message-based ID matcher (ExplicitMatcher, orphan
+// detection). This is how the --id-pattern CLI flag supports trackers whose
+// IDs don't have numeric suffixes (e.g. beadhive's bh-8g6cj) (#188).
+// Patterns may capture the ID in group 1; patterns without a capture group
+// match the ID as the whole expression.
+func SetCustomIDPatterns(patterns []*regexp.Regexp) {
+	customIDPatternsMu.Lock()
+	defer customIDPatternsMu.Unlock()
+	customIDPatterns = make([]*regexp.Regexp, len(patterns))
+	copy(customIDPatterns, patterns)
+}
+
+// CustomIDPatterns returns the registered custom bead ID patterns (may be empty).
+func CustomIDPatterns() []*regexp.Regexp {
+	customIDPatternsMu.RLock()
+	defer customIDPatternsMu.RUnlock()
+	out := make([]*regexp.Regexp, len(customIDPatterns))
+	copy(out, customIDPatterns)
+	return out
+}
+
+// DefaultPatterns returns the default set of bead ID patterns, plus any
+// custom patterns registered via SetCustomIDPatterns (#188).
 func DefaultPatterns() []*regexp.Regexp {
+	return append(builtinPatterns(), CustomIDPatterns()...)
+}
+
+// builtinPatterns returns the built-in bead ID patterns.
+func builtinPatterns() []*regexp.Regexp {
 	return []*regexp.Regexp{
 		// [ID] format - very explicit
 		regexp.MustCompile(`\[([A-Za-z]+-\d+)\]`),
@@ -93,17 +130,27 @@ func (m *ExplicitMatcher) ExtractIDsFromMessage(message string) []IDMatch {
 	for _, pattern := range m.patterns {
 		found := pattern.FindAllStringSubmatch(message, -1)
 		for _, match := range found {
-			if len(match) >= 2 {
-				id := normalizeBeadID(match[1])
-				if !seen[id] {
-					seen[id] = true
-					matchType := classifyMatch(match[0])
-					matches = append(matches, IDMatch{
-						ID:        id,
-						MatchType: matchType,
-						RawMatch:  match[0],
-					})
-				}
+			// Prefer capture group 1 when the pattern defines one; custom
+			// patterns without a capture group match the whole expression
+			// as the ID (#188).
+			raw := ""
+			if len(match) >= 2 && match[1] != "" {
+				raw = match[1]
+			} else if len(match) >= 1 {
+				raw = match[0]
+			}
+			if raw == "" {
+				continue
+			}
+			id := normalizeBeadID(raw)
+			if !seen[id] {
+				seen[id] = true
+				matchType := classifyMatch(match[0])
+				matches = append(matches, IDMatch{
+					ID:        id,
+					MatchType: matchType,
+					RawMatch:  match[0],
+				})
 			}
 		}
 	}

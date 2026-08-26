@@ -476,8 +476,12 @@ func TestExport_WithComments(t *testing.T) {
 		{ID: "1", IssueID: "comments-1", Author: "alice", Text: "First comment", CreatedAt: now.Add(-time.Hour)},
 		{ID: "2", IssueID: "comments-1", Author: "bob", Text: "Second comment", CreatedAt: now},
 	}
+	otherIssue := makeTestIssue("comments-2", "Another issue with a reused comment ID", model.StatusOpen, 2, model.TypeTask)
+	otherIssue.Comments = []*model.Comment{
+		{ID: "1", IssueID: "comments-2", Author: "carol", Text: "Same local ID, different issue", CreatedAt: now},
+	}
 
-	exp := NewSQLiteExporter([]*model.Issue{issue}, nil, nil, nil)
+	exp := NewSQLiteExporter([]*model.Issue{issue, otherIssue}, nil, nil, nil)
 
 	if err := exp.Export(tmpDir); err != nil {
 		t.Fatalf("Export failed: %v", err)
@@ -497,6 +501,12 @@ func TestExport_WithComments(t *testing.T) {
 	if count != 2 {
 		t.Errorf("Expected 2 comments, got %d", count)
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM comments`).Scan(&count); err != nil {
+		t.Fatalf("Query total comments count failed: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("Expected 3 total comments with reused per-issue IDs, got %d", count)
+	}
 
 	// Verify comment content (id is now composite: issue_id:comment_id)
 	var author, text string
@@ -505,6 +515,12 @@ func TestExport_WithComments(t *testing.T) {
 	}
 	if author != "alice" || text != "First comment" {
 		t.Errorf("Comment 1: expected author='alice', text='First comment', got author='%s', text='%s'", author, text)
+	}
+	if err := db.QueryRow(`SELECT author, text FROM comments WHERE id = ?`, "comments-2:1").Scan(&author, &text); err != nil {
+		t.Fatalf("Query reused comment ID failed: %v", err)
+	}
+	if author != "carol" || text != "Same local ID, different issue" {
+		t.Errorf("Reused comment ID: got author=%q, text=%q", author, text)
 	}
 
 	// Verify comment_count in materialized view

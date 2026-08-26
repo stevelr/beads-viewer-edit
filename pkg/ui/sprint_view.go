@@ -265,7 +265,7 @@ func truncateStrSprint(s string, maxLen int) string {
 }
 
 // handleSprintKeys handles keyboard input when in sprint view (bv-161)
-func (m Model) handleSprintKeys(msg tea.KeyMsg) Model {
+func (m *Model) handleSprintKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
 	case "P", "esc":
 		// Exit sprint view

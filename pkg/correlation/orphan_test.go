@@ -1,6 +1,7 @@
 package correlation
 
 import (
+	"regexp"
 	"testing"
 	"time"
 )
@@ -245,5 +246,47 @@ func TestOrphanReport_Fields(t *testing.T) {
 	}
 	if len(report.ByBead["bv-1"]) != 2 {
 		t.Errorf("Expected 2 commits for bv-1, got %d", len(report.ByBead["bv-1"]))
+	}
+}
+
+func TestOrphanDetector_CustomIDPatternMatchesProbableBead(t *testing.T) {
+	SetCustomIDPatterns([]*regexp.Regexp{regexp.MustCompile(`\bbh-[a-z0-9]{5}\b`)})
+	t.Cleanup(func() { SetCustomIDPatterns(nil) })
+
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"bh-8g6cj": {
+				Title:  "Flush ordering",
+				Status: "open",
+			},
+		},
+		CommitIndex: map[string][]string{},
+	}
+	od := NewOrphanDetector(report, "/tmp/test-repo")
+
+	candidate := &OrphanCandidate{
+		SHA:     "abc123def456",
+		Message: "fix flush ordering for bh-8g6cj",
+	}
+	beadScores := make(map[string]*probableBeadBuilder)
+	od.checkMessage(candidate, beadScores)
+
+	builder, ok := beadScores["bh-8g6cj"]
+	if !ok {
+		t.Fatalf("expected custom-pattern bead ID to be scored, got %#v", beadScores)
+	}
+	if builder.score < 35 {
+		t.Errorf("expected mention score >= 35, got %d", builder.score)
+	}
+
+	// The custom pattern should also register as a message signal.
+	foundSignal := false
+	for _, sig := range candidate.Signals {
+		if sig.Signal == SignalOrphanMessage {
+			foundSignal = true
+		}
+	}
+	if !foundSignal {
+		t.Errorf("expected message signal from custom pattern, got %#v", candidate.Signals)
 	}
 }

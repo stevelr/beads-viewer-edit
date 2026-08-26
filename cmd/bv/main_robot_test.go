@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -238,7 +239,7 @@ func TestRobotNextClaimablePickRejectsAssignedTopPick(t *testing.T) {
 		Assignee:  " cc11 ",
 	}}
 
-	_, diagnostic, reasons, ok := robotNextClaimablePick(picks, issues)
+	_, diagnostic, reasons, ok := robotNextClaimablePick(picks, issues, time.Time{})
 	if ok {
 		t.Fatalf("assigned top pick must not be claimable")
 	}

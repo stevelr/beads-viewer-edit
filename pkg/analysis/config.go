@@ -10,6 +10,11 @@ import (
 // AnalysisConfig controls which metrics to compute and their timeouts.
 // This enables size-based algorithm selection for optimal performance.
 type AnalysisConfig struct {
+	// DisableCache forces this analysis call to recompute instead of consulting
+	// or populating either the in-process incremental cache or the robot disk
+	// cache. This is useful for profiling and validation that require fresh work.
+	DisableCache bool `json:"-"`
+
 	// Betweenness centrality (expensive: O(V*E))
 	ComputeBetweenness       bool
 	BetweennessTimeout       time.Duration

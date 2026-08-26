@@ -295,3 +295,53 @@ func TestDuplicateIDsInMessage(t *testing.T) {
 		t.Errorf("expected 1 unique match, got %d", len(matches))
 	}
 }
+
+func TestCustomIDPatterns_NoCaptureGroup(t *testing.T) {
+	SetCustomIDPatterns([]*regexp.Regexp{regexp.MustCompile(`\bbh-[a-z0-9]{5}\b`)})
+	t.Cleanup(func() { SetCustomIDPatterns(nil) })
+
+	m := NewExplicitMatcher("/tmp/test")
+	matches := m.ExtractIDsFromMessage("fix flush ordering (bh-8g6cj)")
+
+	found := false
+	for _, match := range matches {
+		if match.ID == "bh-8g6cj" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected custom pattern to match bh-8g6cj, got %#v", matches)
+	}
+}
+
+func TestCustomIDPatterns_WithCaptureGroup(t *testing.T) {
+	SetCustomIDPatterns([]*regexp.Regexp{regexp.MustCompile(`(?i)ref\s+(bhui-[a-z]{3})\b`)})
+	t.Cleanup(func() { SetCustomIDPatterns(nil) })
+
+	m := NewExplicitMatcher("/tmp/test")
+	matches := m.ExtractIDsFromMessage("board polish, ref BHUI-PBB done")
+
+	found := false
+	for _, match := range matches {
+		if match.ID == "bhui-pbb" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected capture group 1 to be extracted as the ID, got %#v", matches)
+	}
+}
+
+func TestCustomIDPatterns_DefaultsUnaffectedWhenEmpty(t *testing.T) {
+	SetCustomIDPatterns(nil)
+	base := len(builtinPatterns())
+	if got := len(DefaultPatterns()); got != base {
+		t.Errorf("DefaultPatterns() = %d patterns with no custom set, want %d", got, base)
+	}
+
+	SetCustomIDPatterns([]*regexp.Regexp{regexp.MustCompile(`x-[0-9a-f]{4}`)})
+	t.Cleanup(func() { SetCustomIDPatterns(nil) })
+	if got := len(DefaultPatterns()); got != base+1 {
+		t.Errorf("DefaultPatterns() = %d patterns with one custom set, want %d", got, base+1)
+	}
+}

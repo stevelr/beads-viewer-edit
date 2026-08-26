@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/pprof"
 	"slices"
@@ -1501,6 +1502,7 @@ func main() {
 	historyLimit := flag.Int("history-limit", 500, "Max commits to analyze (0 = unlimited)")
 	robotHistoryTimeoutMs := flag.Int("robot-history-timeout-ms", -1, "Budget in ms for the git-history prologue of robot triage (0 = unbounded; default 10000, env BV_ROBOT_HISTORY_TIMEOUT_MS)")
 	minConfidence := flag.Float64("min-confidence", 0.0, "Filter correlations by minimum confidence (0.0-1.0)")
+	idPatterns := flag.StringArray("id-pattern", nil, "Custom bead ID regex for commit-message matching, e.g. 'bh-[a-z0-9]{5}' (repeatable; capture group 1 is the ID, else the whole match) (#188)")
 	// Correlation audit flags (bv-e1u6)
 	robotExplainCorrelation := flag.String("robot-explain-correlation", "", "Explain why a commit is linked to a bead (format: SHA:beadID)")
 	robotConfirmCorrelation := flag.String("robot-confirm-correlation", "", "Confirm a correlation is correct (format: SHA:beadID)")
@@ -1698,6 +1700,23 @@ func main() {
 		// --theme > BV_THEME > ~/.config/bv/config.yaml > auto-detect. (bv-128)
 		ui.SetThemeOverride(effectiveThemePreference(*themeFlag, flag.CommandLine.Changed("theme"), os.Stderr))
 
+		// Register custom bead ID patterns (--id-pattern, #188) before any
+		// correlation work runs, so every message-based ID matcher (explicit
+		// matching, orphan detection) recognizes non-default ID formats like
+		// beadhive's bh-8g6cj.
+		if len(*idPatterns) > 0 {
+			compiled := make([]*regexp.Regexp, 0, len(*idPatterns))
+			for _, p := range *idPatterns {
+				re, err := regexp.Compile(p)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Invalid --id-pattern %q: %v\n", p, err)
+					os.Exit(2)
+				}
+				compiled = append(compiled, re)
+			}
+			correlation.SetCustomIDPatterns(compiled)
+		}
+
 		modifierRules := []modifierFlagRule{
 			{modifier: "robot-diff", requires: []string{"diff-since"}},
 			{modifier: "robot-search", requires: []string{"search"}},
@@ -1812,18 +1831,30 @@ func main() {
 		}
 
 		// CPU profiling support
+		var stopCPUProfile func()
 		if *cpuProfile != "" {
 			f, err := os.Create(*cpuProfile)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Could not create CPU profile: %v\n", err)
 				os.Exit(1)
 			}
-			defer f.Close()
 			if err := pprof.StartCPUProfile(f); err != nil {
+				_ = f.Close()
 				fmt.Fprintf(os.Stderr, "Could not start CPU profile: %v\n", err)
 				os.Exit(1)
 			}
-			defer pprof.StopCPUProfile()
+			profileActive := true
+			stopCPUProfile = func() {
+				if !profileActive {
+					return
+				}
+				pprof.StopCPUProfile()
+				profileActive = false
+				if err := f.Close(); err != nil {
+					fmt.Fprintf(os.Stderr, "Could not close CPU profile: %v\n", err)
+				}
+			}
+			defer stopCPUProfile()
 		}
 
 		// Apply --db flag: set BEADS_DB env var so all downstream code respects it.
@@ -1929,9 +1960,10 @@ func main() {
 		}
 
 		robotDispatchContext := RobotContext{
-			Stdout:  os.Stdout,
-			Stderr:  os.Stderr,
-			Encoder: newRobotEncoder(os.Stdout),
+			Stdout:             os.Stdout,
+			Stderr:             os.Stderr,
+			Encoder:            newRobotEncoder(os.Stdout),
+			FinalizeBeforeExit: stopCPUProfile,
 		}
 		dispatchRobotFlagOrExit(&phaseOneRobotRegistry, "robot-help", robotDispatchContext)
 		dispatchRobotFlagOrExit(&phaseOneRobotRegistry, "version", robotDispatchContext)
@@ -3146,12 +3178,14 @@ func main() {
 			output := struct {
 				GeneratedAt string                     `json:"generated_at"`
 				DataHash    string                     `json:"data_hash"`
+				LoadStats   *RobotLoadStats            `json:"load_stats,omitempty"` // Present when records were dropped during load (#190)
 				Flow        analysis.CrossLabelFlow    `json:"flow"`
 				Config      analysis.LabelHealthConfig `json:"analysis_config"`
 				UsageHints  []string                   `json:"usage_hints"`
 			}{
 				GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 				DataHash:    dataHash,
+				LoadStats:   robotLoadStatsFromLastLoad(),
 				Flow:        flow,
 				Config:      cfg,
 				UsageHints: []string{
@@ -3184,10 +3218,11 @@ func main() {
 
 			// Build limited output
 			type AttentionOutput struct {
-				GeneratedAt string `json:"generated_at"`
-				DataHash    string `json:"data_hash"`
-				Limit       int    `json:"limit"`
-				TotalLabels int    `json:"total_labels"`
+				GeneratedAt string          `json:"generated_at"`
+				DataHash    string          `json:"data_hash"`
+				LoadStats   *RobotLoadStats `json:"load_stats,omitempty"` // Present when records were dropped during load (#190)
+				Limit       int             `json:"limit"`
+				TotalLabels int             `json:"total_labels"`
 				Labels      []struct {
 					Rank            int     `json:"rank"`
 					Label           string  `json:"label"`
@@ -3206,6 +3241,7 @@ func main() {
 			output := AttentionOutput{
 				GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 				DataHash:    dataHash,
+				LoadStats:   robotLoadStatsFromLastLoad(),
 				Limit:       limit,
 				TotalLabels: result.TotalLabels,
 				UsageHints: []string{
@@ -3650,6 +3686,7 @@ func main() {
 			output := struct {
 				GeneratedAt    string                  `json:"generated_at"`
 				DataHash       string                  `json:"data_hash"`
+				LoadStats      *RobotLoadStats         `json:"load_stats,omitempty"`   // Present when records were dropped during load (#190)
 				AsOf           string                  `json:"as_of,omitempty"`        // Historical snapshot ref
 				AsOfCommit     string                  `json:"as_of_commit,omitempty"` // Resolved commit SHA
 				AnalysisConfig analysis.AnalysisConfig `json:"analysis_config"`
@@ -3664,6 +3701,7 @@ func main() {
 			}{
 				GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
 				DataHash:         dataHash,
+				LoadStats:        robotLoadStatsFromLastLoad(),
 				AsOf:             *asOf,
 				AsOfCommit:       asOfResolved,
 				AnalysisConfig:   stats.Config,
@@ -3790,6 +3828,7 @@ func main() {
 			output := struct {
 				GeneratedAt string                 `json:"generated_at"`
 				DataHash    string                 `json:"data_hash"`
+				LoadStats   *RobotLoadStats        `json:"load_stats,omitempty"`   // Present when records were dropped during load (#190)
 				AsOf        string                 `json:"as_of,omitempty"`        // Historical snapshot ref (e.g., HEAD~30)
 				AsOfCommit  string                 `json:"as_of_commit,omitempty"` // Resolved commit SHA
 				Triage      analysis.TriageResult  `json:"triage"`
@@ -3798,6 +3837,7 @@ func main() {
 			}{
 				GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 				DataHash:    dataHash,
+				LoadStats:   robotLoadStatsFromLastLoad(),
 				AsOf:        *asOf,
 				AsOfCommit:  asOfResolved,
 				Triage:      triage,
@@ -5504,7 +5544,7 @@ func main() {
 	}
 }
 
-func runTUIProgram(m ui.Model) error {
+func runTUIProgram(m *ui.Model) error {
 	p := tea.NewProgram(
 		m,
 		tea.WithAltScreen(),
@@ -5986,8 +6026,13 @@ func applyRecipeFilters(issues []model.Issue, r *recipe.Recipe) []model.Issue {
 			}
 		}
 
-		// Actionable filter (no open blockers)
+		// Actionable filter (no open blockers, not scheduler-deferred).
+		// A future defer_until withholds the bead exactly as `br ready` does
+		// (issue #191); the deferral lapses on its own once the instant passes.
 		if f.Actionable != nil && *f.Actionable {
+			if issue.IsDeferredAt(now) {
+				continue
+			}
 			hasOpenBlockers := false
 			for _, dep := range issue.Dependencies {
 				if dep != nil && dep.Type.IsBlocking() && openBlockers[dep.DependsOnID] {
@@ -8155,10 +8200,25 @@ const robotContractVersion = "1.0.0"
 // RobotEnvelope is the standard envelope for all robot command outputs.
 // All robot outputs MUST include these fields for consistency.
 type RobotEnvelope struct {
-	GeneratedAt  string `json:"generated_at"`            // RFC3339 timestamp
-	DataHash     string `json:"data_hash"`               // Fingerprint of source data
-	OutputFormat string `json:"output_format,omitempty"` // "json" or "toon"
-	Version      string `json:"version,omitempty"`       // bv version (e.g., "1.0.0")
+	GeneratedAt  string          `json:"generated_at"`            // RFC3339 timestamp
+	DataHash     string          `json:"data_hash"`               // Fingerprint of source data
+	OutputFormat string          `json:"output_format,omitempty"` // "json" or "toon"
+	Version      string          `json:"version,omitempty"`       // bv version (e.g., "1.0.0")
+	LoadStats    *RobotLoadStats `json:"load_stats,omitempty"`    // Present when records were dropped during load (#190)
+}
+
+// RobotLoadStats surfaces per-line parse accounting for the JSONL source that
+// backed this output. It is emitted only when errors > 0 — i.e. when one or
+// more issue records were dropped during load (malformed JSON or failed
+// validation such as updated_at < created_at) — so agents can distinguish
+// "issue absent from data" from "issue silently dropped by the loader" (#190).
+// Robot stderr stays clean; the accounting lives here in the JSON contract.
+type RobotLoadStats struct {
+	SourcePath string   `json:"source_path,omitempty"` // JSONL file the stats describe
+	Valid      int      `json:"valid"`                 // Issue lines that parsed and validated
+	Errors     int      `json:"errors"`                // Issue lines dropped (malformed JSON or failed validation)
+	Skipped    int      `json:"skipped"`               // Recognized non-issue `_type` records
+	Warnings   []string `json:"warnings,omitempty"`    // Per-line skip reasons (capped)
 }
 
 // RobotMeta contains optional timing and computation metadata.
@@ -8171,12 +8231,35 @@ type RobotMeta struct {
 }
 
 // NewRobotEnvelope creates a standard envelope for robot output.
+// When the backing JSONL load dropped records (malformed JSON or failed
+// validation), the envelope carries a load_stats block so the drop is visible
+// in every robot surface instead of the records simply not existing (#190).
 func NewRobotEnvelope(dataHash string) RobotEnvelope {
-	return RobotEnvelope{
+	env := RobotEnvelope{
 		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
 		DataHash:     dataHash,
 		OutputFormat: robotOutputFormat,
 		Version:      version.Version,
+	}
+	env.LoadStats = robotLoadStatsFromLastLoad()
+	return env
+}
+
+// robotLoadStatsFromLastLoad returns a load_stats block when the most recent
+// JSONL load dropped records (malformed JSON or failed validation), nil
+// otherwise. Hand-rolled robot output structs that do not embed RobotEnvelope
+// use this directly so every robot surface reports drops consistently (#190).
+func robotLoadStatsFromLastLoad() *RobotLoadStats {
+	rep := datasource.LastLoadReport()
+	if rep == nil || rep.Errors == 0 {
+		return nil
+	}
+	return &RobotLoadStats{
+		SourcePath: rep.Path,
+		Valid:      rep.Valid,
+		Errors:     rep.Errors,
+		Skipped:    rep.Skipped,
+		Warnings:   rep.Warnings,
 	}
 }
 

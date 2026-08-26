@@ -210,15 +210,19 @@ func looksLikeBeadsDBFile(dbPath string) bool {
 
 // IsBDWorkspace returns true when the given .beads directory belongs to a
 // modern Dolt-native bd workspace. Detection is based on the presence of a
-// .beads/dolt/ subdirectory or a metadata.json declaring backend=dolt.
+// .beads/dolt/ (server mode) or .beads/embeddeddolt/ (embedded mode, bd 1.1+)
+// subdirectory, or a metadata.json declaring backend=dolt.
 func IsBDWorkspace(beadsDir string) bool {
 	if beadsDir == "" {
 		return false
 	}
 
-	// Fast path: modern beads stores Dolt data under .beads/dolt/.
-	if info, err := os.Stat(filepath.Join(beadsDir, "dolt")); err == nil && info.IsDir() {
-		return true
+	// Fast path: bd stores Dolt data under .beads/dolt/ (server mode) or
+	// .beads/embeddeddolt/ (embedded mode, the bd 1.1+ default) (#189).
+	for _, dir := range []string{"dolt", "embeddeddolt"} {
+		if info, err := os.Stat(filepath.Join(beadsDir, dir)); err == nil && info.IsDir() {
+			return true
+		}
 	}
 
 	// Fallback: metadata.json may explicitly record the backend.
@@ -265,7 +269,7 @@ func PrepareBeadsDirForRead(beadsDir string, refreshBDExport bool, warnFunc func
 						warnFunc(fmt.Sprintf("bd export failed, using existing issues.jsonl: %v", err))
 					}
 				} else {
-					return "", fmt.Errorf("failed to refresh bd compatibility JSONL: %w", err)
+					return "", fmt.Errorf("failed to refresh bd compatibility JSONL (run 'bd export -o .beads/issues.jsonl'): %w", err)
 				}
 			}
 		}
@@ -409,7 +413,8 @@ func FindJSONLPathWithWarnings(beadsDir string, warnFunc func(msg string)) (stri
 	// issues.jsonl -> beads.jsonl -> beads.base.jsonl. Legacy bd workspaces
 	// remain readable through the beads.jsonl fallback.
 	preferredNames := PreferredJSONLNames
-	if IsBDWorkspace(beadsDir) {
+	isBD := IsBDWorkspace(beadsDir)
+	if isBD {
 		preferredNames = []string{"issues.jsonl", "beads.jsonl", "beads.base.jsonl"}
 	} else if metadataPreferred := metadataJSONLExportName(beadsDir); metadataPreferred != "" {
 		preferredNames = prependPreferredName(metadataPreferred, PreferredJSONLNames)
@@ -425,6 +430,19 @@ func FindJSONLPathWithWarnings(beadsDir string, warnFunc func(msg string)) (stri
 				}
 			}
 		}
+	}
+
+	// In a bd (Dolt-backed) workspace the issue data lives in the Dolt
+	// database; never fall back to a stray non-issue JSONL (memories,
+	// interactions, ...) — that silently reports an empty project (#189).
+	// Accept an existing-but-empty compatibility export (a legitimately empty
+	// project); otherwise require the export.
+	if isBD {
+		issuesPath := filepath.Join(beadsDir, "issues.jsonl")
+		if _, err := os.Stat(issuesPath); err == nil {
+			return issuesPath, nil
+		}
+		return "", fmt.Errorf("no compatibility JSONL found at %s; run 'bd export -o .beads/issues.jsonl'", issuesPath)
 	}
 
 	// Fall back to first non-empty candidate
@@ -712,6 +730,7 @@ func parseIssuesWithOptions(r io.Reader, opts ParseOptions, usePool bool) ([]mod
 		issues, poolRefs = processIssueLine(line, lineNum, opts, usePool, issues, poolRefs, opts.Stats, warn)
 	}
 
+	internRepeatedIssueStrings(issues, poolRefs)
 	return issues, poolRefs, nil
 }
 
@@ -1073,6 +1092,7 @@ func parseIssuesParallel(data []byte, opts ParseOptions, usePool bool, maxCapaci
 		opts.Stats.Skipped += stats.Skipped
 	}
 
+	internRepeatedIssueStrings(issues, poolRefs)
 	return issues, poolRefs, nil
 }
 
@@ -1214,6 +1234,97 @@ func normalizeLoadedIssue(issue *model.Issue) {
 		}
 		if dep.IssueID == "" {
 			dep.IssueID = issue.ID
+		}
+	}
+}
+
+const issueStringInternerSlots = 128
+
+// issueStringInterner is a bounded, stack-friendly table for the low-cardinality
+// strings repeated across issues. A fixed table avoids both a process-global
+// retention leak and a fresh map allocation on every reload.
+type issueStringInterner struct {
+	slots [issueStringInternerSlots]string
+}
+
+func (in *issueStringInterner) intern(value string) string {
+	if value == "" {
+		return ""
+	}
+
+	const fnvOffset64 = uint64(14695981039346656037)
+	const fnvPrime64 = uint64(1099511628211)
+	hash := fnvOffset64
+	for i := 0; i < len(value); i++ {
+		hash ^= uint64(value[i])
+		hash *= fnvPrime64
+	}
+
+	start := int(hash & (issueStringInternerSlots - 1))
+	for probe := 0; probe < issueStringInternerSlots; probe++ {
+		index := (start + probe) & (issueStringInternerSlots - 1)
+		canonical := in.slots[index]
+		if canonical == value {
+			return canonical
+		}
+		if canonical == "" {
+			in.slots[index] = value
+			return value
+		}
+	}
+
+	// High-cardinality input filled the bounded table. Preserve correctness and
+	// skip interning this value rather than growing an unbounded structure.
+	return value
+}
+
+// internRepeatedIssueStrings shares immutable string storage within one parsed
+// snapshot. The table is deliberately parse-scoped: labels, assignees, repo
+// names, enums, and dependency targets repeat heavily, while a process-global
+// interner would retain arbitrary user input forever.
+func internRepeatedIssueStrings(issues []model.Issue, poolRefs []*model.Issue) {
+	if len(issues) == 0 {
+		return
+	}
+
+	var interner issueStringInterner
+	for i := range issues {
+		issue := &issues[i]
+		issue.Status = model.Status(interner.intern(string(issue.Status)))
+		issue.IssueType = model.IssueType(interner.intern(string(issue.IssueType)))
+		issue.Assignee = interner.intern(issue.Assignee)
+		issue.SourceRepo = interner.intern(issue.SourceRepo)
+		for labelIndex := range issue.Labels {
+			issue.Labels[labelIndex] = interner.intern(issue.Labels[labelIndex])
+		}
+
+		if i < len(poolRefs) && poolRefs[i] != nil {
+			ref := poolRefs[i]
+			ref.Status = issue.Status
+			ref.IssueType = issue.IssueType
+			ref.Assignee = issue.Assignee
+			ref.SourceRepo = issue.SourceRepo
+			for labelIndex := range ref.Labels {
+				ref.Labels[labelIndex] = issue.Labels[labelIndex]
+			}
+		}
+	}
+
+	for i := range issues {
+		issue := &issues[i]
+		for _, dep := range issue.Dependencies {
+			if dep == nil {
+				continue
+			}
+			dep.Type = model.DependencyType(interner.intern(string(dep.Type)))
+			dep.CreatedBy = interner.intern(dep.CreatedBy)
+		}
+		for _, comment := range issue.Comments {
+			if comment == nil {
+				continue
+			}
+			comment.IssueID = interner.intern(comment.IssueID)
+			comment.Author = interner.intern(comment.Author)
 		}
 	}
 }

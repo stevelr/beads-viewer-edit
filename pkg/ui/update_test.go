@@ -22,7 +22,7 @@ func TestModelUpdatePhase2AndFileChanged(t *testing.T) {
 	// Phase2ReadyMsg should rebuild insights/graph without error
 	ins := m.analysis.GenerateInsights(len(issues))
 	updated, _ := m.Update(Phase2ReadyMsg{Stats: m.analysis, Insights: ins})
-	m2 := updated.(Model)
+	m2 := updated.(*Model)
 	if m2.insightsPanel.insights.Stats == nil {
 		t.Fatalf("expected insights to be regenerated")
 	}
@@ -31,7 +31,7 @@ func TestModelUpdatePhase2AndFileChanged(t *testing.T) {
 	}
 
 	// FileChangedMsg with empty beadsPath should simply re-arm watcher (no panic)
-	if updated2, cmd := m2.Update(FileChangedMsg{}); updated2.(Model).statusMsg != m2.statusMsg {
+	if updated2, cmd := m2.Update(FileChangedMsg{}); updated2.(*Model).statusMsg != m2.statusMsg {
 		_ = cmd // command may be nil; just ensure no panic and type matches
 	}
 }
@@ -105,7 +105,7 @@ func TestUpdateFileChangedReloadsSelection(t *testing.T) {
 
 	updated, cmd := m.Update(FileChangedMsg{})
 	_ = cmd
-	m2 := updated.(Model)
+	m2 := updated.(*Model)
 	if m2.statusIsError {
 		t.Fatalf("expected successful reload, got error %q", m2.statusMsg)
 	}
@@ -141,7 +141,7 @@ func TestUpdateFileChangedReloadsSQLiteSource(t *testing.T) {
 	}
 
 	updated, _ := m.Update(FileChangedMsg{})
-	m2 := updated.(Model)
+	m2 := updated.(*Model)
 	if m2.statusIsError {
 		t.Fatalf("expected successful sqlite reload, got error %q", m2.statusMsg)
 	}

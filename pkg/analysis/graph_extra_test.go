@@ -130,3 +130,53 @@ func TestAnalyzerAnalyzeAsync_DoesNotReuseStatsWhenGraphChanges(t *testing.T) {
 		t.Fatalf("expected graph stats to NOT be reused when graph structure changes")
 	}
 }
+
+func TestAnalyzerAnalyzeAsyncWithConfig_DisableCacheForcesFreshAnalysis(t *testing.T) {
+	t.Setenv("BV_ROBOT", "0")
+
+	const dependentID = "disable-cache-dependent"
+	issues := []model.Issue{
+		{
+			ID:           dependentID,
+			Status:       model.StatusOpen,
+			Dependencies: []*model.Dependency{{DependsOnID: "disable-cache-blocker", Type: model.DepBlocks}},
+		},
+		{ID: "disable-cache-blocker", Status: model.StatusOpen},
+	}
+
+	cachedConfig := NoPhase2Config()
+	cachedFirst := NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), cachedConfig)
+	cachedFirst.WaitForPhase2()
+	cachedFirst.OutDegree[dependentID] = 99
+	cachedSecond := NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), cachedConfig)
+	if cachedSecond != cachedFirst || cachedSecond.OutDegree[dependentID] != 99 {
+		t.Fatalf("default config should reuse cached graph stats")
+	}
+
+	freshConfig := cachedConfig
+	freshConfig.DisableCache = true
+	freshFirst := NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), freshConfig)
+	freshFirst.WaitForPhase2()
+	freshFirst.OutDegree[dependentID] = 99
+	freshSecond := NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), freshConfig)
+	freshSecond.WaitForPhase2()
+	if freshSecond == freshFirst {
+		t.Fatalf("DisableCache analysis reused the previous stats pointer")
+	}
+	if got := freshSecond.OutDegree[dependentID]; got != 1 {
+		t.Fatalf("DisableCache analysis reused mutated cached data: got out-degree %d, want 1", got)
+	}
+
+	outerCache := NewCache(time.Minute)
+	cachedAnalyzer := NewCachedAnalyzer(issues, outerCache)
+	cachedAnalyzer.SetConfig(&freshConfig)
+	outerCache.SetByHash(cachedAnalyzer.dataHash+"|"+cachedAnalyzer.configHash, freshFirst)
+	outerFresh := cachedAnalyzer.AnalyzeAsync(context.Background())
+	outerFresh.WaitForPhase2()
+	if cachedAnalyzer.WasCacheHit() || outerFresh == freshFirst {
+		t.Fatalf("DisableCache analysis should bypass the CachedAnalyzer cache")
+	}
+	if got := outerFresh.OutDegree[dependentID]; got != 1 {
+		t.Fatalf("DisableCache CachedAnalyzer reused mutated cached data: got out-degree %d, want 1", got)
+	}
+}

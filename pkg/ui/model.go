@@ -241,7 +241,7 @@ func StartBackgroundWorkerCmd(w *BackgroundWorker) tea.Cmd {
 		if err := w.Start(); err != nil {
 			return SnapshotErrorMsg{Err: fmt.Errorf("starting background worker: %w", err), Recoverable: false}
 		}
-		w.TriggerRefresh()
+		w.HandleRefreshRequest(RefreshRequestMsg{})
 		return nil
 	}
 }
@@ -448,6 +448,8 @@ type Model struct {
 
 	// UI Components
 	list               list.Model
+	listItemsBuffer    []list.Item
+	listOrderHash      uint64
 	viewport           viewport.Model
 	renderer           *MarkdownRenderer
 	board              BoardModel
@@ -730,6 +732,35 @@ func (m *Model) updateSemanticIDs(items []list.Item) {
 	m.semanticSearch.SetDocs(docs)
 }
 
+// installSnapshotListItems installs precomputed snapshot items without forcing
+// bubbles/list to recompute unchanged pagination and keybinding layout. The
+// model owns this backing slice so copying does not mutate an immutable snapshot.
+func (m *Model) installSnapshotListItems(snapshot *DataSnapshot) {
+	items := snapshot.listModelItems
+	current := m.list.Items()
+	bufferOwned := len(items) > 0 && len(current) == len(items) &&
+		len(m.listItemsBuffer) == len(items) && &current[0] == &m.listItemsBuffer[0]
+	if m.list.FilterState() == list.Unfiltered && bufferOwned {
+		diff := snapshot.IssueDiff
+		if snapshot.IncrementalListUsed && diff != nil &&
+			m.listOrderHash == snapshot.listOrderHash {
+			for _, id := range diff.Modified {
+				if index, ok := snapshot.listIndexByID[id]; ok {
+					m.listItemsBuffer[index] = items[index]
+				}
+			}
+			return
+		}
+		copy(m.listItemsBuffer, items)
+		m.listOrderHash = snapshot.listOrderHash
+		return
+	}
+
+	m.listItemsBuffer = append(make([]list.Item, 0, len(items)), items...)
+	m.list.SetItems(m.listItemsBuffer)
+	m.listOrderHash = snapshot.listOrderHash
+}
+
 func (m *Model) shouldShowSearchScores() bool {
 	if !m.semanticSearchEnabled || !m.semanticHybridEnabled || m.semanticSearch == nil {
 		return false
@@ -823,7 +854,7 @@ func (m *Model) issuesForAsync() []model.Issue {
 
 // NewModel creates a new Model from the given issues
 // beadsPath is the path to the beads.jsonl file for live reload support
-func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath string) Model {
+func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath string) *Model {
 	// Graph Analysis - Phase 1 is instant, Phase 2 runs in background
 	analyzer := analysis.NewAnalyzer(issues)
 	graphStats := analyzer.AnalyzeAsync(context.Background())
@@ -1177,6 +1208,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		backgroundWorker:       backgroundWorker,
 		instanceLock:           instLock,
 		list:                   l,
+		listItemsBuffer:        items,
 		viewport:               vp,
 		renderer:               renderer,
 		board:                  board,
@@ -1246,7 +1278,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	}
 
 	m.registerKeyBindings()
-	return m
+	return &m
 }
 
 // rebuildInsightsPanel refreshes the underlying insights view model from the
@@ -1289,7 +1321,7 @@ func (m *Model) rebuildInsightsPanel() {
 	m.insightsPanel = panel
 }
 
-func (m Model) Init() tea.Cmd {
+func (m *Model) Init() tea.Cmd {
 	// Note: ReadyTimeoutCmd is no longer needed since the model is now
 	// initialized as ready with default dimensions in NewModel().
 	// This eliminates the "Initializing..." phase entirely.
@@ -1315,7 +1347,7 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
 
@@ -1747,6 +1779,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if msg.Snapshot == m.snapshot {
+			if m.backgroundWorker != nil {
+				return m, WaitForBackgroundWorkerMsgCmd(m.backgroundWorker)
+			}
+			return m, nil
+		}
 
 		firstSnapshot := m.snapshotInitPending && m.snapshot == nil
 		m.snapshotInitPending = false
@@ -1824,12 +1862,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Clear caches that need recomputation
 		m.labelHealthCached = false
 		m.attentionCached = false
-		m.priorityHints = make(map[string]*analysis.PriorityRecommendation)
-		m.labelDrilldownCache = make(map[string][]model.Issue)
+		if m.priorityHints == nil {
+			m.priorityHints = make(map[string]*analysis.PriorityRecommendation)
+		} else {
+			clear(m.priorityHints)
+		}
+		if m.labelDrilldownCache == nil {
+			m.labelDrilldownCache = make(map[string][]model.Issue)
+		} else {
+			clear(m.labelDrilldownCache)
+		}
 
-		// Recompute alerts for refreshed dataset
-		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlerts(m.issues, m.analysis, m.analyzer)
-		m.dismissedAlerts = make(map[string]bool)
+		// Alerts are derived while the immutable snapshot is built, off the UI loop.
+		m.alerts = msg.Snapshot.alerts
+		m.alertsCritical = msg.Snapshot.alertsCritical
+		m.alertsWarning = msg.Snapshot.alertsWarning
+		m.alertsInfo = msg.Snapshot.alertsInfo
+		if m.dismissedAlerts == nil {
+			m.dismissedAlerts = make(map[string]bool)
+		} else {
+			clear(m.dismissedAlerts)
+		}
 		m.showAlertsPanel = false
 
 		// Reset semantic caches for the new dataset.
@@ -1895,94 +1948,113 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.applyRecipe(m.activeRecipe)
 			}
 		} else {
-			var filteredItems []list.Item
-			var filteredIssues []model.Issue
-
-			filteredItems = make([]list.Item, 0, len(msg.Snapshot.ListItems))
-			filteredIssues = make([]model.Issue, 0, len(msg.Snapshot.ListItems))
-
-			for _, item := range msg.Snapshot.ListItems {
-				issue := item.Issue
-
-				// Workspace repo filter (nil = all repos)
-				if m.workspaceMode && m.activeRepos != nil {
-					repoKey := strings.ToLower(item.RepoPrefix)
-					if repoKey != "" && !m.activeRepos[repoKey] {
-						continue
+			fastDefaultView := (m.currentFilter == "" || m.currentFilter == "all") &&
+				m.sortMode == SortDefault &&
+				(!m.workspaceMode || m.activeRepos == nil) &&
+				len(msg.Snapshot.listModelItems) == len(msg.Snapshot.ListItems) &&
+				msg.Snapshot.BoardState != nil && msg.Snapshot.GetGraphLayout() != nil
+			if fastDefaultView {
+				m.installSnapshotListItems(msg.Snapshot)
+				if m.semanticSearch != nil {
+					m.semanticSearch.setSnapshotDocuments(msg.Snapshot.semanticIDs, msg.Snapshot.semanticDocs)
+				}
+				m.board.SetSnapshot(msg.Snapshot)
+				m.graphView.SetSnapshot(msg.Snapshot)
+				if selectedID != "" {
+					if index, ok := msg.Snapshot.listIndexByID[selectedID]; ok {
+						m.list.Select(index)
 					}
 				}
+			} else {
+				var filteredItems []list.Item
+				var filteredIssues []model.Issue
 
-				include := false
-				switch m.currentFilter {
-				case "all":
-					include = true
-				case "open":
-					include = !isClosedLikeStatus(issue.Status)
-				case "closed":
-					include = isClosedLikeStatus(issue.Status)
-				case "ready":
-					// Ready = Open/InProgress AND NO Open Blockers
-					// Exclude draft/deferred - not ready for execution
-					if !isClosedLikeStatus(issue.Status) && issue.Status != model.StatusBlocked &&
-						issue.Status != model.StatusDraft && issue.Status != model.StatusDeferred {
-						isBlocked := false
-						for _, dep := range issue.Dependencies {
-							if dep == nil || !dep.Type.IsBlocking() {
-								continue
-							}
-							if blocker, exists := m.issueMap[dep.DependsOnID]; exists && !isClosedLikeStatus(blocker.Status) {
-								isBlocked = true
-								break
-							}
-						}
-						include = !isBlocked
-					}
-				default:
-					if strings.HasPrefix(m.currentFilter, "label:") {
-						label := strings.TrimPrefix(m.currentFilter, "label:")
-						for _, l := range issue.Labels {
-							if l == label {
-								include = true
-								break
-							}
+				filteredItems = make([]list.Item, 0, len(msg.Snapshot.ListItems))
+				filteredIssues = make([]model.Issue, 0, len(msg.Snapshot.ListItems))
+
+				for _, item := range msg.Snapshot.ListItems {
+					issue := item.Issue
+
+					// Workspace repo filter (nil = all repos)
+					if m.workspaceMode && m.activeRepos != nil {
+						repoKey := strings.ToLower(item.RepoPrefix)
+						if repoKey != "" && !m.activeRepos[repoKey] {
+							continue
 						}
 					}
-				}
 
-				if include {
-					filteredItems = append(filteredItems, item)
-					filteredIssues = append(filteredIssues, issue)
-				}
-			}
+					include := false
+					switch m.currentFilter {
+					case "all":
+						include = true
+					case "open":
+						include = !isClosedLikeStatus(issue.Status)
+					case "closed":
+						include = isClosedLikeStatus(issue.Status)
+					case "ready":
+						// Ready = Open/InProgress AND NO Open Blockers
+						// Exclude draft/deferred - not ready for execution
+						if !isClosedLikeStatus(issue.Status) && issue.Status != model.StatusBlocked &&
+							issue.Status != model.StatusDraft && issue.Status != model.StatusDeferred {
+							isBlocked := false
+							for _, dep := range issue.Dependencies {
+								if dep == nil || !dep.Type.IsBlocking() {
+									continue
+								}
+								if blocker, exists := m.issueMap[dep.DependsOnID]; exists && !isClosedLikeStatus(blocker.Status) {
+									isBlocked = true
+									break
+								}
+							}
+							include = !isBlocked
+						}
+					default:
+						if strings.HasPrefix(m.currentFilter, "label:") {
+							label := strings.TrimPrefix(m.currentFilter, "label:")
+							for _, l := range issue.Labels {
+								if l == label {
+									include = true
+									break
+								}
+							}
+						}
+					}
 
-			m.sortFilteredItems(filteredItems, filteredIssues)
-			m.list.SetItems(filteredItems)
-			m.updateSemanticIDs(filteredItems)
-			if m.snapshot != nil && m.snapshot.BoardState != nil && (!m.workspaceMode || m.activeRepos == nil) && len(filteredIssues) == len(m.snapshot.Issues) {
-				m.board.SetSnapshot(m.snapshot)
-			} else {
-				m.board.SetIssues(filteredIssues)
-			}
-			if m.snapshot != nil && m.snapshot.GetGraphLayout() != nil && len(filteredIssues) == len(m.snapshot.Issues) {
-				m.graphView.SetSnapshot(m.snapshot)
-			} else {
-				ins := m.snapshot.GetInsights()
-				m.graphView.SetIssues(filteredIssues, &ins)
-			}
-
-			// Restore selection if possible
-			if selectedID != "" {
-				for i, it := range filteredItems {
-					if item, ok := it.(IssueItem); ok && item.Issue.ID == selectedID {
-						m.list.Select(i)
-						break
+					if include {
+						filteredItems = append(filteredItems, item)
+						filteredIssues = append(filteredIssues, issue)
 					}
 				}
-			}
 
-			// Keep selection in bounds
-			if len(filteredItems) > 0 && m.list.Index() >= len(filteredItems) {
-				m.list.Select(0)
+				m.sortFilteredItems(filteredItems, filteredIssues)
+				m.list.SetItems(filteredItems)
+				m.updateSemanticIDs(filteredItems)
+				if m.snapshot != nil && m.snapshot.BoardState != nil && (!m.workspaceMode || m.activeRepos == nil) && len(filteredIssues) == len(m.snapshot.Issues) {
+					m.board.SetSnapshot(m.snapshot)
+				} else {
+					m.board.SetIssues(filteredIssues)
+				}
+				if m.snapshot != nil && m.snapshot.GetGraphLayout() != nil && len(filteredIssues) == len(m.snapshot.Issues) {
+					m.graphView.SetSnapshot(m.snapshot)
+				} else {
+					ins := m.snapshot.GetInsights()
+					m.graphView.SetIssues(filteredIssues, &ins)
+				}
+
+				// Restore selection if possible
+				if selectedID != "" {
+					for i, it := range filteredItems {
+						if item, ok := it.(IssueItem); ok && item.Issue.ID == selectedID {
+							m.list.Select(i)
+							break
+						}
+					}
+				}
+
+				// Keep selection in bounds
+				if len(filteredItems) > 0 && m.list.Index() >= len(filteredItems) {
+					m.list.Select(0)
+				}
 			}
 		}
 
@@ -2841,7 +2913,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusIsError = false
 
 			if m.backgroundWorker != nil {
-				m.backgroundWorker.ForceRefresh()
+				m.backgroundWorker.HandleRefreshRequest(RefreshRequestMsg{Force: true})
 				cmds = append(cmds, WaitForBackgroundWorkerMsgCmd(m.backgroundWorker))
 				return m, tea.Batch(cmds...)
 			}
@@ -3860,7 +3932,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // handleBoardKeys handles keyboard input when the board is focused (bv-yg39)
-func (m Model) handleBoardKeys(msg tea.KeyMsg) Model {
+func (m *Model) handleBoardKeys(msg tea.KeyMsg) *Model {
 	key := msg.String()
 
 	// ═══════════════════════════════════════════════════════════════════════════
@@ -4052,7 +4124,7 @@ func (m Model) handleBoardKeys(msg tea.KeyMsg) Model {
 }
 
 // handleGraphKeys handles keyboard input when the graph view is focused
-func (m Model) handleGraphKeys(msg tea.KeyMsg) Model {
+func (m *Model) handleGraphKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
 	case "h", "left":
 		m.graphView.MoveLeft()
@@ -4095,7 +4167,7 @@ func (m Model) handleGraphKeys(msg tea.KeyMsg) Model {
 }
 
 // handleTreeKeys handles keyboard input when tree view is focused (bv-gllx)
-func (m Model) handleTreeKeys(msg tea.KeyMsg) Model {
+func (m *Model) handleTreeKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
 	case "j", "down":
 		m.tree.MoveDown()
@@ -4140,7 +4212,7 @@ func (m Model) handleTreeKeys(msg tea.KeyMsg) Model {
 }
 
 // handleActionableKeys handles keyboard input when actionable view is focused
-func (m Model) handleActionableKeys(msg tea.KeyMsg) Model {
+func (m *Model) handleActionableKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
 	case "j", "down":
 		m.actionableView.MoveDown()
@@ -4172,7 +4244,7 @@ func (m Model) handleActionableKeys(msg tea.KeyMsg) Model {
 }
 
 // handleHistoryKeys handles keyboard input when history view is focused
-func (m Model) handleHistoryKeys(msg tea.KeyMsg) Model {
+func (m *Model) handleHistoryKeys(msg tea.KeyMsg) *Model {
 	// Handle search input when active (bv-nkrj)
 	if m.historyView.IsSearchActive() {
 		switch msg.String() {
@@ -4546,7 +4618,7 @@ func openBrowserURL(url string) error {
 }
 
 // handleFlowMatrixKeys handles keyboard input when flow matrix view is focused
-func (m Model) handleFlowMatrixKeys(msg tea.KeyMsg) Model {
+func (m *Model) handleFlowMatrixKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
 	case "f", "q", "esc":
 		// If in drilldown mode, close drilldown first
@@ -4596,7 +4668,7 @@ func (m Model) handleFlowMatrixKeys(msg tea.KeyMsg) Model {
 }
 
 // handleRecipePickerKeys handles keyboard input when recipe picker is focused
-func (m Model) handleRecipePickerKeys(msg tea.KeyMsg) Model {
+func (m *Model) handleRecipePickerKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
 	case "j", "down":
 		m.recipePicker.MoveDown()
@@ -4618,7 +4690,7 @@ func (m Model) handleRecipePickerKeys(msg tea.KeyMsg) Model {
 }
 
 // handleRepoPickerKeys handles keyboard input when repo picker is focused (workspace mode).
-func (m Model) handleRepoPickerKeys(msg tea.KeyMsg) Model {
+func (m *Model) handleRepoPickerKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
 	case "j", "down":
 		m.repoPicker.MoveDown()
@@ -4658,7 +4730,7 @@ func (m Model) handleRepoPickerKeys(msg tea.KeyMsg) Model {
 }
 
 // handleLabelPickerKeys handles keyboard input when label picker is focused (bv-126)
-func (m Model) handleLabelPickerKeys(msg tea.KeyMsg) Model {
+func (m *Model) handleLabelPickerKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
 	case "esc":
 		m.showLabelPicker = false
@@ -4684,7 +4756,7 @@ func (m Model) handleLabelPickerKeys(msg tea.KeyMsg) Model {
 }
 
 // handleInsightsKeys handles keyboard input when insights panel is focused
-func (m Model) handleInsightsKeys(msg tea.KeyMsg) Model {
+func (m *Model) handleInsightsKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
 	case "esc":
 		m.focused = focusList
@@ -4736,7 +4808,7 @@ func (m Model) handleInsightsKeys(msg tea.KeyMsg) Model {
 }
 
 // handleListKeys handles keyboard input when the list is focused
-func (m Model) handleListKeys(msg tea.KeyMsg) Model {
+func (m *Model) handleListKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
 	case "enter":
 		if !m.isSplitView {
@@ -4846,7 +4918,7 @@ func (m Model) handleListKeys(msg tea.KeyMsg) Model {
 }
 
 // handleTimeTravelInputKeys handles keyboard input for the time-travel revision prompt
-func (m Model) handleTimeTravelInputKeys(msg tea.KeyMsg) Model {
+func (m *Model) handleTimeTravelInputKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
 	case "enter":
 		// Submit the revision
@@ -4919,7 +4991,7 @@ func (m Model) restoreFocusFromHelp() focus {
 }
 
 // handleHelpKeys handles keyboard input when the help overlay is focused
-func (m Model) handleHelpKeys(msg tea.KeyMsg) Model {
+func (m *Model) handleHelpKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
 	case "j", "down":
 		m.helpScroll++
@@ -4982,7 +5054,7 @@ func (m Model) renderLoadingScreen() string {
 	return lipgloss.Place(m.width, m.height-1, lipgloss.Center, lipgloss.Center, content)
 }
 
-func (m Model) View() string {
+func (m *Model) View() string {
 	if !m.ready {
 		return "Initializing..."
 	}
@@ -7065,10 +7137,11 @@ func (m *Model) applyRecipe(r *recipe.Recipe) {
 			}
 		}
 
-		// Apply actionable filter
+		// Apply actionable filter (no open blockers, not scheduler-deferred;
+		// issue #191 parity with `br ready`)
 		if include && r.Filters.Actionable != nil && *r.Filters.Actionable {
 			// Check if issue is blocked
-			isBlocked := false
+			isBlocked := issue.IsDeferredAt(time.Now())
 			for _, dep := range issue.Dependencies {
 				if dep == nil || !dep.Type.IsBlocking() {
 					continue
@@ -7438,7 +7511,7 @@ func (m Model) listChromeLines() int {
 // flow-matrix) are full-screen single panels with their own internal layout;
 // they are already focused, so a click there is treated as a no-op rather than
 // guessing at their internal geometry. The viewer stays read-only.
-func (m Model) handleLeftClick(x, y int) Model {
+func (m *Model) handleLeftClick(x, y int) *Model {
 	// Ignore clicks while any overlay/modal is up: the main list isn't drawn,
 	// so there is nothing meaningful to focus or select.
 	if m.showQuitConfirm || m.showAgentPrompt || m.showCassModal ||

@@ -306,6 +306,7 @@ func TestSQLiteReader_FallbackSchemaLoadsGraphMetadata(t *testing.T) {
 			labels TEXT,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
+			defer_until TEXT,
 			closed_at TEXT
 		);
 		CREATE TABLE dependencies (
@@ -321,8 +322,8 @@ func TestSQLiteReader_FallbackSchemaLoadsGraphMetadata(t *testing.T) {
 			text TEXT NOT NULL,
 			created_at TEXT NOT NULL
 		);
-		INSERT INTO issues (id, title, description, status, priority, issue_type, assignee, labels, created_at, updated_at)
-		VALUES ('EXP-1', 'Export issue', 'from export schema', 'open', 1, 'task', 'cc11', '["graph","sqlite"]', ?, ?);
+		INSERT INTO issues (id, title, description, status, priority, issue_type, assignee, labels, created_at, updated_at, defer_until)
+		VALUES ('EXP-1', 'Export issue', 'from export schema', 'open', 1, 'task', 'cc11', '["graph","sqlite"]', ?, ?, '2031-03-04T05:06:07Z');
 		INSERT INTO issues (id, title, description, status, priority, issue_type, assignee, labels, created_at, updated_at)
 		VALUES ('ROOT-1', 'Root issue', '', 'open', 2, 'task', '', '[]', ?, ?);
 		INSERT INTO dependencies (issue_id, depends_on_id, type)
@@ -352,6 +353,17 @@ func TestSQLiteReader_FallbackSchemaLoadsGraphMetadata(t *testing.T) {
 	}
 	if issue.Assignee != "cc11" {
 		t.Fatalf("expected assignee from fallback schema, got %q", issue.Assignee)
+	}
+	wantDefer := time.Date(2031, 3, 4, 5, 6, 7, 0, time.UTC)
+	if issue.DeferUntil == nil || !issue.DeferUntil.Equal(wantDefer) {
+		t.Fatalf("expected defer_until %v from fallback schema, got %v", wantDefer, issue.DeferUntil)
+	}
+	root, err := r.GetIssueByID("ROOT-1")
+	if err != nil {
+		t.Fatalf("GetIssueByID(ROOT-1): %v", err)
+	}
+	if root.DeferUntil != nil {
+		t.Fatalf("expected NULL defer_until to stay nil, got %v", root.DeferUntil)
 	}
 	if len(issue.Dependencies) != 1 {
 		t.Fatalf("expected one dependency from fallback schema, got %#v", issue.Dependencies)
@@ -390,6 +402,7 @@ func createContractTestSQLiteDB(t *testing.T, path string) {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			due_date DATETIME,
+			defer_until DATETIME,
 			closed_at DATETIME,
 			external_ref TEXT,
 			compaction_level INTEGER DEFAULT 0,
@@ -421,11 +434,13 @@ func createContractTestSQLiteDB(t *testing.T, path string) {
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	// CTR-1 carries a future defer_until (RFC3339 with a non-UTC offset, as
+	// br writes via to_rfc3339()); CTR-2/3 leave it NULL.
 	_, err = db.Exec(`
-		INSERT INTO issues (id, title, status, issue_type, updated_at) VALUES
-		('CTR-1', 'First issue',  'open',   'task', ?),
-		('CTR-2', 'Second issue', 'open',   'task', ?),
-		('CTR-3', 'Third issue',  'closed', 'task', ?)
+		INSERT INTO issues (id, title, status, issue_type, updated_at, defer_until) VALUES
+		('CTR-1', 'First issue',  'open',   'task', ?, '2031-03-04T01:06:07-04:00'),
+		('CTR-2', 'Second issue', 'open',   'task', ?, NULL),
+		('CTR-3', 'Third issue',  'closed', 'task', ?, NULL)
 	`, now, now, now)
 	if err != nil {
 		t.Fatal(err)

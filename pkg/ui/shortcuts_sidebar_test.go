@@ -279,7 +279,7 @@ func TestShortcutsSidebarReservesLayoutWidth(t *testing.T) {
 
 			// Toggle the sidebar on via the real `;` key path.
 			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(";")})
-			m = updated.(Model)
+			m = updated.(*Model)
 			if !m.showShortcutsSidebar {
 				t.Fatalf("`;` did not enable the shortcuts sidebar")
 			}
@@ -305,7 +305,7 @@ func TestShortcutsSidebarReservesLayoutWidth(t *testing.T) {
 
 			// Toggling off restores the full-width layout.
 			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(";")})
-			m = updated.(Model)
+			m = updated.(*Model)
 			if m.showShortcutsSidebar {
 				t.Fatalf("`;` did not disable the shortcuts sidebar")
 			}

@@ -136,24 +136,28 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 	}
 	defer reader.Close()
 
-	// sets is the live window of record-line multisets, keyed by blob OID. Each
-	// entry aliases the blob bytes it was built from, so deleting a set here frees
-	// the underlying blob for GC — the whole point of the streaming window.
-	sets := make(map[string]recordLineSet)
-	getSet := func(sha string) (recordLineSet, error) {
+	// snapshots is the live window of record-line multisets, keyed by blob OID.
+	// Each entry retains both the blob bytes its line slices alias and ordered
+	// per-record descriptors. The descriptors let the paired older snapshot reuse
+	// hashes for byte-identical prefix/suffix records without changing target-order
+	// aggregation semantics. At last-use eviction the snapshot becomes unreachable
+	// before its buffer is handed back to the reader, so live slices are never
+	// overwritten.
+	snapshots := make(map[string]recordLineSnapshot)
+	getSnapshot := func(sha string, reference *recordLineSnapshot) (recordLineSnapshot, error) {
 		if sha == "" {
-			return nil, nil
+			return recordLineSnapshot{}, nil
 		}
-		if s, ok := sets[sha]; ok {
-			return s, nil
+		if snapshot, ok := snapshots[sha]; ok {
+			return snapshot, nil
 		}
 		blob, err := reader.read(sha)
 		if err != nil {
-			return nil, err
+			return recordLineSnapshot{}, err
 		}
-		s := newRecordLineSet(blob)
-		sets[sha] = s
-		return s, nil
+		snapshot, _ := buildRecordLineSnapshot(blob, reference, hashRecordLine)
+		snapshots[sha] = snapshot
+		return snapshot, nil
 	}
 
 	// Compute the uncached commits' contributions in git-log order, evicting each
@@ -163,16 +167,20 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 			continue // served from cache
 		}
 		c := commits[i]
-		newSet, err := getSet(c.newSHA)
+		newSnapshot, err := getSnapshot(c.newSHA, nil)
 		if err != nil {
 			return nil, err
 		}
-		oldSet, err := getSet(c.oldSHA)
+		// Git log is newest-first, so a commit's new snapshot is normally already
+		// live as the previous iteration's old boundary. Build the paired older
+		// target against those actual live bytes; when no usable reference exists,
+		// buildRecordLineSnapshot hashes the entire target.
+		oldSnapshot, err := getSnapshot(c.oldSHA, &newSnapshot)
 		if err != nil {
 			return nil, err
 		}
 		var evs []BeadEvent
-		diffText := synthesizeRecordDiff(oldSet, newSet)
+		diffText := synthesizeRecordDiff(oldSnapshot.lines, newSnapshot.lines)
 		if len(diffText) > 0 {
 			evs = e.parseDiff(diffText, c.info, opts.BeadID)
 		}
@@ -192,9 +200,10 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 		// never be needed again (lastUse indices are all uncached-commit indices,
 		// so this iteration is the last chance to free them), and its bytes — plus
 		// the record-line set aliasing them — are released now rather than at end.
-		for sha := range sets {
+		for sha, live := range snapshots {
 			if lastUse[sha] <= i {
-				delete(sets, sha)
+				delete(snapshots, sha)
+				reader.recycle(live.blob)
 			}
 		}
 	}
@@ -476,11 +485,24 @@ func (e *Extractor) readBlobs(ids []string) (map[string][]byte, error) {
 // no writer/reader deadlock of the kind readBlobs' concurrent-writer path guards
 // against.
 type blobReader struct {
-	cmd   *exec.Cmd
-	stdin io.WriteCloser
-	w     *bufio.Writer
-	out   *bufio.Reader
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	w           *bufio.Writer
+	out         *bufio.Reader
+	spare       []byte
+	arenaRunway int
 }
+
+const (
+	// blobReaderBufferSize is deliberately small enough that large blob payloads
+	// bypass bufio.Reader's transport buffer and read directly into their owned
+	// arena. The capacity removed from the old 10 MiB transport buffer is moved,
+	// byte-for-byte, to the first valid payload arena below. That preserves the
+	// heap-goal runway which reduced GC frequency while avoiding an extra copy of
+	// each multi-megabyte blob through bufio's buffer.
+	blobReaderBufferSize  = 64 * 1024
+	blobReaderArenaRunway = gitLogMaxScanTokenSize - blobReaderBufferSize
+)
 
 // newBlobReader starts the streaming cat-file process for the extractor's repo.
 func (e *Extractor) newBlobReader() (*blobReader, error) {
@@ -498,10 +520,11 @@ func (e *Extractor) newBlobReader() (*blobReader, error) {
 		return nil, fmt.Errorf("starting git cat-file: %w", err)
 	}
 	return &blobReader{
-		cmd:   cmd,
-		stdin: stdin,
-		w:     bufio.NewWriter(stdin),
-		out:   bufio.NewReaderSize(stdout, gitLogMaxScanTokenSize),
+		cmd:         cmd,
+		stdin:       stdin,
+		w:           bufio.NewWriter(stdin),
+		out:         bufio.NewReaderSize(stdout, blobReaderBufferSize),
+		arenaRunway: blobReaderArenaRunway,
 	}, nil
 }
 
@@ -532,7 +555,23 @@ func (b *blobReader) read(sha string) ([]byte, error) {
 	if _, err := fmt.Sscanf(parts[2], "%d", &size); err != nil {
 		return nil, fmt.Errorf("parsing cat-file size %q: %w", parts[2], err)
 	}
-	content := make([]byte, size)
+	// A missing response returns above without consuming arenaRunway. Move the
+	// capacity removed from the transport buffer to exactly the first real blob
+	// allocation; that arena then remains in the existing one-spare recycle
+	// lifecycle. Limiting the full-slice capacity also makes the byte-for-byte
+	// capacity invariant explicit when a sufficiently large spare is supplied.
+	runway := b.arenaRunway
+	capacity := size + runway
+	content := b.spare
+	b.spare = nil
+	if cap(content) < capacity {
+		content = make([]byte, size, capacity)
+	} else if runway > 0 {
+		content = content[:size:capacity]
+	} else {
+		content = content[:size]
+	}
+	b.arenaRunway = 0
 	if _, err := readFull(b.out, content); err != nil {
 		return nil, fmt.Errorf("reading cat-file content for %q: %w", sha, err)
 	}
@@ -541,6 +580,16 @@ func (b *blobReader) read(sha string) ([]byte, error) {
 		return nil, fmt.Errorf("discarding cat-file trailer for %q: %w", sha, err)
 	}
 	return content, nil
+}
+
+// recycle retains at most one no-longer-live blob buffer for the next read.
+// Callers must first remove every recordLineSet whose entries alias content.
+// Keeping only the largest returned capacity bounds idle retained memory to one
+// blob while avoiding allocation and zeroing for the usual rewrite history.
+func (b *blobReader) recycle(content []byte) {
+	if cap(content) > cap(b.spare) {
+		b.spare = content[:0]
+	}
 }
 
 // Close flushes and closes stdin (signalling EOF to git) then waits for exit. It
@@ -577,6 +626,42 @@ func readFull(r *bufio.Reader, buf []byte) (int, error) {
 // compared). It is never persisted, so cross-process determinism is unnecessary.
 var recordLineSetSeed = maphash.MakeSeed()
 
+// hashRecordLine is the production record-line hasher. Passing the hasher into
+// buildRecordLineSnapshot gives tests a deterministic collision seam without a
+// mutable package-global hook.
+func hashRecordLine(line []byte) uint64 {
+	return maphash.Bytes(recordLineSetSeed, line)
+}
+
+// recordLineDescriptor locates one eligible JSON record in its owning blob and
+// carries the digest used by recordLineSet. start:end excludes the line-feed but
+// deliberately includes a preceding carriage return, matching the old scanner.
+type recordLineDescriptor struct {
+	start int
+	end   int
+	hash  uint64
+}
+
+// recordLineSnapshot is the complete live index for one blob. Both entry text
+// and descriptors refer only to blob. indexed distinguishes a valid empty index
+// from a cache/reference hole, for which frontier reuse must fall back to full
+// hashing.
+type recordLineSnapshot struct {
+	lines   recordLineSet
+	records []recordLineDescriptor
+	blob    []byte
+	indexed bool
+}
+
+// recordLineBuildStats makes the frontier's work directly observable in tests
+// and benchmarks without affecting production decisions.
+type recordLineBuildStats struct {
+	hashedRecords int
+	hashedBytes   int
+	reusedRecords int
+	reusedBytes   int
+}
+
 // recordLineEntry is one entry of a recordLineSet: how many times the record line
 // occurs in the blob, plus a representative copy of the line bytes (needed to emit
 // the synthesized diff for changed records).
@@ -597,28 +682,107 @@ type recordLineSet map[uint64]*recordLineEntry
 // lines beginning with '{'. The returned entries alias into blob, which the
 // caller retains for the duration of the extraction.
 func newRecordLineSet(blob []byte) recordLineSet {
-	set := make(recordLineSet)
-	for len(blob) > 0 {
-		nl := bytes.IndexByte(blob, '\n')
-		var line []byte
-		if nl < 0 {
-			line = blob
-			blob = nil
-		} else {
-			line = blob[:nl]
-			blob = blob[nl+1:]
+	snapshot, _ := buildRecordLineSnapshot(blob, nil, hashRecordLine)
+	return snapshot.lines
+}
+
+// buildRecordLineSnapshot indexes target. When reference is a complete live
+// index, byte-identical record prefixes and suffixes reuse its per-record hashes;
+// the unmatched middle is hashed normally. Prefix and suffix never overlap in
+// either side. Missing, stale, or incomplete references take the full-hash path.
+//
+// Hash reuse is only an indexing shortcut. Every target descriptor is aggregated
+// afterward in target order, and every representative aliases target, so even a
+// deliberately colliding hasher produces exactly the same counts and first
+// representative as a full target build.
+func buildRecordLineSnapshot(
+	target []byte,
+	reference *recordLineSnapshot,
+	hashLine func([]byte) uint64,
+) (recordLineSnapshot, recordLineBuildStats) {
+	records := scanRecordLineDescriptors(target)
+	stats := recordLineBuildStats{}
+
+	prefix := 0
+	suffix := 0
+	if reference != nil && reference.indexed && reference.blob != nil {
+		limit := min(len(records), len(reference.records))
+		for prefix < limit {
+			targetRecord := records[prefix]
+			referenceRecord := reference.records[prefix]
+			targetLine := target[targetRecord.start:targetRecord.end]
+			referenceLine := reference.blob[referenceRecord.start:referenceRecord.end]
+			if !bytes.Equal(targetLine, referenceLine) {
+				break
+			}
+			records[prefix].hash = referenceRecord.hash
+			stats.reusedRecords++
+			stats.reusedBytes += len(targetLine)
+			prefix++
 		}
-		if len(line) == 0 || line[0] != '{' {
-			continue
-		}
-		h := maphash.Bytes(recordLineSetSeed, line)
-		if e, ok := set[h]; ok {
-			e.count++
-		} else {
-			set[h] = &recordLineEntry{count: 1, text: line}
+		for suffix < limit-prefix {
+			targetIndex := len(records) - 1 - suffix
+			referenceIndex := len(reference.records) - 1 - suffix
+			targetRecord := records[targetIndex]
+			referenceRecord := reference.records[referenceIndex]
+			targetLine := target[targetRecord.start:targetRecord.end]
+			referenceLine := reference.blob[referenceRecord.start:referenceRecord.end]
+			if !bytes.Equal(targetLine, referenceLine) {
+				break
+			}
+			records[targetIndex].hash = referenceRecord.hash
+			stats.reusedRecords++
+			stats.reusedBytes += len(targetLine)
+			suffix++
 		}
 	}
-	return set
+
+	for i := prefix; i < len(records)-suffix; i++ {
+		record := records[i]
+		line := target[record.start:record.end]
+		records[i].hash = hashLine(line)
+		stats.hashedRecords++
+		stats.hashedBytes += len(line)
+	}
+
+	set := make(recordLineSet, len(records))
+	for _, record := range records {
+		line := target[record.start:record.end]
+		if entry, ok := set[record.hash]; ok {
+			entry.count++
+		} else {
+			set[record.hash] = &recordLineEntry{count: 1, text: line}
+		}
+	}
+
+	return recordLineSnapshot{
+		lines:   set,
+		records: records,
+		blob:    target,
+		indexed: true,
+	}, stats
+}
+
+// scanRecordLineDescriptors records only lines whose first byte is '{'. A final
+// record without a line-feed is included; empty and non-record lines do not
+// consume a record ordinal, which is what makes prefix/suffix comparison match
+// the recordLineSet semantics rather than physical line numbers.
+func scanRecordLineDescriptors(blob []byte) []recordLineDescriptor {
+	var records []recordLineDescriptor
+	for start := 0; start < len(blob); {
+		relativeNewline := bytes.IndexByte(blob[start:], '\n')
+		end := len(blob)
+		next := len(blob)
+		if relativeNewline >= 0 {
+			end = start + relativeNewline
+			next = end + 1
+		}
+		if end > start && blob[start] == '{' {
+			records = append(records, recordLineDescriptor{start: start, end: end})
+		}
+		start = next
+	}
+	return records
 }
 
 // synthesizeRecordDiff produces the same `+{...}`/`-{...}` record lines that

@@ -36,6 +36,11 @@ func TestContainsBlurb(t *testing.T) {
 			content:  "# My AGENTS.md\n\n<!-- bv-agent-instructions-v3 -->\nSome content\n<!-- end-bv-agent-instructions -->",
 			expected: true,
 		},
+		{
+			name:     "has blurb v4",
+			content:  "# My AGENTS.md\n\n<!-- bv-agent-instructions-v4 -->\nSome content\n<!-- end-bv-agent-instructions -->",
+			expected: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -73,6 +78,11 @@ func TestGetBlurbVersion(t *testing.T) {
 			name:     "version 3",
 			content:  "<!-- bv-agent-instructions-v3 -->",
 			expected: 3,
+		},
+		{
+			name:     "version 4",
+			content:  "<!-- bv-agent-instructions-v4 -->",
+			expected: 4,
 		},
 		{
 			name:     "version 10 (multi-digit)",
@@ -206,8 +216,8 @@ func TestRemoveBlurbNoBlurb(t *testing.T) {
 }
 
 func TestUpdateBlurb(t *testing.T) {
-	// Start with content containing old blurb
-	oldContent := "# My AGENTS.md\n\n<!-- bv-agent-instructions-v1 -->\nOld blurb content\n<!-- end-bv-agent-instructions -->\n"
+	// Start with the previous br-only blurb version.
+	oldContent := "# My AGENTS.md\n\n<!-- bv-agent-instructions-v3 -->\nOld br-only blurb content\n<!-- end-bv-agent-instructions -->\n"
 	result := UpdateBlurb(oldContent)
 
 	// Should have exactly one blurb
@@ -219,6 +229,12 @@ func TestUpdateBlurb(t *testing.T) {
 	// Should have current blurb content
 	if !strings.Contains(result, "br ready --json") {
 		t.Error("UpdateBlurb() result missing current blurb content")
+	}
+	if !strings.Contains(result, "bd update <id> --claim --json") {
+		t.Error("UpdateBlurb() result missing Go bd workflow content")
+	}
+	if strings.Contains(result, "bv-agent-instructions-v3") {
+		t.Error("UpdateBlurb() retained the obsolete v3 marker")
 	}
 
 	// Should preserve header
@@ -240,8 +256,13 @@ func TestNeedsUpdate(t *testing.T) {
 		},
 		{
 			name:     "current version",
+			content:  "<!-- bv-agent-instructions-v4 -->",
+			expected: false, // v4 is current, no update needed
+		},
+		{
+			name:     "old v3 needs update",
 			content:  "<!-- bv-agent-instructions-v3 -->",
-			expected: false, // v3 is current, no update needed
+			expected: true, // v3 lacks Go bd command guidance
 		},
 		{
 			name:     "old v2 needs update",
@@ -251,7 +272,7 @@ func TestNeedsUpdate(t *testing.T) {
 		{
 			name:     "old v1 needs update",
 			content:  "<!-- bv-agent-instructions-v1 -->",
-			expected: true, // v1 is old, needs update to v3
+			expected: true, // v1 is old, needs update to v4
 		},
 	}
 
@@ -266,7 +287,7 @@ func TestNeedsUpdate(t *testing.T) {
 }
 
 func TestAgentBlurbContent(t *testing.T) {
-	// Verify blurb contains essential br AND bv commands
+	// Verify blurb contains essential bd, br, and bv commands.
 	essentials := []string{
 		"br ready --json",
 		"br list --status=open --json",
@@ -276,6 +297,13 @@ func TestAgentBlurbContent(t *testing.T) {
 		"br close <id> --reason=\"Completed\" --json",
 		"br sync",
 		"br dep add",
+		"bd ready --json",
+		"bd show <id> --json",
+		"bd create",
+		"bd update <id> --claim --json",
+		"bd close <id> --json",
+		"bd dep add",
+		"bd export --no-memories -o .beads/beads.jsonl",
 		"bv --robot-triage",
 		"bv --robot-next",
 		"bv --robot-plan",
@@ -312,12 +340,13 @@ func TestAgentBlurbContent(t *testing.T) {
 
 	required := []string{
 		".beads/issues.jsonl",
-		"legacy workspaces may use `.beads/beads.jsonl`",
-		"Follow this repository's own git instructions",
+		"legacy `.beads/beads.jsonl`",
+		"Do not run both trackers against the same workspace",
+		"Follow this repository's own git and tracker instructions",
 	}
 	for _, text := range required {
 		if !strings.Contains(AgentBlurb, text) {
-			t.Errorf("AgentBlurb missing required v3 guidance: %q", text)
+			t.Errorf("AgentBlurb missing required v4 guidance: %q", text)
 		}
 	}
 }
@@ -546,7 +575,7 @@ func TestNeedsUpdateLegacy(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:     "current blurb v3 no update",
+			name:     "current blurb v4 no update",
 			content:  "# AGENTS.md\n\n" + AgentBlurb,
 			expected: false,
 		},

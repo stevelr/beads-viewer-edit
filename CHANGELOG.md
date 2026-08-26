@@ -2,9 +2,204 @@
 
 All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first. Each entry links to the tagged commit on GitHub. Where a version was published as a GitHub Release (with binaries), it is marked accordingly; tag-only versions are noted as such.
 
+Scope window: this update reconstructs `v0.21.0` through `v0.21.2`; the earlier version history is
+retained below.
+
+## Release Timeline
+
+| Version | Date | Publication | Orientation |
+|---|---|---|---|
+| [`v0.22.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.22.0) | 2026-08-25 | GitHub Release | Makes snapshot delivery pointer-based and incrementally rebuilds safe list changes, with measured UI latency and allocation reductions. |
+| [`v0.21.2`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.21.2) | 2026-08-24 | GitHub Release | Publishes the 50-pass performance campaign, verified binaries, checksums, SBOM, and corrected Nix guidance. |
+| [`v0.21.1`](https://github.com/Dicklesworthstone/beads_viewer/tree/v0.21.1) | 2026-08-24 | Tag only | Staged the performance and license work; superseded before binary publication. |
+| [`v0.21.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.21.0) | 2026-08-23 | GitHub Release | Strict robot-count semantics, bounded history liveness, theme selection, and cache-path repairs. |
+
 ---
 
 ## [Unreleased]
+
+---
+
+## [v0.22.0] -- 2026-08-25 (Release)
+
+This release finishes the responsive-snapshot workstream: Bubble Tea now keeps the large UI model
+behind a pointer, snapshot installation reuses model-owned buffers, and small content-only changes
+rebuild only the affected list items. The fast path is guarded by deterministic fingerprints and
+falls back to a full rebuild whenever graph topology, recipe membership, sort order, or more than
+20% of issues changes.
+
+### Delivered capability: Faster UI Updates
+
+- **Stop copying the entire model on every message.** The TUI model and its hot navigation helpers
+  now use pointer receivers, eliminating the roughly 198 KB interface-boxing copy that previously
+  accompanied each `Update`. On the 1,000-issue snapshot-swap benchmark, the measured handler moved
+  from **105-225 us** before this work to **4.076-4.284 us**, a **24.5x-55.2x latency reduction**;
+  bytes per operation fell by about **99.8%**. See
+  [`96029793`](https://github.com/Dicklesworthstone/beads_viewer/commit/96029793) and
+  [`1a90b016`](https://github.com/Dicklesworthstone/beads_viewer/commit/1a90b016).
+- **Keep interactive latency inside the frame budget.** Five update-only keypress runs measured
+  p99 at **148-160 us**. Three isolated update-plus-render runs measured p99 at
+  **33.05-35.54 ms**, below the 50 ms interaction target. Isolated GC validation measured maximum
+  pauses of **0.879-1.374 ms**. The benchmarks live with the code in
+  [`5aac8532`](https://github.com/Dicklesworthstone/beads_viewer/commit/5aac8532) and the broader
+  regression coverage in [`d5a1be08`](https://github.com/Dicklesworthstone/beads_viewer/commit/d5a1be08).
+- **Precompute immutable view inputs off the UI loop.** Snapshots now carry list-model items,
+  semantic-search documents, alert summaries, graph data, and stable ID/order indexes so delivery
+  does not reconstruct these structures during rendering. See
+  [`b24297fc`](https://github.com/Dicklesworthstone/beads_viewer/commit/b24297fc).
+
+### Delivered capability: Correct Incremental List Rebuilds
+
+- **Detect changes deterministically.** Issue fingerprints distinguish nil from present zero-value
+  fields, ignore nil dependency entries, canonically order tied comments, and classify simultaneous
+  content and dependency changes exactly once. See
+  [`16ed4342`](https://github.com/Dicklesworthstone/beads_viewer/commit/16ed4342).
+- **Reuse unchanged work only when it is safe.** A change at or below the 20% threshold uses the
+  incremental list path only when recipe identity, membership, order, and dependency topology are
+  unchanged. Additions, removals, dependency edits, recipe changes, reordered results, and larger
+  diffs automatically take the full path. Incremental and full results are compared directly in
+  tests, including recipe and topology fallbacks.
+- **Measured result:** on an AMD EPYC-Milan worker, five paired 1,000-item runs reduced one-change
+  list construction from **374.9-412.4 us** to **189.1-212.6 us** (**1.76x-2.18x faster**).
+  Allocations fell from **1,001 to 2 per operation** (**99.8% fewer**). The remaining approximately
+  516 KB/op is the immutable output slice itself and is not claimed as eliminated.
+
+### Reliability, Integration, and Operator Improvements
+
+- Make background-worker cancellation and recovery ownership thread-safe, with lifecycle and idle-GC
+  coverage in [`2a2ec14e`](https://github.com/Dicklesworthstone/beads_viewer/commit/2a2ec14e) and
+  [`3e6473bb`](https://github.com/Dicklesworthstone/beads_viewer/commit/3e6473bb).
+- Copy interactive graph node descriptions without mutating Beads, including clipboard fallbacks
+  for offline dashboards ([`f2e6c9da`](https://github.com/Dicklesworthstone/beads_viewer/commit/f2e6c9da)).
+- Generate tracker-neutral v4 agent guidance with current `bd` and `br` command families, backed by
+  integration coverage ([`b9ae1472`](https://github.com/Dicklesworthstone/beads_viewer/commit/b9ae1472)).
+- Keep fallback and Nix version sources aligned through a release invariant test
+  ([`70adf7f8`](https://github.com/Dicklesworthstone/beads_viewer/commit/70adf7f8)).
+
+### Verification Boundary
+
+- Passed `go build ./...`, `go vet ./...`, the complete analysis package, focused incremental race
+  tests (three repetitions), and all non-environment-sensitive packages through RCH.
+- The RCH environment runs as root, rewrites the working directory, and lacks usable VCS metadata;
+  seven permission/cwd/timing tests were therefore excluded from the aggregate remote run after
+  their failure modes were reproduced and classified. The E2E package passed separately with
+  `GOFLAGS=-buildvcs=false` propagated into its nested build.
+
+### Added
+
+- **Copy graph node descriptions without mutating Beads.** The exported interactive graph's
+  right-click menu can now copy either a node ID or its raw description. Both actions share a
+  clipboard fallback for local/offline dashboards and report empty descriptions or copy failures
+  instead of silently doing nothing.
+- **Generate correct agent guidance for both Beads trackers.** `bv --agents-add` now installs a
+  tracker-neutral v4 blurb with separate, current `bd` and `br` command families, rather than
+  telling Go Beads workspaces to mutate their tracker with `br`.
+
+---
+
+## [v0.21.2] -- 2026-08-24 (Release)
+
+Published release: [GitHub Release v0.21.2](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.21.2).
+This release publishes the profile-driven work staged under the tag-only `v0.21.1`, plus the
+final Nix packaging correction. The campaign completed all 50 requested iterations, but credits
+only improvements that survived command-level measurement, output-equivalence checks, focused
+causal tests, and the full Go verification suite.
+
+### Delivered capability: Faster Cold Robot Triage
+
+- **Profile the real bottleneck first.** On the pinned 540-issue / 19-open Git fixture, history
+  correlation accounted for 62.26% of command CPU and snapshot extraction for 58.49%. Within that
+  path, profiles attributed roughly 100 ms to large allocations, 70 ms to clearing memory, and
+  70 ms to background garbage collection. This ruled out speculative graph and JSON tuning as the
+  first lever.
+- **Recycle a blob only after its last reader is gone.** Snapshot record sets contain slices that
+  point directly into their Git blob buffer, so reusing a live buffer would silently corrupt
+  history. The extractor already knew each blob's last use. Commit
+  [`22305d12`](https://github.com/Dicklesworthstone/beads_viewer/commit/22305d1208d2d17671f34beb480b68489fcb4a1c)
+  made that lifetime explicit: evict the record set first, then place its backing buffer in a
+  one-slot, largest-capacity spare owned by the streaming `git cat-file --batch` reader. The next
+  blob re-slices that storage when it fits instead of allocating and zeroing another large byte
+  array. Only one spare is retained, so reuse stays bounded rather than becoming a memory cache.
+- **Preserve the algorithm, remove allocation churn.** Git object order, the one-response-at-a-time
+  protocol, line identity, event ordering, and the existing two-to-three-snapshot live window from
+  [#182](https://github.com/Dicklesworthstone/beads_viewer/issues/182) did not change. Four-snapshot
+  lifetime tests prove that two live blobs never alias and that only an
+  explicitly recycled buffer is reused. A real-history differential reproduced all 1,776 legacy
+  events, and 20 independently normalized robot outputs were identical at SHA-256
+  `5992ff99901b1c5abf8ccf3b1a9e3d2490a6f0eda1742cad938e7b3ff9809918`.
+- **Measured result:** ten independent low-load, interleaved cold-cache pairs reduced mean user CPU
+  from **0.647 s to 0.573 s (11.44%)**, with 10/10 wins and exact sign `p=0.00098`. Five traced
+  pairs reduced mean GC cycles from **25.8 to 13.0 (49.61%)**. Wall time improved 2.26% but missed
+  significance (`p=0.0547`), while peak RSS increased 0.177%; therefore this release claims lower
+  CPU and GC work, **not** lower wall latency or memory usage.
+
+### Delivered capability: Reused Graph Analysis
+
+- **What-if batches:** [`4b685960`](https://github.com/Dicklesworthstone/beads_viewer/commit/4b685960)
+  added a stats-consuming path so `--robot-insights` can pass the completed `GraphStats` it already
+  owns. Previously a planted 540-issue batch performed 540 redundant analysis-cache decodes through
+  `TopWhatIfDeltas -> computeWhatIfDelta -> Analyze`. The focused same-worker benchmark moved from
+  **4.4108 s / 1.648 GB / 8,530,586 allocations** to **3.203–16.564 ms / 1.444–4.931 MB /
+  8,504–26,341 allocations**. This is a scoped batch benchmark, not a whole-command latency claim.
+- **Cycle-break insights:** [`5b73a6b6`](https://github.com/Dicklesworthstone/beads_viewer/commit/5b73a6b6)
+  routes the handler's completed statistics into advanced-insight generation instead of launching
+  another analysis merely to recover the same cycle list. Sentinel-cycle tests prove the supplied
+  statistics control the result, while nil callers retain the ordinary analyze-on-demand fallback.
+- **Direct dependency decoding:** [`a83bf01c`](https://github.com/Dicklesworthstone/beads_viewer/commit/a83bf01c)
+  reduced a direct-loader benchmark by 13.00% and allocations by 33.63% while replaying malformed
+  and invalid-UTF-8 inputs through the standard library for exact behavior. It did not improve the
+  dominant cold-correlation command path, so it is not included in the 11.44% release claim.
+
+### Closed workstreams: Measurement and Negative Evidence
+
+- Fixed registry-backed CPU-profile shutdown in
+  [`854a8070`](https://github.com/Dicklesworthstone/beads_viewer/commit/854a8070) and
+  [`0a0838ec`](https://github.com/Dicklesworthstone/beads_viewer/commit/0a0838ec), ensuring profiling
+  completes before robot dispatch exits instead of leaving zero-byte or truncated profiles.
+- Ran 50 bounded optimization passes. PGO, `GOAMD64=v3`, fixed GC pacing, smaller transport
+  buffers, direct event fusion, prefetch windows, alternate record tables, and other promising
+  candidates were rejected when end-to-end confidence intervals crossed zero, system CPU or tails
+  regressed, memory worsened, or the active profile placed too little cost in the proposed seam.
+  These results and retry conditions remain in the pinned
+  [hotspot table](https://github.com/Dicklesworthstone/beads_viewer/blob/v0.21.2/tests/artifacts/perf/HOTSPOT_TABLE.md)
+  and [negative-evidence ledger](https://github.com/Dicklesworthstone/beads_viewer/blob/v0.21.2/tests/artifacts/perf/HYPOTHESIS_LEDGER.md).
+- Retained snapshot frontier/allocation refinements have differential coverage, but no additional
+  release-wide percentage is assigned to them. The only accepted cold-triage result from this
+  campaign is buffer reuse's 11.44% user-CPU and 49.61% GC-cycle reduction.
+
+### Representative commits
+
+- [`22305d12`](https://github.com/Dicklesworthstone/beads_viewer/commit/22305d1208d2d17671f34beb480b68489fcb4a1c)
+  — recycle evicted Git blob buffers on the measured cold-correlation path.
+- [`4b685960`](https://github.com/Dicklesworthstone/beads_viewer/commit/4b685960) — consume
+  completed graph statistics across what-if batches.
+- [`5b73a6b6`](https://github.com/Dicklesworthstone/beads_viewer/commit/5b73a6b6) — reuse
+  completed cycle data in advanced insights.
+- [`854a8070`](https://github.com/Dicklesworthstone/beads_viewer/commit/854a8070) and
+  [`0a0838ec`](https://github.com/Dicklesworthstone/beads_viewer/commit/0a0838ec) — make robot
+  CPU profiles complete and trustworthy.
+
+### Fixed and Packaged
+
+- Document the explicit Nix unfree-package opt-in required by the project's OpenAI/Anthropic
+  license rider, keeping the published flake instructions consistent with its corrected nonfree
+  metadata.
+- Publish five platform archives with individual SHA-256 sidecars, aggregate checksums, an SPDX
+  SBOM, and the DSR build manifest. Publicly downloaded macOS and Windows binaries reported
+  `bv v0.21.2`; the Go module proxy resolved `v0.21.2` to the tagged source commit.
+
+---
+
+## [v0.21.1] -- 2026-08-24 (Tag only)
+
+Staging tag only; no GitHub Release or binary assets were published for `v0.21.1`. Its performance,
+profiling, differential-test, and license-metadata changes were published immediately afterward as
+the `v0.21.2` release and are documented above. The version bump was necessary because the
+`v0.21.1` tag was already immutable when the final Nix usage correction landed.
+
+---
+
+## [v0.21.0] -- 2026-08-23 (Release)
 
 ### Changed — **BREAKING (robot JSON semantics)**
 
@@ -896,7 +1091,11 @@ Initial release of Beads Viewer -- a keyboard-driven terminal interface for the 
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.22.0...HEAD
+[v0.22.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.21.2...v0.22.0
+[v0.21.2]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.21.1...v0.21.2
+[v0.21.1]: https://github.com/Dicklesworthstone/beads_viewer/tree/v0.21.1
+[v0.21.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.20.0...v0.21.0
 [v0.17.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.16.4...v0.17.0
 [v0.16.2]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.16.1...v0.16.2
 [v0.16.1]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.16.0...v0.16.1

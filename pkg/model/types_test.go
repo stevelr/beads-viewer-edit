@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -260,6 +261,106 @@ func TestDependency_UnmarshalJSON_TargetAliases(t *testing.T) {
 			}
 			if dep.Type != DepBlocks {
 				t.Fatalf("Type = %q, want %q", dep.Type, DepBlocks)
+			}
+		})
+	}
+}
+
+// unmarshalDependencyStd is the exact pre-optimization implementation. Keep it
+// in the test as an executable specification: Dependency.UnmarshalJSON may use
+// a faster valid-input decoder, but its values, error behavior, and receiver
+// atomicity must remain indistinguishable from encoding/json.
+func unmarshalDependencyStd(data []byte, d *Dependency) error {
+	type rawDependency struct {
+		IssueID     string         `json:"issue_id"`
+		DependsOnID string         `json:"depends_on_id"`
+		DependsOn   string         `json:"depends_on"`
+		TargetID    string         `json:"target_id"`
+		Type        DependencyType `json:"type"`
+		CreatedAt   time.Time      `json:"created_at"`
+		CreatedBy   string         `json:"created_by"`
+	}
+	var raw rawDependency
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	d.IssueID = raw.IssueID
+	d.DependsOnID = raw.DependsOnID
+	if d.DependsOnID == "" {
+		d.DependsOnID = raw.DependsOn
+	}
+	if d.DependsOnID == "" {
+		d.DependsOnID = raw.TargetID
+	}
+	d.Type = raw.Type
+	d.CreatedAt = raw.CreatedAt
+	d.CreatedBy = raw.CreatedBy
+	return nil
+}
+
+func TestDependency_UnmarshalJSON_MatchesStandardLibrary(t *testing.T) {
+	invalidUTF8 := append(
+		[]byte(`{"issue_id":"`),
+		append([]byte{0xff}, []byte(`","depends_on_id":"B"}`)...)...,
+	)
+	cases := []struct {
+		name string
+		data []byte
+	}{
+		{name: "canonical full", data: []byte(`{"issue_id":"A","depends_on_id":"B","type":"blocks","created_at":"2026-08-24T12:34:56.123456789-04:00","created_by":"agent"}`)},
+		{name: "legacy depends_on", data: []byte(`{"issue_id":"A","depends_on":"C","type":"related"}`)},
+		{name: "legacy target_id", data: []byte(`{"issue_id":"A","target_id":"D","type":"parent-child"}`)},
+		{name: "canonical wins aliases", data: []byte(`{"depends_on_id":"B","depends_on":"C","target_id":"D"}`)},
+		{name: "empty canonical falls through", data: []byte(`{"depends_on_id":"","depends_on":"C","target_id":"D"}`)},
+		{name: "empty canonical and legacy fall through", data: []byte(`{"depends_on_id":"","depends_on":"","target_id":"D"}`)},
+		{name: "duplicate canonical last wins", data: []byte(`{"depends_on_id":"first","depends_on_id":"last"}`)},
+		{name: "case folded duplicate last wins", data: []byte(`{"depends_on_id":"exact","DEPENDS_ON_ID":"folded"}`)},
+		{name: "case folded then exact last wins", data: []byte(`{"DEPENDS_ON_ID":"folded","depends_on_id":"exact"}`)},
+		{name: "escaped key", data: []byte(`{"\u0069ssue_id":"escaped","depends_on_id":"B"}`)},
+		{name: "unknown fields", data: []byte(`{"issue_id":"A","depends_on_id":"B","unknown":{"nested":[1,true,null]},"other":"ignored"}`)},
+		{name: "missing fields", data: []byte(`{}`)},
+		{name: "explicit null fields", data: []byte(`{"issue_id":null,"depends_on_id":null,"type":null,"created_at":null}`)},
+		{name: "top level null", data: []byte(`null`)},
+		{name: "surrogate replacement", data: []byte(`{"issue_id":"\ud800","depends_on_id":"B"}`)},
+		{name: "unicode", data: []byte(`{"issue_id":"café-東京","depends_on_id":"β"}`)},
+		{name: "surrounding whitespace", data: []byte(" \n\t{\"issue_id\":\"A\",\"depends_on_id\":\"B\"}\r\n")},
+		{name: "wrong issue id type", data: []byte(`{"issue_id":7,"depends_on_id":"B"}`)},
+		{name: "wrong dependency type", data: []byte(`{"depends_on_id":{"id":"B"}}`)},
+		{name: "wrong alias type", data: []byte(`{"depends_on":false}`)},
+		{name: "invalid timestamp", data: []byte(`{"created_at":"not-a-time"}`)},
+		{name: "numeric timestamp", data: []byte(`{"created_at":123}`)},
+		{name: "duplicate later type error", data: []byte(`{"issue_id":"A","issue_id":9}`)},
+		{name: "top level array", data: []byte(`[]`)},
+		{name: "top level string", data: []byte(`"dependency"`)},
+		{name: "malformed object", data: []byte(`{"issue_id":"A"`)},
+		{name: "malformed unknown field", data: []byte(`{"unknown":{"nested":]}`)},
+		{name: "trailing junk", data: []byte(`{"issue_id":"A"} trailing`)},
+		{name: "invalid utf8", data: invalidUTF8},
+	}
+
+	seed := Dependency{
+		IssueID:     "seed-issue",
+		DependsOnID: "seed-target",
+		Type:        DepDiscoveredFrom,
+		CreatedAt:   time.Date(2001, time.February, 3, 4, 5, 6, 7, time.UTC),
+		CreatedBy:   "seed-author",
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := seed
+			want := seed
+			gotErr := got.UnmarshalJSON(tc.data)
+			wantErr := unmarshalDependencyStd(tc.data, &want)
+
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("receiver mismatch:\n candidate=%#v\n stdlib=%#v", got, want)
+			}
+			if (gotErr == nil) != (wantErr == nil) {
+				t.Fatalf("error presence mismatch: candidate=%v stdlib=%v", gotErr, wantErr)
+			}
+			if gotErr != nil && (reflect.TypeOf(gotErr) != reflect.TypeOf(wantErr) || gotErr.Error() != wantErr.Error()) {
+				t.Fatalf("error mismatch:\n candidate=(%T) %q\n stdlib=(%T) %q", gotErr, gotErr.Error(), wantErr, wantErr.Error())
 			}
 		})
 	}

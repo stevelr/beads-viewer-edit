@@ -1396,7 +1396,7 @@ func TestTriageGroupByTrack_SingleTrack(t *testing.T) {
 		totalRecs += len(g.Recommendations)
 		hasClaimableRec := false
 		for _, rec := range g.Recommendations {
-			if isClaimableRecommendation(rec, nil, nil) {
+			if isClaimableRecommendation(rec, time.Time{}, nil, nil) {
 				hasClaimableRec = true
 				break
 			}
@@ -1563,7 +1563,7 @@ func TestTriageGroupByTrack_TopPickHasHighestScore(t *testing.T) {
 		}
 		// Top pick should have the highest score in the group
 		for _, rec := range g.Recommendations {
-			if !isClaimableRecommendation(rec, nil, nil) {
+			if !isClaimableRecommendation(rec, time.Time{}, nil, nil) {
 				continue
 			}
 			if rec.Score > g.TopPick.Score {
@@ -1724,7 +1724,7 @@ func TestBuildTopPicks_FiltersBlockedItems(t *testing.T) {
 	}
 
 	// Test with limit of 3
-	picks := buildTopPicks(recommendations, 3, nil, nil)
+	picks := buildTopPicks(recommendations, 3, time.Time{}, nil, nil)
 
 	// Should have exactly 3 picks (all actionable items)
 	if len(picks) != 3 {
@@ -1885,7 +1885,7 @@ func TestBuildTopPicks_LimitRespected(t *testing.T) {
 	}
 
 	// Limit of 2
-	picks := buildTopPicks(recommendations, 2, nil, nil)
+	picks := buildTopPicks(recommendations, 2, time.Time{}, nil, nil)
 	if len(picks) != 2 {
 		t.Errorf("expected 2 picks with limit=2, got %d", len(picks))
 	}
@@ -1903,7 +1903,7 @@ func TestBuildTopPicks_AllBlocked(t *testing.T) {
 		{ID: "b2", Title: "Blocked 2", Status: string(model.StatusOpen), Score: 90.0, BlockedBy: []string{"y"}},
 	}
 
-	picks := buildTopPicks(recommendations, 10, nil, nil)
+	picks := buildTopPicks(recommendations, 10, time.Time{}, nil, nil)
 	if len(picks) != 0 {
 		t.Errorf("expected 0 picks when all are blocked, got %d", len(picks))
 	}
@@ -1941,7 +1941,7 @@ func TestBuildTopPicks_SkipsBlockedStatusAndAssigned(t *testing.T) {
 		},
 	}
 
-	picks := buildTopPicks(recommendations, 3, nil, nil)
+	picks := buildTopPicks(recommendations, 3, time.Time{}, nil, nil)
 	if len(picks) != 1 {
 		t.Fatalf("expected only the claimable open issue, got %d picks: %#v", len(picks), picks)
 	}

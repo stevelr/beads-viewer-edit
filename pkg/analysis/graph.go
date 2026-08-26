@@ -1200,8 +1200,28 @@ type Analyzer struct {
 	blockerCountsMax int
 	config           *AnalysisConfig // Optional custom config, nil means use size-based defaults
 
+	// now is the reference instant for time-gated readiness (defer_until).
+	// Defaults to wall-clock time at construction; robot entrypoints with a
+	// pinned clock (SOURCE_DATE_EPOCH) override it via SetNow so their output
+	// stays deterministic.
+	now time.Time
+
 	dataHashOnce sync.Once
 	dataHash     string
+}
+
+// SetNow overrides the reference instant used for time-gated readiness checks
+// (currently defer_until). A zero value is ignored and leaves the clock as-is.
+func (a *Analyzer) SetNow(now time.Time) {
+	if now.IsZero() {
+		return
+	}
+	a.now = now
+}
+
+// Now returns the analyzer's reference instant for time-gated readiness.
+func (a *Analyzer) Now() time.Time {
+	return a.now
 }
 
 // SeedDataHash records a pre-computed ComputeDataHash for the analyzer's input
@@ -1382,6 +1402,7 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 		issues:           issues,
 		blockerCounts:    blockerCounts,
 		blockerCountsMax: maxBlockers,
+		now:              time.Now(),
 	}
 }
 
@@ -1410,30 +1431,29 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 	nodeCount := len(a.issueMap)
 	edgeCount := a.g.Edges().Len()
 
-	configHash := ComputeConfigHash(&config)
-	incCacheKey := ""
-	if !robotDiskCacheEnabled() {
-		incCacheKey = a.graphStructureHash() + "|" + configHash
-		if cached, ok := getIncrementalGraphStatsCache(incCacheKey); ok {
-			return cached
-		}
-	}
+	var configHash, incCacheKey, robotCacheKey, dataHash string
+	if !config.DisableCache {
+		configHash = ComputeConfigHash(&config)
+		if robotDiskCacheEnabled() {
+			// Reuse the analyzer-scoped memoized hash instead of rebuilding a slice
+			// from issueMap and re-running the SHA256 on every analysis. Identical
+			// value (ComputeDataHash sorts by ID), one computation per analyzer.
+			dataHash = a.DataHash()
+			robotCacheKey = dataHash + "|" + configHash
 
-	var robotCacheKey, dataHash string
-	if robotDiskCacheEnabled() {
-		// Reuse the analyzer-scoped memoized hash instead of rebuilding a slice
-		// from issueMap and re-running the SHA256 on every analysis. Identical
-		// value (ComputeDataHash sorts by ID), one computation per analyzer.
-		dataHash = a.DataHash()
-		robotCacheKey = dataHash + "|" + configHash
-
-		if cached, xfetchRefresh, ok := getRobotDiskCachedStats(robotCacheKey); ok {
-			if !xfetchRefresh || ctx.Err() != nil {
+			if cached, xfetchRefresh, ok := getRobotDiskCachedStats(robotCacheKey); ok {
+				if !xfetchRefresh || ctx.Err() != nil {
+					return cached
+				}
+				// XFetch selected this caller to refresh early. Fall through and
+				// recompute now so the cache is actually renewed instead of serving
+				// the stale entry forever.
+			}
+		} else {
+			incCacheKey = a.graphStructureHash() + "|" + configHash
+			if cached, ok := getIncrementalGraphStatsCache(incCacheKey); ok {
 				return cached
 			}
-			// XFetch selected this caller to refresh early. Fall through and
-			// recompute now so the cache is actually renewed instead of serving
-			// the stale entry forever.
 		}
 	}
 
@@ -2469,7 +2489,11 @@ func (a *Analyzer) GetActionableIssues() []model.Issue {
 		}
 	}
 
-	// Phase 4: Collect actionable issues (not closed, not blocked).
+	// Phase 4: Collect actionable issues (not closed, not blocked, not
+	// scheduler-deferred). A bead with a future defer_until is withheld for
+	// parity with `br ready` (issue #191): it is neither claimable nor part of
+	// the actionable plan until the deferral lapses, even though nothing in
+	// the graph blocks it.
 	//
 	// NOTE: a standalone open parent with open children remains actionable here
 	// (parent-child is a rollup edge that never gates the parent's own
@@ -2491,6 +2515,9 @@ func (a *Analyzer) GetActionableIssues() []model.Issue {
 			continue
 		}
 		if blocked[id] {
+			continue
+		}
+		if issue.IsDeferredAt(a.now) {
 			continue
 		}
 		actionable = append(actionable, issue)

@@ -114,27 +114,52 @@ func TestGraphStatsCacheBlob_SoAStoresNodesOnce(t *testing.T) {
 	}
 }
 
-// TestRobotDiskCache_VersionGate confirms a v1 (old-format) cache file is
-// treated as a miss, not mis-parsed against the v2 reader.
+// TestRobotDiskCache_VersionGate confirms an entry written by an older layout
+// version, or one whose embedded key does not match the lookup (filename
+// collision / foreign file), is treated as a miss and reaped — never served.
 func TestRobotDiskCache_VersionGate(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "analysis_cache.json")
-	// Old v1 file with the legacy map-keyed result shape.
-	old := `{"version":1,"entries":{"k|c":{"created_at":"2026-01-01T00:00:00Z","result":{"page_rank":{"A":0.5}}}}}`
-	if err := os.WriteFile(path, []byte(old), 0o644); err != nil {
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	t.Setenv("BEADS_DB", beadsDir)
+
+	dir, err := robotAnalysisDiskCacheDir(true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	cf := readRobotDiskCacheLocked(f)
-	if cf.Version != robotAnalysisDiskCacheVersion {
-		t.Fatalf("version: got %d, want %d", cf.Version, robotAnalysisDiskCacheVersion)
+	const key = "k|c"
+	path := filepath.Join(dir, robotAnalysisEntryFileName(key))
+
+	writeEntry := func(e robotAnalysisDiskCacheEntry) {
+		t.Helper()
+		raw, err := json.Marshal(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if len(cf.Entries) != 0 {
-		t.Fatalf("expected v1 cache to be ignored (0 entries), got %d", len(cf.Entries))
+
+	// Older layout version.
+	writeEntry(robotAnalysisDiskCacheEntry{Version: robotAnalysisDiskCacheVersion - 1, Key: key, CreatedAt: time.Now().UTC()})
+	if _, _, hit := getRobotDiskCachedStats(key); hit {
+		t.Fatal("old-version entry must be a miss")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("old-version entry file should be reaped, stat err = %v", err)
+	}
+
+	// Key mismatch.
+	writeEntry(robotAnalysisDiskCacheEntry{Version: robotAnalysisDiskCacheVersion, Key: "other|key", CreatedAt: time.Now().UTC()})
+	if _, _, hit := getRobotDiskCachedStats(key); hit {
+		t.Fatal("key-mismatched entry must be a miss")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("key-mismatched entry file should be reaped, stat err = %v", err)
 	}
 }
 

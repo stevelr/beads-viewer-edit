@@ -224,6 +224,19 @@ type WhatIfEntry struct {
 
 // TopWhatIfDeltas returns the top N issues with highest downstream impact (bv-83)
 func (a *Analyzer) TopWhatIfDeltas(n int) []WhatIfEntry {
+	stats := a.Analyze()
+	return a.TopWhatIfDeltasFromStats(&stats, n)
+}
+
+// TopWhatIfDeltasFromStats returns the top N issues with highest downstream
+// impact using graph statistics already computed by the caller. A nil stats
+// pointer falls back to one synchronous analysis for the whole batch.
+func (a *Analyzer) TopWhatIfDeltasFromStats(stats *GraphStats, n int) []WhatIfEntry {
+	if stats == nil {
+		analyzed := a.Analyze()
+		stats = &analyzed
+	}
+
 	if n <= 0 {
 		n = 10
 	}
@@ -234,7 +247,7 @@ func (a *Analyzer) TopWhatIfDeltas(n int) []WhatIfEntry {
 		if isClosedLikeStatus(issue.Status) {
 			continue
 		}
-		delta := a.computeWhatIfDelta(id)
+		delta := a.computeWhatIfDeltaFromStats(id, stats)
 		if delta == nil {
 			continue
 		}

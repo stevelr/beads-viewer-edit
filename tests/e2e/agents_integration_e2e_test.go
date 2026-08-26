@@ -174,6 +174,15 @@ func TestAgentsE2E_AcceptFlow(t *testing.T) {
 	if !strings.Contains(contentStr, agents.BlurbEndMarker) {
 		t.Error("Blurb end marker missing")
 	}
+	if !strings.Contains(contentStr, "br update <id> --status=in_progress --json") {
+		t.Error("Rust br workflow missing from injected blurb")
+	}
+	if !strings.Contains(contentStr, "bd update <id> --claim --json") {
+		t.Error("Go bd workflow missing from injected blurb")
+	}
+	if !strings.Contains(contentStr, "Do not run both trackers against the same workspace") {
+		t.Error("tracker-selection safety guidance missing from injected blurb")
+	}
 
 	// Verify blurb content
 	present, err := agents.VerifyBlurbPresent(agentsPath)

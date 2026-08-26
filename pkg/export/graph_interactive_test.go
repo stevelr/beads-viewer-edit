@@ -79,6 +79,46 @@ func TestGenerateInteractiveGraphHTML_Basic(t *testing.T) {
 	}
 }
 
+func TestGenerateInteractiveGraphHTML_ContextMenuCopyActions(t *testing.T) {
+	tmpDir := t.TempDir()
+	path, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues: []model.Issue{
+			{
+				ID:          "bv-1",
+				Title:       "First Issue",
+				Description: "Raw issue description",
+				Status:      model.StatusOpen,
+				Priority:    1,
+			},
+		},
+		Path: tmpDir + "/copy-actions.html",
+	})
+	if err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML failed: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read generated graph: %v", err)
+	}
+	html := string(data)
+
+	required := []string{
+		`id="ctx-copy">📋 Copy ID`,
+		`id="ctx-copy-description">📝 Copy description`,
+		"const value = contextNode ? contextNode.id : '';",
+		"const value = contextNode ? contextNode.description : '';",
+		"document.execCommand('copy')",
+		"showToast('No ' + fieldName.toLowerCase() + ' to copy')",
+		"showToast('Copy failed')",
+	}
+	for _, want := range required {
+		if !strings.Contains(html, want) {
+			t.Fatalf("generated graph missing copy-action guard %q", want)
+		}
+	}
+}
+
 func TestGenerateInteractiveGraphHTML_EscapesDynamicHTML(t *testing.T) {
 	tmpDir := t.TempDir()
 	issues := []model.Issue{

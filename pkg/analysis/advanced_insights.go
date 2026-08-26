@@ -2,7 +2,6 @@ package analysis
 
 import (
 	"container/heap"
-	"context"
 	"sort"
 )
 
@@ -209,6 +208,13 @@ func DefaultUsageHints() map[string]string {
 // GenerateAdvancedInsights creates the advanced insights structure with current data.
 // Features that aren't yet implemented return status=pending.
 func (a *Analyzer) GenerateAdvancedInsights(config AdvancedInsightsConfig) *AdvancedInsights {
+	return a.GenerateAdvancedInsightsFromStats(nil, config)
+}
+
+// GenerateAdvancedInsightsFromStats creates the advanced insights structure,
+// reusing completed graph statistics when supplied. A nil stats value preserves
+// GenerateAdvancedInsights behavior by running analysis when cycle data is needed.
+func (a *Analyzer) GenerateAdvancedInsightsFromStats(stats *GraphStats, config AdvancedInsightsConfig) *AdvancedInsights {
 	insights := &AdvancedInsights{
 		Config:     config,
 		UsageHints: DefaultUsageHints(),
@@ -236,15 +242,20 @@ func (a *Analyzer) GenerateAdvancedInsights(config AdvancedInsightsConfig) *Adva
 	}
 
 	// Cycle Break - implement basic version using existing cycle detection
-	insights.CycleBreak = a.generateCycleBreakSuggestions(config.CycleBreakLimit)
+	insights.CycleBreak = a.generateCycleBreakSuggestionsFromStats(stats, config.CycleBreakLimit)
 
 	return insights
 }
 
-// generateCycleBreakSuggestions creates cycle break suggestions from existing cycle data.
-func (a *Analyzer) generateCycleBreakSuggestions(limit int) *CycleBreakResult {
-	stats := a.AnalyzeAsync(context.Background())
-	stats.WaitForPhase2()
+// generateCycleBreakSuggestionsFromStats creates cycle break suggestions from
+// supplied cycle data, analyzing only when the caller has no reusable stats.
+func (a *Analyzer) generateCycleBreakSuggestionsFromStats(stats *GraphStats, limit int) *CycleBreakResult {
+	if stats == nil {
+		analyzed := a.Analyze()
+		stats = &analyzed
+	} else {
+		stats.WaitForPhase2()
+	}
 	cycles := stats.Cycles()
 
 	if len(cycles) == 0 {

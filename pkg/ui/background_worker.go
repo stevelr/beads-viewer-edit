@@ -40,6 +40,8 @@ const (
 	WorkerStopped
 )
 
+const backgroundWorkerShutdownTimeout = 500 * time.Millisecond
+
 // WorkerLogLevel controls background worker log verbosity.
 type WorkerLogLevel int
 
@@ -637,9 +639,11 @@ func (w *BackgroundWorker) Stop() {
 
 	// Only wait for done if Start() was called
 	if wasStarted {
+		timer := time.NewTimer(backgroundWorkerShutdownTimeout)
+		defer timer.Stop()
 		select {
 		case <-done:
-		case <-time.After(5 * time.Second):
+		case <-timer.C:
 			w.logEvent(LogLevelWarn, "shutdown_timeout", nil)
 		}
 	}
@@ -903,6 +907,20 @@ func (w *BackgroundWorker) ForceRefresh() {
 	go w.process()
 }
 
+// HandleRefreshRequest applies a UI refresh request on the worker side. Recipe
+// changes and forced reloads are folded into one processing run.
+func (w *BackgroundWorker) HandleRefreshRequest(msg RefreshRequestMsg) {
+	recipeChanged := false
+	if msg.Recipe != nil {
+		recipeChanged = w.setRecipe(msg.Recipe)
+	}
+	if msg.Force || recipeChanged {
+		w.ForceRefresh()
+		return
+	}
+	w.TriggerRefresh()
+}
+
 func recipeFingerprint(r *recipe.Recipe) string {
 	if r == nil {
 		return ""
@@ -921,10 +939,16 @@ func recipeFingerprint(r *recipe.Recipe) string {
 // SetRecipe updates the worker's current recipe and triggers a refresh (bv-2h40).
 // This allows Phase 3 view builders to incorporate recipe/filter state off-thread.
 func (w *BackgroundWorker) SetRecipe(r *recipe.Recipe) {
+	if w.setRecipe(r) {
+		w.ForceRefresh()
+	}
+}
+
+func (w *BackgroundWorker) setRecipe(r *recipe.Recipe) bool {
 	w.mu.Lock()
 	if w.state == WorkerStopped {
 		w.mu.Unlock()
-		return
+		return false
 	}
 
 	nextID := ""
@@ -939,10 +963,7 @@ func (w *BackgroundWorker) SetRecipe(r *recipe.Recipe) {
 	w.currentRecipeID = nextID
 	w.currentRecipeHash = nextHash
 	w.mu.Unlock()
-
-	if changed {
-		w.ForceRefresh()
-	}
+	return changed
 }
 
 // GetSnapshot returns the current snapshot (may be nil).
@@ -1753,6 +1774,14 @@ type SnapshotErrorMsg struct {
 // The UI should check DataHash matches current snapshot before using.
 type Phase2UpdateMsg struct {
 	DataHash string // Content hash to verify this matches current snapshot
+}
+
+// RefreshRequestMsg asks the BackgroundWorker to reload data. Force bypasses
+// content-hash deduplication; Recipe applies new background view configuration.
+// A nil Recipe keeps the worker's current recipe.
+type RefreshRequestMsg struct {
+	Force  bool
+	Recipe *recipe.Recipe
 }
 
 func (w *BackgroundWorker) send(msg tea.Msg) {

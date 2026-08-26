@@ -23,11 +23,15 @@ func NewJSONLReader(source DataSource) (*JSONLReader, error) {
 }
 
 // LoadIssues returns all non-tombstone issues from the JSONL file.
+// Parse accounting is published via LastLoadReport so records dropped during
+// load (malformed JSON, failed validation) stay visible to callers (#190).
 func (r *JSONLReader) LoadIssues() ([]model.Issue, error) {
-	all, err := loader.LoadIssuesFromFile(r.path)
+	rec := newLoadRecorder(r.path)
+	all, err := loader.LoadIssuesFromFileWithOptions(r.path, rec.options())
 	if err != nil {
 		return nil, err
 	}
+	rec.commit()
 	// Filter out tombstone issues to match the IssueReader contract.
 	out := make([]model.Issue, 0, len(all))
 	for i := range all {

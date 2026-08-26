@@ -137,6 +137,26 @@ func TestBackgroundWorker_StartStop(t *testing.T) {
 	}
 }
 
+func TestBackgroundWorker_StopCompletesWithinOneSecondWhenLoopStuck(t *testing.T) {
+	worker, err := NewBackgroundWorker(WorkerConfig{})
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+
+	// Simulate an unresponsive processing loop. Stop must still honor its public
+	// sub-second shutdown contract rather than waiting indefinitely.
+	worker.mu.Lock()
+	worker.started = true
+	worker.done = make(chan struct{})
+	worker.mu.Unlock()
+
+	start := time.Now()
+	worker.Stop()
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		t.Fatalf("Stop took %v; want less than 1s", elapsed)
+	}
+}
+
 func TestBackgroundWorker_StopReturnsSnapshotPooledIssues(t *testing.T) {
 	tmpDir := t.TempDir()
 	beadsPath := filepath.Join(tmpDir, "beads.jsonl")
@@ -231,6 +251,49 @@ func TestBackgroundWorker_TriggerRefresh(t *testing.T) {
 
 	if len(snapshot.Issues) != 1 {
 		t.Errorf("Expected 1 issue, got %d", len(snapshot.Issues))
+	}
+}
+
+func TestBackgroundWorker_RefreshRequestMsg(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsPath := filepath.Join(tmpDir, "beads.jsonl")
+	content := `{"id":"test-1","title":"Test","status":"open","priority":1,"issue_type":"task"}` + "\n"
+	if err := os.WriteFile(beadsPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	worker, err := NewBackgroundWorker(WorkerConfig{BeadsPath: beadsPath})
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+	defer worker.Stop()
+
+	worker.HandleRefreshRequest(RefreshRequestMsg{Force: true})
+	waitForSnapshotVersion(t, worker, 1)
+	first := worker.GetSnapshot()
+	firstMsg := waitForBackgroundWorkerMsg(t, worker, 2*time.Second, func(msg tea.Msg) bool {
+		_, ok := msg.(SnapshotReadyMsg)
+		return ok
+	}).(SnapshotReadyMsg)
+	if firstMsg.Snapshot != first {
+		t.Fatal("RefreshRequestMsg snapshot was not delivered through worker message channel")
+	}
+
+	worker.HandleRefreshRequest(RefreshRequestMsg{Force: true})
+	waitForSnapshotVersion(t, worker, 2)
+	if second := worker.GetSnapshot(); second == first {
+		t.Fatal("forced RefreshRequestMsg was deduplicated")
+	}
+
+	r := &recipe.Recipe{Name: "message-flow"}
+	worker.HandleRefreshRequest(RefreshRequestMsg{Recipe: r})
+	waitForSnapshotVersion(t, worker, 3)
+
+	worker.mu.RLock()
+	gotRecipe := worker.currentRecipe
+	worker.mu.RUnlock()
+	if gotRecipe != r {
+		t.Fatal("RefreshRequestMsg recipe was not applied by worker")
 	}
 }
 
@@ -516,14 +579,14 @@ func TestBackgroundWorker_IncrementalListMetrics(t *testing.T) {
 	}
 
 	metrics := worker.Metrics()
-	if metrics.IncrementalListCount == 0 {
-		t.Fatalf("expected IncrementalListCount > 0, got %d", metrics.IncrementalListCount)
+	if metrics.IncrementalListCount != 1 {
+		t.Fatalf("IncrementalListCount=%d, want 1", metrics.IncrementalListCount)
 	}
-	if metrics.FullListCount == 0 {
-		t.Fatalf("expected FullListCount > 0, got %d", metrics.FullListCount)
+	if metrics.FullListCount != 1 {
+		t.Fatalf("FullListCount=%d, want 1", metrics.FullListCount)
 	}
-	if metrics.IncrementalListRatio <= 0 {
-		t.Fatalf("expected IncrementalListRatio > 0, got %f", metrics.IncrementalListRatio)
+	if metrics.IncrementalListRatio != 0.5 {
+		t.Fatalf("IncrementalListRatio=%f, want 0.5", metrics.IncrementalListRatio)
 	}
 }
 
@@ -1204,6 +1267,152 @@ func TestBackgroundWorker_ConcurrentTrigger(t *testing.T) {
 	}
 }
 
+func TestBackgroundWorker_RapidWritesKeepUIResponsive(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsPath := filepath.Join(tmpDir, "beads.jsonl")
+	const (
+		initialIssues = 100
+		rapidWrites   = 50
+	)
+	if err := writeStressIssuesFile(beadsPath, initialIssues, 0, "initial"); err != nil {
+		t.Fatalf("write initial issues: %v", err)
+	}
+
+	issues, err := loader.LoadIssuesFromFile(beadsPath)
+	if err != nil {
+		t.Fatalf("load initial issues: %v", err)
+	}
+	m := NewModel(issues, nil, "")
+
+	worker, err := NewBackgroundWorker(WorkerConfig{
+		BeadsPath:     beadsPath,
+		DebounceDelay: 25 * time.Millisecond,
+		MessageBuffer: 16,
+		IdleGC:        &IdleGCConfig{Enabled: false},
+	})
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+	defer worker.Stop()
+	m.backgroundWorker = worker
+	if err := worker.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	worker.TriggerRefresh()
+
+	writerDone := make(chan error, 1)
+	go func() {
+		for i := 0; i < rapidWrites; i++ {
+			f, openErr := os.OpenFile(beadsPath, os.O_APPEND|os.O_WRONLY, 0o644)
+			if openErr != nil {
+				writerDone <- openErr
+				return
+			}
+			_, writeErr := fmt.Fprintf(f,
+				`{"id":"rapid-%d","title":"Rapid %d","status":"open","priority":2,"issue_type":"task"}`+"\n",
+				i, i,
+			)
+			closeErr := f.Close()
+			if writeErr != nil {
+				writerDone <- writeErr
+				return
+			}
+			if closeErr != nil {
+				writerDone <- closeErr
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		writerDone <- nil
+	}()
+
+	var (
+		updateTotal    time.Duration
+		maxUpdate      time.Duration
+		renderTotal    time.Duration
+		maxRender      time.Duration
+		sampleCount    int
+		updatesOver50  int
+		snapshotCount  int
+		errorCount     int
+		latestCount    int
+		writerErr      error
+		writerFinished bool
+	)
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(2 * time.Millisecond)
+	defer tick.Stop()
+
+	for !writerFinished || latestCount != initialIssues+rapidWrites {
+		select {
+		case writerErr = <-writerDone:
+			writerFinished = true
+		case msg := <-worker.Messages():
+			switch typed := msg.(type) {
+			case SnapshotReadyMsg:
+				snapshotCount++
+				latestCount = len(typed.Snapshot.Issues)
+			case SnapshotErrorMsg:
+				errorCount++
+			}
+			updated, _ := m.Update(msg)
+			m = updated.(*Model)
+		case <-tick.C:
+			start := time.Now()
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+			m = updated.(*Model)
+			updateLatency := time.Since(start)
+			renderStart := time.Now()
+			if view := m.View(); view == "" {
+				t.Fatal("View returned empty output during rapid writes")
+			}
+			renderLatency := time.Since(renderStart)
+			updateTotal += updateLatency
+			renderTotal += renderLatency
+			sampleCount++
+			if updateLatency > maxUpdate {
+				maxUpdate = updateLatency
+			}
+			if renderLatency > maxRender {
+				maxRender = renderLatency
+			}
+			if updateLatency > 50*time.Millisecond {
+				updatesOver50++
+			}
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for final snapshot: writer_finished=%v latest_count=%d snapshots=%d errors=%d",
+				writerFinished, latestCount, snapshotCount, errorCount)
+		}
+	}
+
+	if writerErr != nil {
+		t.Fatalf("rapid writer failed: %v", writerErr)
+	}
+	if sampleCount == 0 {
+		t.Fatal("expected UI latency samples")
+	}
+	if snapshotCount >= rapidWrites {
+		t.Fatalf("expected rapid writes to coalesce: snapshots=%d writes=%d", snapshotCount, rapidWrites)
+	}
+	if errorCount != 0 {
+		t.Fatalf("unexpected background worker errors: %d", errorCount)
+	}
+
+	averageUpdate := updateTotal / time.Duration(sampleCount)
+	averageRender := renderTotal / time.Duration(sampleCount)
+	over50Ratio := float64(updatesOver50) / float64(sampleCount)
+	t.Logf("rapid-write UI latency: update_avg=%v update_max=%v update_over50ms=%d/%d (%.2f%%), render_avg=%v render_max=%v, snapshots=%d writes=%d",
+		averageUpdate, maxUpdate, updatesOver50, sampleCount, over50Ratio*100,
+		averageRender, maxRender, snapshotCount, rapidWrites)
+	if averageUpdate >= 50*time.Millisecond {
+		t.Fatalf("average UI update latency=%v, want <50ms", averageUpdate)
+	}
+	if over50Ratio >= 0.05 {
+		t.Fatalf("UI update samples over 50ms=%.2f%%, want <5%%", over50Ratio*100)
+	}
+}
+
 func TestBackgroundWorker_TriggerRefreshCoalescesWhileProcessScheduled(t *testing.T) {
 	worker, err := NewBackgroundWorker(WorkerConfig{BeadsPath: ""})
 	if err != nil {
@@ -1359,6 +1568,45 @@ func TestBackgroundWorker_Phase2UpdateMsgDelivered(t *testing.T) {
 	}
 	if phase2Hash != snapshot.DataHash {
 		t.Fatalf("phase2 hash mismatch: got %s, want %s", phase2Hash, snapshot.DataHash)
+	}
+}
+
+func TestBackgroundWorker_RunPhase2AnalysisSignalsMatchingSnapshot(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "root", Title: "Root", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		{ID: "child", Title: "Child", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}}},
+	}
+	snapshot := NewSnapshotBuilder(issues).Build()
+	snapshot.Analysis.WaitForPhase2()
+	snapshot.DataHash = "phase2-signal-test"
+	snapshot.phase2Ready = false
+
+	worker, err := NewBackgroundWorker(WorkerConfig{})
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+	defer worker.Stop()
+	worker.snapshot = snapshot
+
+	go worker.runPhase2Analysis(snapshot.Analysis, snapshot.DataHash)
+	msg := waitForBackgroundWorkerMsg(t, worker, 2*time.Second, func(msg tea.Msg) bool {
+		_, ok := msg.(Phase2UpdateMsg)
+		return ok
+	}).(Phase2UpdateMsg)
+	if msg.DataHash != snapshot.DataHash {
+		t.Fatalf("Phase2UpdateMsg hash=%q, want %q", msg.DataHash, snapshot.DataHash)
+	}
+
+	m := NewModel(issues, nil, "")
+	m.snapshot = snapshot
+	if view := m.View(); view == "" {
+		t.Fatal("UI did not render while Phase 2 snapshot was pending")
+	}
+	newM, _ := m.Update(msg)
+	m = newM.(*Model)
+	if !m.snapshot.phase2Ready {
+		t.Fatal("matching Phase2UpdateMsg did not mark current snapshot ready")
 	}
 }
 
@@ -1734,6 +1982,96 @@ func TestBackgroundWorker_MaybeIdleGC_TriggersAfterThreshold(t *testing.T) {
 	worker.maybeIdleGC(now.Add(1 * time.Second))
 	if gcCalls != 1 {
 		t.Fatalf("expected idle GC to be gated by MinInterval, ran %d times", gcCalls)
+	}
+}
+
+func TestModelUpdate_RecordsUserInputForIdleGC(t *testing.T) {
+	worker, err := NewBackgroundWorker(WorkerConfig{
+		BeadsPath: "",
+		IdleGC:    &IdleGCConfig{Enabled: false},
+	})
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+	defer worker.Stop()
+
+	tests := []struct {
+		name string
+		msg  tea.Msg
+	}{
+		{name: "key", msg: tea.KeyMsg{Type: tea.KeyDown}},
+		{name: "mouse", msg: tea.MouseMsg{}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			oldActivity := time.Now().Add(-time.Hour)
+			worker.recordActivityAt(oldActivity)
+
+			m := NewModel(nil, nil, "")
+			m.backgroundWorker = worker
+			m.Update(tc.msg)
+
+			got := time.Unix(0, worker.lastActivityUnixNano.Load())
+			if !got.After(oldActivity) {
+				t.Fatalf("user input did not advance activity time: got=%v old=%v", got, oldActivity)
+			}
+		})
+	}
+}
+
+func TestBackgroundWorker_GCPausesUnderRapidSnapshotLoad(t *testing.T) {
+	beadsPath := filepath.Join(t.TempDir(), "issues.jsonl")
+	if err := writeStressIssuesFile(beadsPath, 1000, 0, "gc-pause"); err != nil {
+		t.Fatalf("write stress issues: %v", err)
+	}
+
+	worker, err := NewBackgroundWorker(WorkerConfig{
+		BeadsPath: beadsPath,
+		IdleGC:    &IdleGCConfig{Enabled: false},
+	})
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+	defer worker.Stop()
+
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	for i := 0; i < 10; i++ {
+		snapshot := worker.buildSnapshot(true)
+		if snapshot == nil {
+			t.Fatalf("buildSnapshot returned nil at iteration %d", i)
+		}
+		if snapshot.Analysis != nil {
+			snapshot.Analysis.WaitForPhase2()
+		}
+		loader.ReturnIssuePtrsToPool(snapshot.pooledIssues)
+		snapshot = nil
+		runtime.GC()
+	}
+
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	if after.NumGC <= before.NumGC {
+		t.Fatalf("expected GC cycles under rapid snapshot load: before=%d after=%d", before.NumGC, after.NumGC)
+	}
+
+	firstCycle := before.NumGC + 1
+	if after.NumGC-firstCycle+1 > uint32(len(after.PauseNs)) {
+		firstCycle = after.NumGC - uint32(len(after.PauseNs)) + 1
+	}
+	var maxPause time.Duration
+	for cycle := firstCycle; cycle <= after.NumGC; cycle++ {
+		pause := time.Duration(after.PauseNs[(cycle-1)%uint32(len(after.PauseNs))])
+		if pause > maxPause {
+			maxPause = pause
+		}
+	}
+	t.Logf("rapid snapshot GC cycles=%d max_pause=%v", after.NumGC-before.NumGC, maxPause)
+	if maxPause >= 10*time.Millisecond {
+		t.Fatalf("maximum GC pause=%v, want <10ms", maxPause)
 	}
 }
 

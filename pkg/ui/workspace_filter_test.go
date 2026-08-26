@@ -24,7 +24,7 @@ func TestApplyFilterRespectsWorkspaceRepoFilter(t *testing.T) {
 
 	m := NewModel(issues, nil, "")
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	m.EnableWorkspaceMode(WorkspaceInfo{
 		Enabled:      true,
@@ -61,7 +61,7 @@ func TestApplyFilterRespectsHyphenatedWorkspaceRepoKey(t *testing.T) {
 
 	m := NewModel(issues, nil, "")
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	m.EnableWorkspaceMode(WorkspaceInfo{
 		Enabled:      true,

@@ -834,7 +834,7 @@ type commentEditorFinishedMsg struct {
 // tryEditKeyHandler checks if the key matches an edit hotkey and dispatches.
 // Returns handled=false if no match (caller should continue normal handling).
 // fork: human-edit
-func (m Model) tryEditKeyHandler(key string) (Model, tea.Cmd, bool) {
+func (m *Model) tryEditKeyHandler(key string) (*Model, tea.Cmd, bool) {
 	hk := m.editConfig.Hotkeys
 
 	// Guard: no edit keys while any modal/picker/overlay is active
@@ -891,7 +891,7 @@ func (m Model) tryEditKeyHandler(key string) (Model, tea.Cmd, bool) {
 
 // --- Picker Openers ---
 
-func (m Model) getSelectedIssue() *model.Issue {
+func (m *Model) getSelectedIssue() *model.Issue {
 	if m.focused == focusBoard {
 		return m.board.SelectedIssue()
 	}
@@ -905,7 +905,7 @@ func (m Model) getSelectedIssue() *model.Issue {
 	return nil
 }
 
-func (m Model) openPriorityPicker() (Model, tea.Cmd) {
+func (m *Model) openPriorityPicker() (*Model, tea.Cmd) {
 	issue := m.getSelectedIssue()
 	if issue == nil {
 		m.statusMsg = "No issue selected"
@@ -925,7 +925,7 @@ func (m Model) openPriorityPicker() (Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) openStatusPicker() (Model, tea.Cmd) {
+func (m *Model) openStatusPicker() (*Model, tea.Cmd) {
 	issue := m.getSelectedIssue()
 	if issue == nil {
 		m.statusMsg = "No issue selected"
@@ -945,7 +945,7 @@ func (m Model) openStatusPicker() (Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) openTypePicker() (Model, tea.Cmd) {
+func (m *Model) openTypePicker() (*Model, tea.Cmd) {
 	issue := m.getSelectedIssue()
 	if issue == nil {
 		m.statusMsg = "No issue selected"
@@ -975,7 +975,7 @@ func (m Model) openTypePicker() (Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) openAssigneePicker() (Model, tea.Cmd) {
+func (m *Model) openAssigneePicker() (*Model, tea.Cmd) {
 	issue := m.getSelectedIssue()
 	if issue == nil {
 		m.statusMsg = "No issue selected"
@@ -1003,7 +1003,7 @@ func (m Model) openAssigneePicker() (Model, tea.Cmd) {
 
 // --- Full Editor ---
 
-func (m Model) openIssueInEditor() (Model, tea.Cmd) {
+func (m *Model) openIssueInEditor() (*Model, tea.Cmd) {
 	issue := m.getSelectedIssue()
 	if issue == nil {
 		m.statusMsg = "No issue selected"
@@ -1096,7 +1096,7 @@ func launchInWezterm(config *EditConfig, mdPath string) error {
 
 // --- Create Issue ---
 
-func (m Model) createNewIssue(parentID *string) (Model, tea.Cmd) {
+func (m *Model) createNewIssue(parentID *string) (*Model, tea.Cmd) {
 	brPath := m.editConfig.BrPath
 	return m, func() tea.Msg {
 		id, err := CreateIssue(brPath, parentID)
@@ -1104,7 +1104,7 @@ func (m Model) createNewIssue(parentID *string) (Model, tea.Cmd) {
 	}
 }
 
-func (m Model) createSubIssue() (Model, tea.Cmd) {
+func (m *Model) createSubIssue() (*Model, tea.Cmd) {
 	issue := m.getSelectedIssue()
 	if issue == nil {
 		m.statusMsg = "No issue selected"
@@ -1122,7 +1122,7 @@ func AddBrComment(brPath, issueID, filePath string) error {
 	return RunBrUpdate([]string{brPath, "comments", "add", issueID, "-f", filePath})
 }
 
-func (m Model) addComment() (Model, tea.Cmd) {
+func (m *Model) addComment() (*Model, tea.Cmd) {
 	issue := m.getSelectedIssue()
 	if issue == nil {
 		m.statusMsg = "No issue selected"
@@ -1163,7 +1163,7 @@ func (m Model) addComment() (Model, tea.Cmd) {
 
 // handleCommentEditorFinished processes the result of a comment editor session.
 // fork: human-edit
-func (m Model) handleCommentEditorFinished(msg commentEditorFinishedMsg) (Model, tea.Cmd) {
+func (m *Model) handleCommentEditorFinished(msg commentEditorFinishedMsg) (*Model, tea.Cmd) {
 	if msg.err != nil {
 		m.statusMsg = fmt.Sprintf("Editor error: %v", msg.err)
 		m.statusIsError = true
@@ -1200,21 +1200,21 @@ func (m Model) handleCommentEditorFinished(msg commentEditorFinishedMsg) (Model,
 // --- Message Handlers (called from Update) ---
 
 // handleEditApplied processes a successful edit result. fork: human-edit
-func (m Model) handleEditApplied(msg editAppliedMsg) Model {
+func (m *Model) handleEditApplied(msg editAppliedMsg) *Model {
 	m.statusMsg = fmt.Sprintf("Updated %s: %d field(s) saved", msg.issueID, msg.nFields)
 	m.statusIsError = false
 	return m
 }
 
 // handleEditError processes an edit error. fork: human-edit
-func (m Model) handleEditError(msg editErrorMsg) Model {
+func (m *Model) handleEditError(msg editErrorMsg) *Model {
 	m.statusMsg = fmt.Sprintf("Edit failed: %v", msg.err)
 	m.statusIsError = true
 	return m
 }
 
 // handleEditNoChanges processes a no-changes result. fork: human-edit
-func (m Model) handleEditNoChanges(msg editNoChangesMsg) Model {
+func (m *Model) handleEditNoChanges(msg editNoChangesMsg) *Model {
 	m.statusMsg = fmt.Sprintf("No changes detected for %s", msg.issueID)
 	m.statusIsError = false
 	return m
@@ -1222,7 +1222,7 @@ func (m Model) handleEditNoChanges(msg editNoChangesMsg) Model {
 
 // handleEditorFinished processes the result of a synchronous editor session.
 // fork: human-edit
-func (m Model) handleEditorFinished(msg editorFinishedMsg) (Model, tea.Cmd) {
+func (m *Model) handleEditorFinished(msg editorFinishedMsg) (*Model, tea.Cmd) {
 	if msg.err != nil {
 		m.statusMsg = fmt.Sprintf("Editor error: %v", msg.err)
 		m.statusIsError = true
@@ -1272,7 +1272,7 @@ func (m Model) handleEditorFinished(msg editorFinishedMsg) (Model, tea.Cmd) {
 
 // handleEditPoll handles periodic file-watch polling for async editor sessions.
 // fork: human-edit
-func (m Model) handleEditPoll() (Model, tea.Cmd) {
+func (m *Model) handleEditPoll() (*Model, tea.Cmd) {
 	if m.pendingEdit == nil {
 		return m, nil
 	}
@@ -1356,7 +1356,7 @@ func (m Model) handleEditPoll() (Model, tea.Cmd) {
 
 // handleCreateAndEdit handles the result of creating a new issue and opens it in the editor.
 // fork: human-edit
-func (m Model) handleCreateAndEdit(msg createAndEditMsg) (Model, tea.Cmd) {
+func (m *Model) handleCreateAndEdit(msg createAndEditMsg) (*Model, tea.Cmd) {
 	if msg.err != nil {
 		m.statusMsg = fmt.Sprintf("Create failed: %v", msg.err)
 		m.statusIsError = true
@@ -1438,7 +1438,7 @@ func (m Model) handleCreateAndEdit(msg createAndEditMsg) (Model, tea.Cmd) {
 
 // handleEditPickerResult processes the result of an edit picker modal.
 // fork: human-edit
-func (m Model) handleEditPickerResult() (Model, tea.Cmd) {
+func (m *Model) handleEditPickerResult() (*Model, tea.Cmd) {
 	if m.editPicker.Result != PickerAccepted {
 		m.showEditPicker = false
 		return m, nil

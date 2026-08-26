@@ -1,10 +1,13 @@
 package model
 
 import (
-	"encoding/json"
+	stdjson "encoding/json"
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	json "github.com/goccy/go-json"
 )
 
 // Issue represents a trackable work item
@@ -24,6 +27,7 @@ type Issue struct {
 	CreatedAt          time.Time     `json:"created_at"`
 	UpdatedAt          time.Time     `json:"updated_at"`
 	DueDate            *time.Time    `json:"due_date,omitempty"`
+	DeferUntil         *time.Time    `json:"defer_until,omitempty"` // Scheduler deferral: hidden from ready/actionable until this instant passes
 	ClosedAt           *time.Time    `json:"closed_at,omitempty"`
 	ExternalRef        *string       `json:"external_ref,omitempty"`
 	CompactionLevel    int           `json:"compaction_level,omitempty"`
@@ -51,6 +55,10 @@ func (i Issue) Clone() Issue {
 	if i.DueDate != nil {
 		v := *i.DueDate
 		clone.DueDate = &v
+	}
+	if i.DeferUntil != nil {
+		v := *i.DeferUntil
+		clone.DeferUntil = &v
 	}
 	if i.ExternalRef != nil {
 		v := *i.ExternalRef
@@ -91,6 +99,16 @@ func (i Issue) Clone() Issue {
 	}
 
 	return clone
+}
+
+// IsDeferredAt reports whether the issue's defer_until deferral is still
+// active at the given instant. This mirrors `br ready`: a bead whose
+// defer_until lies strictly in the future is withheld from ready/actionable
+// views; once the instant is reached (or if no deferral is set) it is not
+// deferred. The comparison is instant-based, so the source timezone of the
+// timestamp is irrelevant.
+func (i Issue) IsDeferredAt(now time.Time) bool {
+	return i.DeferUntil != nil && i.DeferUntil.After(now)
 }
 
 // Validate checks if the issue data is logically valid
@@ -207,8 +225,22 @@ func (d *Dependency) UnmarshalJSON(data []byte) error {
 		CreatedBy   string         `json:"created_by"`
 	}
 	var raw rawDependency
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
+	// goccy deliberately leaves invalid UTF-8 bytes intact, whereas the legacy
+	// encoding/json contract replaces them with U+FFFD. Keep that rare input on
+	// the standard-library path; valid UTF-8 is the profiled production case.
+	if !utf8.Valid(data) {
+		if err := stdjson.Unmarshal(data, &raw); err != nil {
+			return err
+		}
+	} else if err := json.Unmarshal(data, &raw); err != nil {
+		// Keep the successful, production-heavy path on goccy, while replaying
+		// failures through the standard library so callers retain the legacy
+		// concrete error type and message. Reset raw first because a decoder may
+		// populate fields before reporting a later error.
+		raw = rawDependency{}
+		if err := stdjson.Unmarshal(data, &raw); err != nil {
+			return err
+		}
 	}
 
 	d.IssueID = raw.IssueID
@@ -284,14 +316,14 @@ type Comment struct {
 // numeric id back through the export does not silently lose precision.
 func (c *Comment) UnmarshalJSON(data []byte) error {
 	type rawComment struct {
-		ID        json.RawMessage `json:"id"`
-		IssueID   string          `json:"issue_id"`
-		Author    string          `json:"author"`
-		Text      string          `json:"text"`
-		CreatedAt time.Time       `json:"created_at"`
+		ID        stdjson.RawMessage `json:"id"`
+		IssueID   string             `json:"issue_id"`
+		Author    string             `json:"author"`
+		Text      string             `json:"text"`
+		CreatedAt time.Time          `json:"created_at"`
 	}
 	var raw rawComment
-	if err := json.Unmarshal(data, &raw); err != nil {
+	if err := stdjson.Unmarshal(data, &raw); err != nil {
 		return err
 	}
 	c.IssueID = raw.IssueID
@@ -304,7 +336,7 @@ func (c *Comment) UnmarshalJSON(data []byte) error {
 	}
 	// Try as string first (UUIDv7, the v1.0+ format).
 	var s string
-	if err := json.Unmarshal(raw.ID, &s); err == nil {
+	if err := stdjson.Unmarshal(raw.ID, &s); err == nil {
 		c.ID = s
 		return nil
 	}

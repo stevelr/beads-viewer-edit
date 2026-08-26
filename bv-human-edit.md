@@ -2,7 +2,7 @@
 
 ## Overview
 
-The human-edit feature adds in-TUI issue editing to beads_viewer (bv). Users can modify individual fields via quick-edit pickers, edit titles inline, or open a full per-issue markdown file in a terminal editor. All mutations go through the `br` CLI as a subprocess — bv never writes to JSONL or SQLite directly. The current fork is based on upstream bv v0.19.0.
+The human-edit feature adds in-TUI issue editing to beads_viewer (bv). Users can modify individual fields via quick-edit pickers, edit titles inline, or open a full per-issue markdown file in a terminal editor. All mutations go through the `br` CLI as a subprocess — bv never writes to JSONL or SQLite directly. The current fork is based on upstream bv v0.22.0.
 
 ---
 

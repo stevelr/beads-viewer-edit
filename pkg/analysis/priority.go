@@ -779,6 +779,15 @@ const MaxUnblockedIDsShown = 10
 // computeWhatIfDelta calculates the impact of completing an issue (bv-83)
 func (a *Analyzer) computeWhatIfDelta(issueID string) *WhatIfDelta {
 	stats := a.Analyze()
+	return a.computeWhatIfDeltaFromStats(issueID, &stats)
+}
+
+// computeWhatIfDeltaFromStats calculates the impact of completing an issue
+// using graph statistics already owned by the caller.
+func (a *Analyzer) computeWhatIfDeltaFromStats(issueID string, stats *GraphStats) *WhatIfDelta {
+	if stats == nil {
+		return a.computeWhatIfDelta(issueID)
+	}
 
 	// Get direct unblocks using existing method
 	directUnblocks := a.computeUnblocks(issueID)

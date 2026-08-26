@@ -54,7 +54,9 @@ brews:
     directory: Formula
     homepage: https://github.com/Dicklesworthstone/beads_viewer
     description: "Graph-aware task management TUI for beads projects"
-    license: "MIT"
+    custom_block: |
+      license :cannot_represent
+    skip_upload: true
     install: |
       bin.install "bv"
     test: |
@@ -78,4 +80,5 @@ scoops:
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     homepage: https://github.com/Dicklesworthstone/beads_viewer
     description: "Graph-aware task management TUI for beads projects"
-    license: MIT
+    license: https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/main/LICENSE
+    skip_upload: true

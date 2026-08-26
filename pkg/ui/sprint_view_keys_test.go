@@ -10,7 +10,7 @@ import (
 )
 
 func TestHandleSprintKeys_Exit(t *testing.T) {
-	m := Model{
+	m := &Model{
 		isSprintView: true,
 		focused:      focusDetail,
 		theme:        DefaultTheme(lipgloss.NewRenderer(nil)),
@@ -33,7 +33,7 @@ func TestHandleSprintKeys_NextPrevSprint(t *testing.T) {
 		{ID: "s2", Name: "Sprint 2", StartDate: now.AddDate(0, 0, -1), EndDate: now.AddDate(0, 0, 7), BeadIDs: []string{"A"}},
 	}
 
-	m := Model{
+	m := &Model{
 		isSprintView:   true,
 		theme:          DefaultTheme(lipgloss.NewRenderer(nil)),
 		width:          100,
@@ -145,7 +145,7 @@ func TestTruncateStrSprint(t *testing.T) {
 // =============================================================================
 
 func TestRenderSprintDashboard_NoSprintSelected(t *testing.T) {
-	m := Model{
+	m := &Model{
 		theme:          DefaultTheme(lipgloss.NewRenderer(nil)),
 		width:          100,
 		height:         40,
@@ -168,7 +168,7 @@ func TestRenderSprintDashboard_BasicSprint(t *testing.T) {
 		BeadIDs:   []string{"A", "B"},
 	}
 
-	m := Model{
+	m := &Model{
 		theme:          DefaultTheme(lipgloss.NewRenderer(nil)),
 		width:          100,
 		height:         40,
@@ -207,7 +207,7 @@ func TestRenderSprintDashboard_AllStatusTypes(t *testing.T) {
 		BeadIDs:   []string{"A", "B", "C", "D"},
 	}
 
-	m := Model{
+	m := &Model{
 		theme:          DefaultTheme(lipgloss.NewRenderer(nil)),
 		width:          100,
 		height:         50,
@@ -243,7 +243,7 @@ func TestRenderSprintDashboard_AtRiskItems(t *testing.T) {
 		BeadIDs:   []string{"A", "B"},
 	}
 
-	m := Model{
+	m := &Model{
 		theme:          DefaultTheme(lipgloss.NewRenderer(nil)),
 		width:          100,
 		height:         50,
@@ -277,7 +277,7 @@ func TestRenderSprintDashboard_NoAtRiskItems(t *testing.T) {
 		BeadIDs:   []string{"A"},
 	}
 
-	m := Model{
+	m := &Model{
 		theme:          DefaultTheme(lipgloss.NewRenderer(nil)),
 		width:          100,
 		height:         50,
@@ -305,7 +305,7 @@ func TestRenderSprintDashboard_NarrowWidth(t *testing.T) {
 		BeadIDs:   []string{"A"},
 	}
 
-	m := Model{
+	m := &Model{
 		theme:          DefaultTheme(lipgloss.NewRenderer(nil)),
 		width:          30, // Very narrow
 		height:         40,
@@ -332,7 +332,7 @@ func TestRenderSprintDashboard_ZeroDaysRemaining(t *testing.T) {
 		BeadIDs:   []string{"A"},
 	}
 
-	m := Model{
+	m := &Model{
 		theme:          DefaultTheme(lipgloss.NewRenderer(nil)),
 		width:          100,
 		height:         40,
@@ -373,7 +373,7 @@ func TestRenderSprintDashboard_ManyBeads(t *testing.T) {
 		BeadIDs:   beadIDs,
 	}
 
-	m := Model{
+	m := &Model{
 		theme:          DefaultTheme(lipgloss.NewRenderer(nil)),
 		width:          100,
 		height:         50,
@@ -398,7 +398,7 @@ func TestRenderSprintDashboard_InsufficientData(t *testing.T) {
 		// No start/end dates
 	}
 
-	m := Model{
+	m := &Model{
 		theme:          DefaultTheme(lipgloss.NewRenderer(nil)),
 		width:          100,
 		height:         40,
@@ -416,7 +416,7 @@ func TestRenderSprintDashboard_InsufficientData(t *testing.T) {
 }
 
 func TestHandleSprintKeys_EscExit(t *testing.T) {
-	m := Model{
+	m := &Model{
 		isSprintView: true,
 		focused:      focusDetail,
 		theme:        DefaultTheme(lipgloss.NewRenderer(nil)),
@@ -440,7 +440,7 @@ func TestHandleSprintKeys_DownArrow(t *testing.T) {
 		{ID: "s2", Name: "Sprint 2", StartDate: now.AddDate(0, 0, -1), EndDate: now.AddDate(0, 0, 7), BeadIDs: []string{"A"}},
 	}
 
-	m := Model{
+	m := &Model{
 		isSprintView:   true,
 		theme:          DefaultTheme(lipgloss.NewRenderer(nil)),
 		width:          100,
@@ -463,7 +463,7 @@ func TestHandleSprintKeys_UpArrow(t *testing.T) {
 		{ID: "s2", Name: "Sprint 2", StartDate: now.AddDate(0, 0, -1), EndDate: now.AddDate(0, 0, 7), BeadIDs: []string{"A"}},
 	}
 
-	m := Model{
+	m := &Model{
 		isSprintView:   true,
 		theme:          DefaultTheme(lipgloss.NewRenderer(nil)),
 		width:          100,
@@ -485,7 +485,7 @@ func TestHandleSprintKeys_BoundaryAtFirst(t *testing.T) {
 		{ID: "s1", Name: "Sprint 1", StartDate: now.AddDate(0, 0, -7), EndDate: now.AddDate(0, 0, -1), BeadIDs: []string{"A"}},
 	}
 
-	m := Model{
+	m := &Model{
 		isSprintView:   true,
 		theme:          DefaultTheme(lipgloss.NewRenderer(nil)),
 		width:          100,
@@ -508,7 +508,7 @@ func TestHandleSprintKeys_BoundaryAtLast(t *testing.T) {
 		{ID: "s1", Name: "Sprint 1", StartDate: now.AddDate(0, 0, -7), EndDate: now.AddDate(0, 0, -1), BeadIDs: []string{"A"}},
 	}
 
-	m := Model{
+	m := &Model{
 		isSprintView:   true,
 		theme:          DefaultTheme(lipgloss.NewRenderer(nil)),
 		width:          100,
@@ -531,7 +531,7 @@ func TestHandleSprintKeys_NilSelectedSprint(t *testing.T) {
 		{ID: "s1", Name: "Sprint 1", StartDate: now.AddDate(0, 0, -7), EndDate: now.AddDate(0, 0, -1), BeadIDs: []string{"A"}},
 	}
 
-	m := Model{
+	m := &Model{
 		isSprintView:   true,
 		theme:          DefaultTheme(lipgloss.NewRenderer(nil)),
 		width:          100,

@@ -130,13 +130,17 @@ func BenchmarkRealData_TriagePhase1Only(b *testing.B) {
 func BenchmarkRealData_FullAnalysis(b *testing.B) {
 	issues := loadProjectBeads(b)
 	b.Logf("Loaded %d real issues for benchmark", len(issues))
+	// Graph construction is intentionally outside the timer; the separate
+	// BenchmarkRealData_GraphBuild owns that cost.
+	an := analysis.NewAnalyzer(issues)
+	cfg := analysis.FullAnalysisConfig()
+	cfg.DisableCache = true
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		an := analysis.NewAnalyzer(issues)
-		_ = an.AnalyzeWithConfig(analysis.FullAnalysisConfig())
+		_ = an.AnalyzeWithConfig(cfg)
 	}
 }
 
@@ -144,14 +148,16 @@ func BenchmarkRealData_FullAnalysis(b *testing.B) {
 func BenchmarkRealData_FastAnalysis(b *testing.B) {
 	issues := loadProjectBeads(b)
 	b.Logf("Loaded %d real issues for benchmark", len(issues))
+	// Graph construction is intentionally outside the timer; the separate
+	// BenchmarkRealData_GraphBuild owns that cost.
+	an := analysis.NewAnalyzer(issues)
 
-	cfg := analysis.AnalysisConfig{} // Default: Phase 1 only
+	cfg := analysis.AnalysisConfig{DisableCache: true} // Fresh Phase 1 only
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		an := analysis.NewAnalyzer(issues)
 		_ = an.AnalyzeWithConfig(cfg)
 	}
 }

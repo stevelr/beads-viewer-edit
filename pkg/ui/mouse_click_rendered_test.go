@@ -11,7 +11,7 @@ import (
 // appears. It returns -1 if the marker isn't found. This walks the SAME bytes
 // the user sees, so any drift in the rendered chrome (filter bar, header wrap,
 // border) is reflected here — unlike asserting against hard-coded offsets.
-func rowYInRenderedView(t *testing.T, m Model, marker string) int {
+func rowYInRenderedView(t *testing.T, m *Model, marker string) int {
 	t.Helper()
 	var view string
 	if m.isSplitView {

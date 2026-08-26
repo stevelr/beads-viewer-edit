@@ -332,7 +332,7 @@ func keyMsg(key string) tea.KeyMsg {
 }
 
 // setupTestModel creates a ready model with test data for key dispatch tests.
-func setupTestModel(t *testing.T) Model {
+func setupTestModel(t *testing.T) *Model {
 	t.Helper()
 	issues := testIssuesForKeyDispatch()
 	return NewModel(issues, nil, "")
@@ -353,7 +353,7 @@ func TestKeyDispatch_BoardNavigation(t *testing.T) {
 
 	// Switch to board view
 	updated, _ := m.Update(keyMsg("b"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if m.focused != focusBoard {
 		t.Fatalf("Expected focusBoard after 'b' key, got %v", m.focused)
@@ -362,19 +362,19 @@ func TestKeyDispatch_BoardNavigation(t *testing.T) {
 	tests := []struct {
 		key      string
 		desc     string
-		checkFn  func(Model) bool
+		checkFn  func(*Model) bool
 		expected string
 	}{
-		{"h", "left navigation", func(m Model) bool { return m.focused == focusBoard }, "stays in board"},
-		{"l", "right navigation", func(m Model) bool { return m.focused == focusBoard }, "stays in board"},
-		{"j", "down navigation", func(m Model) bool { return m.focused == focusBoard }, "stays in board"},
-		{"k", "up navigation", func(m Model) bool { return m.focused == focusBoard }, "stays in board"},
+		{"h", "left navigation", func(m *Model) bool { return m.focused == focusBoard }, "stays in board"},
+		{"l", "right navigation", func(m *Model) bool { return m.focused == focusBoard }, "stays in board"},
+		{"j", "down navigation", func(m *Model) bool { return m.focused == focusBoard }, "stays in board"},
+		{"k", "up navigation", func(m *Model) bool { return m.focused == focusBoard }, "stays in board"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.desc, func(t *testing.T) {
 			updated, _ := m.Update(keyMsg(tc.key))
-			result := updated.(Model)
+			result := updated.(*Model)
 			if !tc.checkFn(result) {
 				t.Errorf("focus=%v key=%s expected=%s actual=focus:%v", focusBoard, tc.key, tc.expected, result.focused)
 			}
@@ -389,7 +389,7 @@ func TestKeyDispatch_GraphNavigation(t *testing.T) {
 
 	// Switch to graph view
 	updated, _ := m.Update(keyMsg("g"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if m.focused != focusGraph {
 		t.Fatalf("Expected focusGraph after 'g' key, got %v", m.focused)
@@ -398,19 +398,19 @@ func TestKeyDispatch_GraphNavigation(t *testing.T) {
 	tests := []struct {
 		key      string
 		desc     string
-		checkFn  func(Model) bool
+		checkFn  func(*Model) bool
 		expected string
 	}{
-		{"h", "left navigation", func(m Model) bool { return m.focused == focusGraph }, "stays in graph"},
-		{"l", "right navigation", func(m Model) bool { return m.focused == focusGraph }, "stays in graph"},
-		{"j", "down navigation", func(m Model) bool { return m.focused == focusGraph }, "stays in graph"},
-		{"k", "up navigation", func(m Model) bool { return m.focused == focusGraph }, "stays in graph"},
+		{"h", "left navigation", func(m *Model) bool { return m.focused == focusGraph }, "stays in graph"},
+		{"l", "right navigation", func(m *Model) bool { return m.focused == focusGraph }, "stays in graph"},
+		{"j", "down navigation", func(m *Model) bool { return m.focused == focusGraph }, "stays in graph"},
+		{"k", "up navigation", func(m *Model) bool { return m.focused == focusGraph }, "stays in graph"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.desc, func(t *testing.T) {
 			updated, _ := m.Update(keyMsg(tc.key))
-			result := updated.(Model)
+			result := updated.(*Model)
 			if !tc.checkFn(result) {
 				t.Errorf("focus=%v key=%s expected=%s actual=focus:%v", focusGraph, tc.key, tc.expected, result.focused)
 			}
@@ -427,7 +427,7 @@ func TestKeyDispatch_GInBoardStartsCombo(t *testing.T) {
 
 	// Switch to board view
 	updated, _ := m.Update(keyMsg("b"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if m.focused != focusBoard {
 		t.Fatalf("Expected focusBoard after 'b', got %v", m.focused)
@@ -435,7 +435,7 @@ func TestKeyDispatch_GInBoardStartsCombo(t *testing.T) {
 
 	// 'g' starts combo timer - should NOT immediately toggle to graph
 	updated, _ = m.Update(keyMsg("g"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	// Should still be in board (combo timer started, not yet expired)
 	if m.focused != focusBoard {
@@ -456,7 +456,7 @@ func TestKeyDispatch_GInTreeStartsCombo(t *testing.T) {
 
 	// Switch to tree view
 	updated, _ := m.Update(keyMsg("E"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if m.focused != focusTree {
 		t.Fatalf("Expected focusTree after 'E', got %v", m.focused)
@@ -464,7 +464,7 @@ func TestKeyDispatch_GInTreeStartsCombo(t *testing.T) {
 
 	// First 'g' starts combo timer - should NOT immediately toggle to graph
 	updated, _ = m.Update(keyMsg("g"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	// Should still be in tree (combo timer started, not yet expired)
 	if m.focused != focusTree {
@@ -477,7 +477,7 @@ func TestKeyDispatch_GInTreeStartsCombo(t *testing.T) {
 
 	// Second 'g' within combo window triggers gg-combo (jump to top), stays in tree
 	updated, _ = m.Update(keyMsg("g"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if m.focused != focusTree {
 		t.Errorf("focus=tree key=gg expected=tree (gg-combo) actual=focus:%v", m.focused)
@@ -494,7 +494,7 @@ func TestKeyDispatch_ComboCancelledByOtherKey(t *testing.T) {
 
 	// Switch to board view
 	updated, _ := m.Update(keyMsg("b"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if m.focused != focusBoard {
 		t.Fatalf("Expected focusBoard after 'b', got %v", m.focused)
@@ -502,7 +502,7 @@ func TestKeyDispatch_ComboCancelledByOtherKey(t *testing.T) {
 
 	// First 'g' starts combo timer
 	updated, _ = m.Update(keyMsg("g"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if m.pendingComboKey != "g" {
 		t.Fatalf("Expected pendingComboKey='g' after first g, got %q", m.pendingComboKey)
@@ -510,7 +510,7 @@ func TestKeyDispatch_ComboCancelledByOtherKey(t *testing.T) {
 
 	// Press 'j' (navigation) - should CANCEL the pending combo
 	updated, _ = m.Update(keyMsg("j"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	// pendingComboKey should be cleared (combo cancelled)
 	if m.pendingComboKey != "" {
@@ -529,7 +529,7 @@ func TestKeyDispatch_Regression_QInHistoryClosesHistory(t *testing.T) {
 
 	// Toggle history view on
 	updated, _ := m.Update(keyMsg("h"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if !m.isHistoryView || m.focused != focusHistory {
 		t.Fatalf("Expected history view after 'h', got isHistoryView=%v focused=%v", m.isHistoryView, m.focused)
@@ -537,7 +537,7 @@ func TestKeyDispatch_Regression_QInHistoryClosesHistory(t *testing.T) {
 
 	// Press 'q' - should close history (falls through to quit confirm or handled by global)
 	updated, _ = m.Update(keyMsg("q"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	// 'q' in history should close history view (or show quit confirm if at top level)
 	// Based on the code, 'q' is not in the history handler's key list, so it falls through
@@ -552,7 +552,7 @@ func TestKeyDispatch_Regression_EscInTreeReturnsList(t *testing.T) {
 
 	// Toggle tree view on (E, not f - f is FlowMatrix)
 	updated, _ := m.Update(keyMsg("E"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if m.focused != focusTree {
 		t.Fatalf("Expected focusTree after 'E', got %v", m.focused)
@@ -560,7 +560,7 @@ func TestKeyDispatch_Regression_EscInTreeReturnsList(t *testing.T) {
 
 	// Press ESC - should return to list
 	updated, _ = m.Update(keyMsg("esc"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	// ESC is handled by tree and should close tree or return to list
 	// Based on code: "esc" is in tree handler's list
@@ -574,7 +574,7 @@ func TestKeyDispatch_Regression_FInHistoryTogglesFileTree(t *testing.T) {
 
 	// Toggle history view on
 	updated, _ := m.Update(keyMsg("h"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if m.focused != focusHistory {
 		t.Fatalf("Expected focusHistory after 'h', got %v", m.focused)
@@ -582,7 +582,7 @@ func TestKeyDispatch_Regression_FInHistoryTogglesFileTree(t *testing.T) {
 
 	// Press 'f' - should toggle file tree within history
 	updated, _ = m.Update(keyMsg("f"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	// 'f' is handled by history handler
 	// Verify we're still in history (file tree is internal state)
@@ -594,19 +594,19 @@ func TestKeyDispatch_Regression_BoardSearchConsumesInput(t *testing.T) {
 	m := setupTestModel(t)
 
 	updated, _ := m.Update(keyMsg("b"))
-	m = updated.(Model)
+	m = updated.(*Model)
 	if m.focused != focusBoard || !m.isBoardView {
 		t.Fatalf("Expected board view after 'b', got focused=%v isBoardView=%v", m.focused, m.isBoardView)
 	}
 
 	updated, _ = m.Update(keyMsg("/"))
-	m = updated.(Model)
+	m = updated.(*Model)
 	if !m.board.IsSearchMode() {
 		t.Fatal("expected board search mode after '/'")
 	}
 
 	updated, _ = m.Update(keyMsg("b"))
-	m = updated.(Model)
+	m = updated.(*Model)
 	if got := m.board.SearchQuery(); got != "b" {
 		t.Fatalf("expected board search query %q, got %q", "b", got)
 	}
@@ -615,13 +615,13 @@ func TestKeyDispatch_Regression_BoardSearchConsumesInput(t *testing.T) {
 	}
 
 	updated, _ = m.Update(keyMsg("backspace"))
-	m = updated.(Model)
+	m = updated.(*Model)
 	if got := m.board.SearchQuery(); got != "" {
 		t.Fatalf("expected board search query to clear after backspace, got %q", got)
 	}
 
 	updated, _ = m.Update(keyMsg("esc"))
-	m = updated.(Model)
+	m = updated.(*Model)
 	if m.board.IsSearchMode() {
 		t.Fatal("expected esc to cancel board search mode")
 	}
@@ -634,19 +634,19 @@ func TestKeyDispatch_Regression_HistorySearchConsumesGlobalKeys(t *testing.T) {
 	m := setupTestModel(t)
 
 	updated, _ := m.Update(keyMsg("h"))
-	m = updated.(Model)
+	m = updated.(*Model)
 	if m.focused != focusHistory || !m.isHistoryView {
 		t.Fatalf("Expected history view after 'h', got focused=%v isHistoryView=%v", m.focused, m.isHistoryView)
 	}
 
 	updated, _ = m.Update(keyMsg("/"))
-	m = updated.(Model)
+	m = updated.(*Model)
 	if !m.historyView.IsSearchActive() {
 		t.Fatal("expected history search mode after '/'")
 	}
 
 	updated, _ = m.Update(keyMsg("q"))
-	m = updated.(Model)
+	m = updated.(*Model)
 	if got := m.historyView.SearchQuery(); got != "q" {
 		t.Fatalf("expected history search query %q, got %q", "q", got)
 	}
@@ -655,7 +655,7 @@ func TestKeyDispatch_Regression_HistorySearchConsumesGlobalKeys(t *testing.T) {
 	}
 
 	updated, _ = m.Update(keyMsg("esc"))
-	m = updated.(Model)
+	m = updated.(*Model)
 	if m.historyView.IsSearchActive() {
 		t.Fatal("expected esc to cancel history search mode")
 	}
@@ -672,14 +672,14 @@ func TestKeyDispatch_Regression_LabelPickerConsumesQKey(t *testing.T) {
 	m := setupTestModel(t)
 
 	updated, _ := m.Update(keyMsg("l"))
-	m = updated.(Model)
+	m = updated.(*Model)
 	if m.focused != focusLabelPicker || !m.showLabelPicker {
 		t.Fatalf("expected label picker after 'l', got focused=%v showLabelPicker=%v", m.focused, m.showLabelPicker)
 	}
 
 	// Typing a lowercase q must append to the filter, not quit/close the picker.
 	updated, _ = m.Update(keyMsg("q"))
-	m = updated.(Model)
+	m = updated.(*Model)
 	if !m.showLabelPicker || m.focused != focusLabelPicker {
 		t.Fatalf("expected label picker to stay open after typing 'q', got focused=%v showLabelPicker=%v", m.focused, m.showLabelPicker)
 	}
@@ -690,7 +690,7 @@ func TestKeyDispatch_Regression_LabelPickerConsumesQKey(t *testing.T) {
 	// Subsequent printable chars keep appending (e.g. building "required").
 	for _, k := range []string{"u", "e"} {
 		updated, _ = m.Update(keyMsg(k))
-		m = updated.(Model)
+		m = updated.(*Model)
 	}
 	if got := m.labelPicker.InputValue(); got != "que" {
 		t.Fatalf("expected label filter input %q, got %q", "que", got)
@@ -698,7 +698,7 @@ func TestKeyDispatch_Regression_LabelPickerConsumesQKey(t *testing.T) {
 
 	// Esc still cancels the picker and returns to the list.
 	updated, _ = m.Update(keyMsg("esc"))
-	m = updated.(Model)
+	m = updated.(*Model)
 	if m.showLabelPicker || m.focused != focusList {
 		t.Fatalf("expected esc to cancel label picker, got focused=%v showLabelPicker=%v", m.focused, m.showLabelPicker)
 	}
@@ -708,18 +708,18 @@ func TestKeyDispatch_Regression_HistorySearchEnterKeepsFilter(t *testing.T) {
 	m := setupTestModel(t)
 
 	updated, _ := m.Update(keyMsg("h"))
-	m = updated.(Model)
+	m = updated.(*Model)
 	if m.focused != focusHistory || !m.isHistoryView {
 		t.Fatalf("Expected history view after 'h', got focused=%v isHistoryView=%v", m.focused, m.isHistoryView)
 	}
 
 	updated, _ = m.Update(keyMsg("/"))
-	m = updated.(Model)
+	m = updated.(*Model)
 	updated, _ = m.Update(keyMsg("q"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	updated, _ = m.Update(keyMsg("enter"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if m.historyView.IsSearchActive() {
 		t.Fatal("expected enter to exit active history search input")
@@ -741,7 +741,7 @@ func TestKeyDispatch_Regression_HistoryFileTreeEscStaysInHistory(t *testing.T) {
 	m.historyView.SetFileTreeFocus(true)
 
 	updated, _ := m.Update(keyMsg("esc"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if !m.isHistoryView || m.focused != focusHistory {
 		t.Fatalf("expected esc in history file tree to stay in history view, got focused=%v isHistoryView=%v", m.focused, m.isHistoryView)
@@ -758,7 +758,7 @@ func TestKeyDispatch_ModalConsumesAllKeys(t *testing.T) {
 
 	// Show help modal
 	updated, _ := m.Update(keyMsg("?"))
-	m = updated.(Model)
+	m = updated.(*Model)
 
 	if !m.showHelp {
 		t.Fatalf("Expected help modal after '?'")
@@ -769,7 +769,7 @@ func TestKeyDispatch_ModalConsumesAllKeys(t *testing.T) {
 
 	for _, key := range viewToggleKeys {
 		updated, _ := m.Update(keyMsg(key))
-		result := updated.(Model)
+		result := updated.(*Model)
 
 		// Modal should still be shown - keys are consumed
 		if result.showHelp && result.focused == focusHelp {
@@ -788,18 +788,18 @@ func TestKeyDispatch_ViewToggleTable(t *testing.T) {
 	type testCase struct {
 		startFocus focus
 		key        string
-		expectFn   func(Model) (bool, string)
+		expectFn   func(*Model) (bool, string)
 	}
 
 	cases := []testCase{
 		// From list view
-		{focusList, "b", func(m Model) (bool, string) { return m.focused == focusBoard, "should toggle to board" }},
-		{focusList, "g", func(m Model) (bool, string) { return m.focused == focusGraph, "should toggle to graph" }},
-		{focusList, "h", func(m Model) (bool, string) { return m.isHistoryView, "should toggle to history" }},
-		{focusList, "f", func(m Model) (bool, string) { return m.focused == focusFlowMatrix, "should toggle to flow matrix" }},
-		{focusList, "E", func(m Model) (bool, string) { return m.focused == focusTree, "should toggle to tree" }},
-		{focusList, "i", func(m Model) (bool, string) { return m.focused == focusInsights, "should toggle to insights" }},
-		{focusList, "a", func(m Model) (bool, string) { return m.focused == focusActionable, "should toggle to actionable" }},
+		{focusList, "b", func(m *Model) (bool, string) { return m.focused == focusBoard, "should toggle to board" }},
+		{focusList, "g", func(m *Model) (bool, string) { return m.focused == focusGraph, "should toggle to graph" }},
+		{focusList, "h", func(m *Model) (bool, string) { return m.isHistoryView, "should toggle to history" }},
+		{focusList, "f", func(m *Model) (bool, string) { return m.focused == focusFlowMatrix, "should toggle to flow matrix" }},
+		{focusList, "E", func(m *Model) (bool, string) { return m.focused == focusTree, "should toggle to tree" }},
+		{focusList, "i", func(m *Model) (bool, string) { return m.focused == focusInsights, "should toggle to insights" }},
+		{focusList, "a", func(m *Model) (bool, string) { return m.focused == focusActionable, "should toggle to actionable" }},
 
 		// Note: 'g' in board uses gg-combo mechanism (async timeout before graph toggle),
 		// so it can't be tested with simple synchronous Update() calls.
@@ -825,19 +825,19 @@ func TestKeyDispatch_ViewToggleTable(t *testing.T) {
 			switch tc.startFocus {
 			case focusBoard:
 				updated, _ := m.Update(keyMsg("b"))
-				m = updated.(Model)
+				m = updated.(*Model)
 			case focusGraph:
 				updated, _ := m.Update(keyMsg("g"))
-				m = updated.(Model)
+				m = updated.(*Model)
 			case focusTree:
 				updated, _ := m.Update(keyMsg("E"))
-				m = updated.(Model)
+				m = updated.(*Model)
 			case focusHistory:
 				updated, _ := m.Update(keyMsg("h"))
-				m = updated.(Model)
+				m = updated.(*Model)
 			case focusInsights:
 				updated, _ := m.Update(keyMsg("i"))
-				m = updated.(Model)
+				m = updated.(*Model)
 			}
 
 			if m.focused != tc.startFocus && tc.startFocus != focusHistory {
@@ -846,7 +846,7 @@ func TestKeyDispatch_ViewToggleTable(t *testing.T) {
 
 			// Send the test key
 			updated, _ := m.Update(keyMsg(tc.key))
-			result := updated.(Model)
+			result := updated.(*Model)
 
 			ok, expected := tc.expectFn(result)
 			if !ok {

@@ -252,6 +252,16 @@ func (s *SemanticSearch) SetDocs(docs map[string]string) {
 	s.snapshot.Store(snap)
 }
 
+// setSnapshotDocuments installs immutable document metadata prepared by a
+// DataSnapshot. The snapshot owns both containers for their entire lifetime,
+// so the UI event loop does not need to copy every ID and document on reload.
+func (s *SemanticSearch) setSnapshotDocuments(ids []string, docs map[string]string) {
+	snap := s.Snapshot()
+	snap.IDs = ids
+	snap.Docs = docs
+	s.snapshot.Store(snap)
+}
+
 // Filter implements list.FilterFunc, returning ranks sorted by semantic similarity.
 // This is non-blocking: returns cached results or fuzzy fallback immediately,
 // and marks the term as pending for async computation.

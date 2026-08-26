@@ -382,6 +382,7 @@ func TestIssuePoolResetsFields(t *testing.T) {
 	issue.Description = "desc"
 	issue.Assignee = "owner"
 	issue.DueDate = &now
+	issue.DeferUntil = &now
 	issue.ClosedAt = &now
 	issue.EstimatedMinutes = new(int)
 	*issue.EstimatedMinutes = 42
@@ -398,8 +399,8 @@ func TestIssuePoolResetsFields(t *testing.T) {
 	if reset.ID != "" || reset.Title != "" || reset.Description != "" || reset.Assignee != "" {
 		t.Fatalf("expected scalar fields to be cleared, got ID=%q title=%q desc=%q assignee=%q", reset.ID, reset.Title, reset.Description, reset.Assignee)
 	}
-	if reset.DueDate != nil || reset.ClosedAt != nil || reset.EstimatedMinutes != nil || reset.ExternalRef != nil {
-		t.Fatalf("expected pointer fields to be nil: due=%v closed=%v est=%v ext=%v", reset.DueDate, reset.ClosedAt, reset.EstimatedMinutes, reset.ExternalRef)
+	if reset.DueDate != nil || reset.DeferUntil != nil || reset.ClosedAt != nil || reset.EstimatedMinutes != nil || reset.ExternalRef != nil {
+		t.Fatalf("expected pointer fields to be nil: due=%v defer=%v closed=%v est=%v ext=%v", reset.DueDate, reset.DeferUntil, reset.ClosedAt, reset.EstimatedMinutes, reset.ExternalRef)
 	}
 	if len(reset.Dependencies) != 0 {
 		t.Fatalf("expected dependencies to be reset, got %d", len(reset.Dependencies))
@@ -1283,7 +1284,14 @@ func TestGetBeadsDir_EmptyRepoPath_UsesCwd(t *testing.T) {
 	}
 	defer os.Chdir(oldCwd)
 
-	expected := filepath.Join(tmpDir, ".beads")
+	// os.Getwd canonicalizes macOS's /var symlink to /private/var, while
+	// t.TempDir may retain the non-canonical spelling. Compare against the
+	// actual cwd that GetBeadsDir observes rather than the pre-chdir string.
+	currentDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Failed to get temp cwd: %v", err)
+	}
+	expected := filepath.Join(currentDir, ".beads")
 
 	result, err := loader.GetBeadsDir("")
 	if err != nil {
@@ -1465,5 +1473,58 @@ func TestGetBeadsDir_RedirectMissingTargetErrors(t *testing.T) {
 
 	if _, err := loader.GetBeadsDir(root); err == nil {
 		t.Fatal("expected missing-target error, got nil")
+	}
+}
+
+func TestIsBDWorkspace_EmbeddedDoltDir(t *testing.T) {
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "embeddeddolt"), 0o755); err != nil {
+		t.Fatalf("mkdir embeddeddolt: %v", err)
+	}
+
+	if !loader.IsBDWorkspace(beadsDir) {
+		t.Fatal("IsBDWorkspace() = false for .beads/embeddeddolt, want true (#189)")
+	}
+}
+
+func TestFindJSONLPath_BDWorkspaceRejectsStrayJSONL(t *testing.T) {
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "embeddeddolt"), 0o755); err != nil {
+		t.Fatalf("mkdir embeddeddolt: %v", err)
+	}
+	// A stray non-issue JSONL must not be silently selected in a bd
+	// workspace whose compatibility export is missing (#189).
+	if err := os.WriteFile(filepath.Join(beadsDir, "memories.jsonl"), []byte(`{"_type":"memory","id":"m1"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loader.FindJSONLPath(beadsDir)
+	if err == nil {
+		t.Fatal("FindJSONLPath() = nil error for bd workspace without issues.jsonl, want loud error")
+	}
+	if !strings.Contains(err.Error(), "bd export") {
+		t.Errorf("error should suggest bd export, got: %v", err)
+	}
+}
+
+func TestFindJSONLPath_BDWorkspaceAcceptsEmptyIssuesJSONL(t *testing.T) {
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "embeddeddolt"), 0o755); err != nil {
+		t.Fatalf("mkdir embeddeddolt: %v", err)
+	}
+	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(issuesPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := loader.FindJSONLPath(beadsDir)
+	if err != nil {
+		t.Fatalf("FindJSONLPath() error = %v", err)
+	}
+	if got != issuesPath {
+		t.Fatalf("FindJSONLPath() = %q, want %q (empty export = legitimately empty project)", got, issuesPath)
 	}
 }

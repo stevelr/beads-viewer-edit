@@ -5,10 +5,104 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+// maxLoadReportWarnings caps how many per-line warning messages a LoadReport
+// retains, so a pathologically corrupt file cannot bloat robot payloads.
+const maxLoadReportWarnings = 10
+
+// LoadReport captures per-line parse accounting for the most recent successful
+// JSONL load, so callers (robot payload emitters in particular) can surface
+// records that were dropped during load instead of silently reporting them as
+// nonexistent (#190). Errors counts issue-shaped lines that were malformed JSON
+// or failed model validation (e.g. updated_at < created_at); each such skip
+// also contributes a human-readable reason to Warnings (capped).
+type LoadReport struct {
+	// Path is the JSONL file the report describes.
+	Path string
+	// Valid is the number of issue lines that parsed and validated.
+	Valid int
+	// Errors is the number of issue-shaped lines dropped as malformed JSON or
+	// failed model validation.
+	Errors int
+	// Skipped is the number of recognized non-issue `_type` records.
+	Skipped int
+	// Warnings holds up to maxLoadReportWarnings skip reasons, in file order.
+	Warnings []string
+}
+
+var (
+	lastLoadReportMu sync.Mutex
+	lastLoadReport   *LoadReport
+)
+
+// LastLoadReport returns a copy of the parse accounting recorded by the most
+// recent successful JSONL load in this process, or nil when no JSONL load has
+// completed (e.g. the issues came from SQLite). Robot commands consult this to
+// emit a `load_stats` block whenever records were dropped during load (#190).
+func LastLoadReport() *LoadReport {
+	lastLoadReportMu.Lock()
+	defer lastLoadReportMu.Unlock()
+	if lastLoadReport == nil {
+		return nil
+	}
+	cp := *lastLoadReport
+	cp.Warnings = append([]string(nil), lastLoadReport.Warnings...)
+	return &cp
+}
+
+func recordLoadReport(rep LoadReport) {
+	lastLoadReportMu.Lock()
+	defer lastLoadReportMu.Unlock()
+	lastLoadReport = &rep
+}
+
+// loadRecorder wires a single JSONL parse to a LoadReport: it collects
+// ParseStats plus the loader's per-line skip warnings, mirroring the default
+// warning behavior (stderr in interactive mode, quiet under BV_ROBOT=1 so
+// robot stdout/stderr stay clean — the accounting surfaces in the JSON
+// payload instead).
+type loadRecorder struct {
+	path     string
+	stats    loader.ParseStats
+	warnings []string
+	robot    bool
+}
+
+func newLoadRecorder(path string) *loadRecorder {
+	return &loadRecorder{path: path, robot: os.Getenv("BV_ROBOT") == "1"}
+}
+
+func (r *loadRecorder) options() loader.ParseOptions {
+	return loader.ParseOptions{
+		Stats: &r.stats,
+		WarningHandler: func(msg string) {
+			if len(r.warnings) < maxLoadReportWarnings {
+				r.warnings = append(r.warnings, msg)
+			}
+			if !r.robot {
+				fmt.Fprintf(os.Stderr, "Warning: %s\n", msg)
+			}
+		},
+	}
+}
+
+// commit records the parse accounting as the process-wide last load report.
+// Call only after the load succeeded — failed candidates in the smart-load
+// fallthrough must not pollute the report for the source actually used.
+func (r *loadRecorder) commit() {
+	recordLoadReport(LoadReport{
+		Path:     r.path,
+		Valid:    r.stats.Valid,
+		Errors:   r.stats.Errors,
+		Skipped:  r.stats.Skipped,
+		Warnings: append([]string(nil), r.warnings...),
+	})
+}
 
 // LoadIssues performs smart multi-source detection and loading.
 // It discovers all available sources (SQLite, JSONL), validates them, selects
@@ -30,29 +124,81 @@ func LoadIssues(repoPath string) ([]model.Issue, error) {
 		return nil, err
 	}
 
+	// bd/Dolt workspaces (#189): the issue data lives in a Dolt database that
+	// bv cannot read directly, so route through the bd bridge added for #141.
+	// It refreshes the compatibility export at .beads/issues.jsonl via
+	// `bd export` when possible and errors loudly when no export exists —
+	// instead of silently reporting an empty project.
+	if loader.IsBDWorkspace(beadsDir) {
+		return loadBDWorkspace(beadsDir)
+	}
+
 	issues, smartErr := loadSmart(beadsDir, repoPath)
 	if smartErr == nil {
 		return issues, nil
 	}
 
 	// Fall back to legacy JSONL-only loading
-	return loader.LoadIssues(repoPath)
+	return loadLegacyJSONL(beadsDir)
+}
+
+// loadLegacyJSONL mirrors loader.LoadIssues' legacy behavior (tolerant parse,
+// no tombstone filtering) while publishing parse accounting via LastLoadReport.
+// This path is reached when the smart loader rejected every candidate — e.g. a
+// small JSONL whose only records fail validation trips the error-rate gate —
+// which is exactly when dropped records MUST stay visible instead of the load
+// silently yielding fewer (or zero) issues (#190).
+func loadLegacyJSONL(beadsDir string) ([]model.Issue, error) {
+	jsonlPath, err := loader.FindJSONLPath(beadsDir)
+	if err != nil {
+		return nil, err
+	}
+	rec := newLoadRecorder(jsonlPath)
+	issues, err := loader.LoadIssuesFromFileWithOptions(jsonlPath, rec.options())
+	if err != nil {
+		return nil, err
+	}
+	rec.commit()
+	return issues, nil
 }
 
 // LoadIssuesFromDir performs smart source detection within a known beads directory.
 // This is useful when the caller already knows the .beads path.
 func LoadIssuesFromDir(beadsDir string) ([]model.Issue, error) {
+	// bd/Dolt workspaces (#189): see LoadIssues.
+	if loader.IsBDWorkspace(beadsDir) {
+		return loadBDWorkspace(beadsDir)
+	}
+
 	issues, smartErr := loadSmart(beadsDir, "")
 	if smartErr == nil {
 		return issues, nil
 	}
 
-	// Fall back to JSONL
-	jsonlPath, err := loader.FindJSONLPath(beadsDir)
-	if err != nil {
-		return nil, err
+	// Fall back to JSONL (legacy tolerant parse, with load accounting; #190)
+	return loadLegacyJSONL(beadsDir)
+}
+
+// loadBDWorkspace loads issues from a bd (Dolt-backed) workspace by resolving
+// the compatibility JSONL through loader.PrepareBeadsDirForRead (#141): it
+// refreshes .beads/issues.jsonl via `bd export` when the bd binary is
+// available, falls back to an existing export with a warning when the refresh
+// fails, and returns a hard error when no compatibility JSONL can be produced.
+// This guarantees bd workspaces either load real data or fail loudly — never
+// a silently-empty result from a stray non-issue JSONL (#189).
+func loadBDWorkspace(beadsDir string) ([]model.Issue, error) {
+	warn := func(msg string) {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", msg)
 	}
-	return loader.LoadIssuesFromFile(jsonlPath)
+	jsonlPath, err := loader.PrepareBeadsDirForRead(beadsDir, true, warn)
+	if err != nil {
+		return nil, fmt.Errorf("bd/Dolt workspace detected at %s: %w", beadsDir, err)
+	}
+	return loadAndValidateJSONL(DataSource{
+		Type:     SourceTypeJSONLLocal,
+		Path:     jsonlPath,
+		Priority: PriorityJSONLLocal,
+	})
 }
 
 // ExplicitBeadsDBSource returns the direct source named by BEADS_DB when it
@@ -181,11 +327,12 @@ func loadAndValidate(source DataSource) ([]model.Issue, error) {
 // honor the IssueReader contract. Reading the file a single time replaces the
 // previous validate-then-load double parse.
 func loadAndValidateJSONL(source DataSource) ([]model.Issue, error) {
-	var stats loader.ParseStats
-	all, err := loader.LoadIssuesFromFileWithOptions(source.Path, loader.ParseOptions{Stats: &stats})
+	rec := newLoadRecorder(source.Path)
+	all, err := loader.LoadIssuesFromFileWithOptions(source.Path, rec.options())
 	if err != nil {
 		return nil, err
 	}
+	stats := rec.stats
 
 	// Apply the error-rate gate against the same default threshold
 	// validateJSONL enforces. Malformed JSON or failed model validation count as
@@ -209,6 +356,10 @@ func loadAndValidateJSONL(source DataSource) ([]model.Issue, error) {
 	if stats.Valid == 0 && stats.Errors+stats.Skipped > 0 {
 		return nil, fmt.Errorf("%s: no issue records (%d non-issue/error lines, 0 valid issues)", source.Path, stats.Errors+stats.Skipped)
 	}
+
+	// This source is the one actually being used: publish its parse accounting
+	// so robot payloads can surface any dropped records (#190).
+	rec.commit()
 
 	// Filter out tombstone issues to match the IssueReader contract (the same
 	// filtering JSONLReader.LoadIssues applies).

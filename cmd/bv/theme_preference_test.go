@@ -83,6 +83,38 @@ func TestLoadThemeFromUserConfig(t *testing.T) {
 	}
 }
 
+func TestLoadBackgroundModeFromUserConfig(t *testing.T) {
+	tests := []struct {
+		name  string
+		body  string
+		want  bool
+		found bool
+	}{
+		{name: "enabled", body: "experimental:\n  background_mode: true\n", want: true, found: true},
+		{name: "disabled", body: "experimental:\n  background_mode: false\n", want: false, found: true},
+		{name: "missing key", body: "theme: dark\n", found: false},
+		{name: "malformed yaml", body: "experimental: [unterminated\n", found: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withThemeConfig(t, tt.body)
+			got, found := loadBackgroundModeFromUserConfig()
+			if got != tt.want || found != tt.found {
+				t.Fatalf("loadBackgroundModeFromUserConfig() = (%v, %v), want (%v, %v)",
+					got, found, tt.want, tt.found)
+			}
+		})
+	}
+
+	t.Run("missing file", func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		if got, found := loadBackgroundModeFromUserConfig(); got || found {
+			t.Fatalf("loadBackgroundModeFromUserConfig() = (%v, %v), want (false, false)", got, found)
+		}
+	})
+}
+
 func TestEffectiveThemePreference(t *testing.T) {
 	// Explicit flag beats env and config.
 	withThemeConfig(t, "theme: dark\n")

@@ -1,6 +1,8 @@
 package analysis
 
 import (
+	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -278,6 +280,67 @@ func TestTopWhatIfDeltas_SkipsTombstone(t *testing.T) {
 	}
 }
 
+func TestTopWhatIfDeltasFromStats_UsesProvidedStatsAndPreservesOutput(t *testing.T) {
+	const dependentCount = 12
+	issues := make([]model.Issue, 0, dependentCount+2)
+	issues = append(issues, model.Issue{ID: "ROOT", Title: "Root blocker", Status: model.StatusOpen})
+	for i := 0; i < dependentCount; i++ {
+		id := fmt.Sprintf("DEPENDENT-%03d", i)
+		issues = append(issues, model.Issue{
+			ID:     id,
+			Title:  id,
+			Status: model.StatusBlocked,
+			Dependencies: []*model.Dependency{
+				{IssueID: id, DependsOnID: "ROOT", Type: model.DepBlocks},
+			},
+		})
+	}
+	issues = append(issues, model.Issue{
+		ID:     "CASCADE",
+		Title:  "Cascade leaf",
+		Status: model.StatusBlocked,
+		Dependencies: []*model.Dependency{
+			{IssueID: "CASCADE", DependsOnID: "DEPENDENT-000", Type: model.DepBlocks},
+		},
+	})
+
+	analyzer := NewAnalyzer(issues)
+	stats := analyzer.Analyze()
+	want := analyzer.TopWhatIfDeltas(0)
+	got := analyzer.TopWhatIfDeltasFromStats(&stats, 0)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("provided-stats output differs from ordinary output:\n got: %#v\nwant: %#v", got, want)
+	}
+	if len(got) != 2 || got[0].IssueID != "ROOT" || got[1].IssueID != "DEPENDENT-000" {
+		t.Fatalf("unexpected order: %#v", got)
+	}
+
+	root := got[0].Delta
+	if root.DirectUnblocks != dependentCount || root.TransitiveUnblocks != dependentCount+1 {
+		t.Fatalf("unexpected root unblock counts: %+v", root)
+	}
+	if root.BlockedReduction != dependentCount || root.ParallelizationGain == nil || *root.ParallelizationGain != dependentCount-1 {
+		t.Fatalf("unexpected root reduction/parallelization: %+v", root)
+	}
+	if len(root.UnblockedIssueIDs) != MaxUnblockedIDsShown || root.UnblockedIssueIDs[0] != "DEPENDENT-000" || root.UnblockedIssueIDs[9] != "DEPENDENT-009" {
+		t.Fatalf("unexpected capped unblocked IDs: %v", root.UnblockedIssueIDs)
+	}
+
+	provided := &GraphStats{criticalPathScore: map[string]float64{"ROOT": MaxCriticalPathDepth}}
+	fromProvided := analyzer.TopWhatIfDeltasFromStats(provided, 1)
+	if len(fromProvided) != 1 || fromProvided[0].IssueID != "ROOT" {
+		t.Fatalf("n=1 cap returned unexpected result: %#v", fromProvided)
+	}
+	if fromProvided[0].Delta.DepthReduction != 1 {
+		t.Fatalf("provided critical-path score was not consumed: depth reduction=%v, want 1", fromProvided[0].Delta.DepthReduction)
+	}
+
+	fromNil := analyzer.TopWhatIfDeltasFromStats(nil, 0)
+	if !reflect.DeepEqual(fromNil, want) {
+		t.Fatalf("nil stats fallback differs from ordinary output:\n got: %#v\nwant: %#v", fromNil, want)
+	}
+}
+
 func TestGenerateEnhancedRecommendations_CappedAt10(t *testing.T) {
 	now := time.Now()
 	var issues []model.Issue
@@ -350,5 +413,44 @@ func TestExplanationStatus_Capped(t *testing.T) {
 
 	if status.CappedFields != "unblocked_issue_ids" {
 		t.Error("expected capped fields to be set")
+	}
+}
+
+// BenchmarkTopWhatIfDeltas_StatsReuse measures the complete top-what-if batch
+// after the analyzer's graph statistics have already been cached. The wide
+// graph keeps cascade traversal small for all but one issue, making redundant
+// per-issue cache reads visible in the benchmark result.
+func BenchmarkTopWhatIfDeltas_StatsReuse(b *testing.B) {
+	b.Setenv("BV_ROBOT", "1")
+	b.Setenv("BV_CACHE_DIR", b.TempDir())
+
+	const issueCount = 540
+	issues := make([]model.Issue, issueCount)
+	issues[0] = model.Issue{ID: "ROOT", Title: "Root blocker", Status: model.StatusOpen}
+	for i := 1; i < issueCount; i++ {
+		id := fmt.Sprintf("DEPENDENT-%03d", i)
+		issues[i] = model.Issue{
+			ID:     id,
+			Title:  id,
+			Status: model.StatusBlocked,
+			Dependencies: []*model.Dependency{
+				{IssueID: id, DependsOnID: "ROOT", Type: model.DepBlocks},
+			},
+		}
+	}
+
+	analyzer := NewAnalyzer(issues)
+	stats := analyzer.Analyze()
+	if stats.NodeCount != issueCount {
+		b.Fatalf("benchmark setup produced %d nodes, want %d", stats.NodeCount, issueCount)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		got := analyzer.TopWhatIfDeltas(10)
+		if len(got) != 1 || got[0].IssueID != "ROOT" || got[0].Delta.TransitiveUnblocks != issueCount-1 {
+			b.Fatalf("unexpected top what-if result: %+v", got)
+		}
 	}
 }

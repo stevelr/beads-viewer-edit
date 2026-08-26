@@ -1,6 +1,8 @@
 package analysis
 
 import (
+	"bytes"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -212,6 +214,16 @@ func TestFullAnalysisConfig(t *testing.T) {
 	}
 	if cfg.MaxCyclesToStore < 1000 {
 		t.Errorf("Expected high max cycles in full config, got %d", cfg.MaxCyclesToStore)
+	}
+}
+
+func TestAnalysisConfigDisableCacheIsNotSerialized(t *testing.T) {
+	encoded, err := json.Marshal(AnalysisConfig{DisableCache: true})
+	if err != nil {
+		t.Fatalf("marshalling analysis config: %v", err)
+	}
+	if bytes.Contains(encoded, []byte("DisableCache")) {
+		t.Fatalf("DisableCache is an execution control and must not change robot output schema: %s", encoded)
 	}
 }
 

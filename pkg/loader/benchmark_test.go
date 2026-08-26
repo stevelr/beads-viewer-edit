@@ -1,6 +1,7 @@
 package loader
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -76,4 +77,37 @@ func BenchmarkLoadIssuesFromFile(b *testing.B) {
 			}
 		})
 	}
+}
+
+func BenchmarkParseIssuesPoolComparison(b *testing.B) {
+	issues := testutil.QuickRandom(1000, 0.01)
+	content := []byte(testutil.ToJSONL(issues))
+	opts := ParseOptions{WarningHandler: func(string) {}}
+
+	b.Run("unpooled", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			loaded, err := ParseIssuesWithOptions(bytes.NewReader(content), opts)
+			if err != nil {
+				b.Fatalf("parse issues: %v", err)
+			}
+			if len(loaded) != len(issues) {
+				b.Fatalf("unexpected issue count: got=%d want=%d", len(loaded), len(issues))
+			}
+		}
+	})
+
+	b.Run("pooled", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			loaded, err := ParseIssuesWithOptionsPooled(bytes.NewReader(content), opts)
+			if err != nil {
+				b.Fatalf("parse pooled issues: %v", err)
+			}
+			if len(loaded.Issues) != len(issues) {
+				b.Fatalf("unexpected issue count: got=%d want=%d", len(loaded.Issues), len(issues))
+			}
+			ReturnIssuePtrsToPool(loaded.PoolRefs)
+		}
+	})
 }

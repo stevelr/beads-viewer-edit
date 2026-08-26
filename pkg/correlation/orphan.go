@@ -360,6 +360,16 @@ func (od *OrphanDetector) checkMessage(candidate *OrphanCandidate, beadScores ma
 		}
 	}
 
+	// Custom ID patterns (--id-pattern, #188) count as strong ID signals,
+	// matched against the original-case message since the pattern is
+	// user-supplied.
+	for _, re := range CustomIDPatterns() {
+		if match := re.FindString(candidate.Message); match != "" {
+			totalWeight += 25
+			matchDetails = append(matchDetails, match)
+		}
+	}
+
 	if totalWeight > 0 {
 		candidate.Signals = append(candidate.Signals, OrphanSignalHit{
 			Signal:  SignalOrphanMessage,
@@ -372,31 +382,54 @@ func (od *OrphanDetector) checkMessage(candidate *OrphanCandidate, beadScores ma
 	matches := orphanBeadIDPattern.FindAllStringSubmatch(msg, -1)
 	for _, match := range matches {
 		if len(match) >= 2 {
-			beadID := "bv-" + strings.ToLower(match[1]) // Normalize to lowercase
-			history, ok := od.lookup.beads[beadID]
-			if !ok {
-				for id, h := range od.lookup.beads {
-					if strings.EqualFold(id, beadID) {
-						beadID = id
-						history = h
-						ok = true
-						break
-					}
-				}
+			od.scoreMentionedBead(beadScores, "bv-"+strings.ToLower(match[1]))
+		}
+	}
+
+	// Custom ID patterns (--id-pattern, #188): extract candidate IDs from the
+	// original-case message and credit any that name a known bead. The ID is
+	// capture group 1 when the pattern defines one, else the whole match.
+	for _, re := range CustomIDPatterns() {
+		for _, match := range re.FindAllStringSubmatch(candidate.Message, -1) {
+			id := ""
+			if len(match) >= 2 && match[1] != "" {
+				id = match[1]
+			} else if len(match) >= 1 {
+				id = match[0]
 			}
-			if ok {
-				if _, exists := beadScores[beadID]; !exists {
-					beadScores[beadID] = &probableBeadBuilder{
-						title:  history.Title,
-						status: history.Status,
-					}
-				}
-				beadScores[beadID].score += 35
-				beadScores[beadID].reasons = append(beadScores[beadID].reasons,
-					"bead ID mentioned in commit message")
+			if id != "" {
+				od.scoreMentionedBead(beadScores, id)
 			}
 		}
 	}
+}
+
+// scoreMentionedBead credits a bead whose ID appears in a commit message.
+// Lookup is case-insensitive; unknown IDs are ignored.
+func (od *OrphanDetector) scoreMentionedBead(beadScores map[string]*probableBeadBuilder, beadID string) {
+	history, ok := od.lookup.beads[beadID]
+	if !ok {
+		for id, h := range od.lookup.beads {
+			if strings.EqualFold(id, beadID) {
+				beadID = id
+				history = h
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok {
+		return
+	}
+	if _, exists := beadScores[beadID]; !exists {
+		beadScores[beadID] = &probableBeadBuilder{
+			title:  history.Title,
+			status: history.Status,
+		}
+	}
+	beadScores[beadID].score += 35
+	beadScores[beadID].reasons = append(beadScores[beadID].reasons,
+		"bead ID mentioned in commit message")
 }
 
 // checkAuthor checks if author has linked commits nearby.
