@@ -49,8 +49,8 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 We only use **Go Modules** in this project, NEVER any other package manager.
 
-- **Version:** Go 1.25+ (check `go.mod` for exact version)
-- **Toolchain:** `go1.25.5` (see `go.mod`)
+- **Version:** Go 1.26+ (check `go.mod` for exact version)
+- **Toolchain:** `go1.26.8` (see `go.mod`)
 - **Dependency versions:** Managed via `go.mod` / `go.sum`
 - **Lockfile:** `go.sum` (auto-managed by `go mod`)
 
@@ -75,7 +75,7 @@ go mod tidy                       # Clean up unused deps
 | `charmbracelet/bubbles` | Reusable TUI components (viewport, list, etc.) |
 | `charmbracelet/huh` | Interactive form components |
 | `charmbracelet/glamour` | Markdown rendering |
-| `modernc.org/sqlite` | Pure-Go SQLite for FTS5 search index |
+| `modernc.org/sqlite` | Pure-Go SQLite for the static-site export (`beads.sqlite3` with an FTS5 index) |
 | `gonum.org/v1/gonum` | Graph algorithms (PageRank, betweenness, HITS, eigenvector) |
 | `goccy/go-json` | High-performance JSON serialization |
 | `fsnotify/fsnotify` | Filesystem event watching (daemon mode) |
@@ -202,7 +202,7 @@ go test -run TestSpecificName ./pkg/...
 | Package | Focus Areas |
 |---------|-------------|
 | `pkg/analysis` | Graph metrics (PageRank, betweenness, HITS, eigenvector, k-core), triage, planning, priority detection |
-| `pkg/search` | Hybrid semantic search (text + graph metrics), FTS5, ranking, presets |
+| `pkg/search` | Hybrid semantic search (text + graph metrics), hash embedder, ranking, presets |
 | `pkg/correlation` | Bead-to-commit correlation, orphan detection, history tracking |
 | `pkg/export` | Static site export, HTML bundle generation, GitHub Pages deployment |
 | `pkg/loader` | JSONL parsing, bead loading, validation |
@@ -230,7 +230,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ## beads_viewer — This Project
 
-**This is the project you're working on.** beads_viewer (`bv`) is a graph-aware triage engine for Beads projects (`.beads/issues.jsonl` in current `br` workspaces, with `.beads/beads.jsonl` supported for legacy/`bd` workspaces). It computes PageRank, betweenness, critical path, cycles, HITS, eigenvector, and k-core metrics deterministically. It provides both an interactive TUI and machine-readable `--robot-*` JSON outputs for AI agent consumption.
+**This is the project you're working on.** beads_viewer (`bv`) is a graph-aware triage engine for Beads projects (`.beads/issues.jsonl` in current `br` and Dolt-backed `bd` workspaces, with `.beads/beads.jsonl` supported for legacy workspaces). It computes PageRank, betweenness, critical path, cycles, HITS, eigenvector, and k-core metrics deterministically. It provides both an interactive TUI and machine-readable `--robot-*` JSON outputs for AI agent consumption.
 
 ### What It Does
 
@@ -240,7 +240,7 @@ Analyzes Beads issue graphs to produce actionable triage recommendations, parall
 
 ```
 .beads/{issues,beads}.jsonl → Loader → Graph Build → ┬─ Phase 1 (instant): degree, topo sort, density
-                                              └─ Phase 2 (async, 500ms): PageRank, betweenness,
+                                              └─ Phase 2 (async, size-tiered): PageRank, betweenness,
                                                                           HITS, eigenvector, cycles
                                                               │
                                               ┌───────────────┴───────────────┐
@@ -258,11 +258,11 @@ Analyzes Beads issue graphs to produce actionable triage recommendations, parall
 
 ```
 beads_viewer/
-├── go.mod                          # Module root (Go 1.25+)
-├── cmd/bv/                         # CLI entry point (cobra)
+├── go.mod                          # Module root (Go 1.26+)
+├── cmd/bv/                         # CLI entry point (Cobra/pflag and robot registry)
 ├── pkg/
 │   ├── analysis/                   # Graph metrics, triage, planning, priority, forecasting
-│   ├── search/                     # Hybrid semantic search (text + graph, FTS5)
+│   ├── search/                     # Hybrid semantic search (text + graph metrics)
 │   ├── correlation/                # Bead-to-commit correlation, orphan detection
 │   ├── export/                     # Static site export (HTML/JS bundle, GitHub Pages)
 │   ├── loader/                     # JSONL parsing, bead loading, validation
@@ -290,9 +290,9 @@ beads_viewer/
 
 ### Key Design Decisions
 
-- **Two-phase analysis**: Phase 1 metrics (degree, topo sort, density) are instant; Phase 2 (PageRank, betweenness, HITS, eigenvector, cycles) runs async with a 500ms timeout — check `status` flags
+- **Two-phase analysis**: Phase 1 metrics (degree, topo sort, density) are instant; Phase 2 (PageRank, betweenness, HITS, eigenvector, cycles) runs async with size-tiered timeouts (2 s down to 200 ms, `ConfigForSize` in `pkg/analysis/config.go`) — check `status` flags
 - **Robot-first API**: All `--robot-*` flags emit deterministic JSON to stdout; human TUI is secondary
-- **Pure-Go SQLite** (`modernc.org/sqlite`) for FTS5 search index — no CGO dependency
+- **Pure-Go SQLite** (`modernc.org/sqlite`) for the static-site export's FTS5 index — no CGO dependency; `pkg/search` itself is an in-memory hash-embedding index, not SQLite
 - **Hybrid search** combines text relevance with graph metrics (PageRank, status, impact, priority, recency) via configurable weight presets
 - **Elm architecture TUI** via bubbletea — all state transitions are message-based
 - **Structured error wrapping** with `fmt.Errorf("context: %w", err)` for traceability
@@ -522,7 +522,7 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` - be
 
 ## bv — Graph-Aware Triage Engine
 
-bv is a graph-aware triage engine for Beads projects (`.beads/issues.jsonl` in current `br` workspaces, with `.beads/beads.jsonl` supported for legacy/`bd` workspaces). It computes PageRank, betweenness, critical path, cycles, HITS, eigenvector, and k-core metrics deterministically.
+bv is a graph-aware triage engine for Beads projects (`.beads/issues.jsonl` in current `br` and Dolt-backed `bd` workspaces, with `.beads/beads.jsonl` supported for legacy workspaces). It computes PageRank, betweenness, critical path, cycles, HITS, eigenvector, and k-core metrics deterministically.
 
 **Scope boundary:** bv handles *what to work on* (triage, priority, planning). For agent-to-agent coordination (messaging, work claiming, file reservations), use MCP Agent Mail.
 
@@ -530,7 +530,7 @@ bv is a graph-aware triage engine for Beads projects (`.beads/issues.jsonl` in c
 
 ### The Workflow: Start With Triage
 
-**`bv --robot-triage` is your single entry point.** It returns:
+**`bv --robot-triage` is your single entry point.** Its `triage` object contains:
 - `quick_ref`: at-a-glance counts + top 3 picks
 - `recommendations`: ranked actionable items with scores, reasons, unblock info
 - `quick_wins`: low-effort high-impact items
@@ -569,7 +569,7 @@ bv --robot-next          # Minimal: just the single top pick + claim command
 | Command | Returns |
 |---------|---------|
 | `--robot-burndown <sprint>` | Sprint burndown, scope changes, at-risk items |
-| `--robot-forecast <id\|all>` | ETA predictions with dependency-aware scheduling |
+| `--robot-forecast <id\|all>` | ETA estimates from a duration heuristic and 30-day closure velocity (not a scheduler) |
 | `--robot-alerts` | Stale issues, blocking cascades, priority mismatches |
 | `--robot-suggest` | Hygiene: duplicates, missing deps, label suggestions |
 | `--robot-graph [--graph-format=json\|dot\|mermaid]` | Dependency graph export |
@@ -588,20 +588,25 @@ bv --robot-triage --robot-triage-by-label    # Group by domain
 
 ### Understanding Robot Output
 
-**All robot JSON includes:**
-- `data_hash` — Fingerprint of the source JSONL issue file
-- `status` — Per-metric state: `computed|approx|timeout|skipped` + elapsed ms
-- `as_of` / `as_of_commit` — Present when using `--as-of`
+**Issue-backed analysis output:**
+- `data_hash` — Fingerprint of issue data used by the response
+- `status` — For metric-bearing commands such as insights, plan, and priority: `computed|pending|timeout|skipped` + elapsed ms; sampled betweenness is `computed` with `reason: "approximate"`
+- `as_of` / `as_of_commit` — Present for historical issue analysis using `--as-of`
+- `source_authority`, `authority_hash`, `scope_hash` — Loaded-source completeness, full authority identity, and selected-candidate scope
+
+Metadata-only commands have their own schemas. Check `--robot-schema` for
+command-specific required fields. Source completeness does not establish a
+live tracker route; inspect the suggested action's original ID and directory.
 
 **Two-phase analysis:**
 - **Phase 1 (instant):** degree, topo sort, density
-- **Phase 2 (async, 500ms timeout):** PageRank, betweenness, HITS, eigenvector, cycles
+- **Phase 2 (async, size-tiered timeouts):** PageRank, betweenness, HITS, eigenvector, cycles. See `ConfigForSize`; check each metric's status. An empty cycle list after skipped or timed-out analysis does not prove acyclicity, and stored cycles may be capped.
 
 ### jq Quick Reference
 
 ```bash
-bv --robot-triage | jq '.quick_ref'                        # At-a-glance summary
-bv --robot-triage | jq '.recommendations[0]'               # Top recommendation
+bv --robot-triage | jq '.triage.quick_ref'                 # At-a-glance summary
+bv --robot-triage | jq '.triage.recommendations[0]'         # Top recommendation
 bv --robot-plan | jq '.plan.summary.highest_impact'        # Best unblock target
 bv --robot-insights | jq '.status'                         # Check metric readiness
 bv --robot-insights | jq '.Cycles'                         # Circular deps (must fix!)
@@ -673,6 +678,16 @@ rch queue                     # See active/waiting builds
 ```
 
 If rch or its workers are unavailable, it fails open — builds run locally as normal.
+
+### Trust boundary
+
+RCH is a remote build service, so treat every offloaded command as leaving this machine:
+
+- **What is shipped:** the working tree of the current project (source, vendor/, test fixtures, `.beads/`), the command line, and an allowlisted subset of environment variables needed by the Go toolchain. Workers cache Go modules and build outputs per project (`.rch-go/` locally mirrors that cache and is git-ignored).
+- **What must never be shipped:** secrets and tokens (`GITHUB_TOKEN`, `GH_TOKEN`, cloud credentials, `~/.netrc`, `.git/config` credential helpers), private keys, or a tree that contains customer data. Do not export such values into the shell before running a build, and do not commit them into the tree. If a build needs a credential (private module proxy, signed release), run it locally or get explicit approval first.
+- **Who runs the workers:** the 8 Contabo VPS hosts are operated by the project maintainer; they are not a shared public service. Assume anything sent there can be read by whoever administers those hosts and may be retained in caches until the next cleanup. Private or credential-bearing builds therefore require the maintainer's explicit approval per run.
+- **Fallback:** when RCH or its workers are unreachable it fails open to a local build, so a green build never proves the remote path was used; check `rch status` if that matters.
+- **Docs:** `rch doctor`, `rch --help`, and the RCH repository README describe the env allowlist and the cache lifecycle in detail.
 
 **Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
@@ -749,98 +764,6 @@ Returns structured results with file paths, line ranges, and extracted code snip
 - **Don't** use `warp_grep` to find a specific function name → use `ripgrep`
 - **Don't** use `ripgrep` to understand "how does X work" → wastes time with manual reads
 - **Don't** use `ripgrep` for codemods → risks collateral edits
-
-<!-- bv-agent-instructions-v3 -->
-
----
-
-## Beads Workflow Integration
-
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) for issue tracking and [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) (`bv`) for graph-aware triage. Issues are stored in `.beads/` and tracked in git. Current `br` workspaces normally export `.beads/issues.jsonl`; older `bd`/legacy workspaces may use `.beads/beads.jsonl`. `bv` auto-discovers the supported JSONL files, so agents should use `br`/`bv` commands instead of hard-coding a single filename.
-
-### Using bv as an AI sidecar
-
-bv is a graph-aware triage engine for Beads projects. Instead of parsing .beads/issues.jsonl / .beads/beads.jsonl directly or hallucinating graph traversal, use robot flags for deterministic, dependency-aware outputs with precomputed metrics (PageRank, betweenness, critical path, cycles, HITS, eigenvector, k-core).
-
-**Scope boundary:** bv handles *what to work on* (triage, priority, planning). `br` handles creating, modifying, and closing beads.
-
-**CRITICAL: Use ONLY --robot-* flags. Bare bv launches an interactive TUI that blocks your session.**
-
-#### The Workflow: Start With Triage
-
-**`bv --robot-triage` is your single entry point.** It returns everything you need in one call:
-- `quick_ref`: at-a-glance counts + top 3 picks
-- `recommendations`: ranked actionable items with scores, reasons, unblock info
-- `quick_wins`: low-effort high-impact items
-- `blockers_to_clear`: items that unblock the most downstream work
-- `project_health`: status/type/priority distributions, graph metrics
-- `commands`: copy-paste shell commands for next steps
-
-```bash
-bv --robot-triage        # THE MEGA-COMMAND: start here
-bv --robot-next          # Minimal: just the single top pick + claim command
-
-# Token-optimized output (TOON) for lower LLM context usage:
-bv --robot-triage --format toon
-```
-
-Before claiming, verify current state with `br show <id> --json` or `br ready --json`. `recommendations` can include graph-important blocked or assigned work; only `quick_ref.top_picks` and non-empty `claim_command` fields represent claimable work.
-
-#### Other bv Commands
-
-| Command | Returns |
-|---------|---------|
-| `--robot-plan` | Parallel execution tracks with unblocks lists |
-| `--robot-priority` | Priority misalignment detection with confidence |
-| `--robot-insights` | Full metrics: PageRank, betweenness, HITS, eigenvector, critical path, cycles, k-core |
-| `--robot-alerts` | Stale issues, blocking cascades, priority mismatches |
-| `--robot-suggest` | Hygiene: duplicates, missing deps, label suggestions, cycle breaks |
-| `--robot-diff --diff-since <ref>` | Changes since ref: new/closed/modified issues |
-| `--robot-graph [--graph-format=json\|dot\|mermaid]` | Dependency graph export |
-
-#### Scoping & Filtering
-
-```bash
-bv --robot-plan --label backend              # Scope to label's subgraph
-bv --robot-insights --as-of HEAD~30          # Historical point-in-time
-bv --recipe actionable --robot-plan          # Pre-filter: ready to work (no blockers)
-bv --recipe high-impact --robot-triage       # Pre-filter: top PageRank scores
-```
-
-### br Commands for Issue Management
-
-```bash
-br ready --json                       # Show issues ready to work (no blockers)
-br list --status=open --json          # All open issues
-br show <id> --json                   # Full issue details with dependencies
-br create --title="..." --type=task --priority=2 --json
-br update <id> --status=in_progress --json
-br close <id> --reason="Completed" --json
-br close <id1> <id2> --reason="Completed" --json
-br sync --flush-only                  # Export DB to JSONL after Beads mutations
-```
-
-### Workflow Pattern
-
-1. **Triage**: Run `bv --robot-triage` to find the highest-impact actionable work
-2. **Claim**: Use `br update <id> --status=in_progress --json`
-3. **Work**: Implement the task
-4. **Complete**: Use `br close <id> --reason="Completed" --json`
-5. **Sync**: Run `br sync --flush-only` after Beads mutations so the JSONL export is current
-
-### Key Concepts
-
-- **Dependencies**: Issues can block other issues. `br ready --json` shows only unblocked work.
-- **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers 0-4, not words)
-- **Types**: task, bug, feature, epic, chore, docs, question
-- **Blocking**: `br dep add <issue> <depends-on>` to add dependencies
-
-### Git Policy
-
-`br` never commits or pushes. Follow this repository's own git instructions before staging, committing, or pushing. If the repository says "commit only when asked," that rule overrides any generic workflow advice.
-
-<!-- end-bv-agent-instructions -->
-
 ## cass — Cross-Agent Session Search
 
 `cass` indexes prior agent conversations (Claude Code, Codex, Cursor, Gemini, ChatGPT, Aider, etc.) into a unified, searchable index so you can reuse solved problems.
@@ -948,3 +871,119 @@ NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are cha
 Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.
 
 For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
+
+<!-- bv-agent-instructions-v5 -->
+
+---
+
+## Beads Workflow Integration
+
+This project uses a Beads tracker—either the Go `bd` CLI or the Rust `br` CLI—for issue tracking, plus [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) (`bv`) for graph-aware triage. Issues are stored in `.beads/`. `bv` auto-discovers supported JSONL exports, including `.beads/issues.jsonl` and legacy `.beads/beads.jsonl`.
+
+**Choose the tracker CLI from this repository's instructions and configuration.** Use `bd` commands in a Go Beads workspace and `br` commands in a beads_rust workspace. Do not run both trackers against the same workspace or infer the tracker solely from the JSONL filename.
+
+### Using bv as an AI sidecar
+
+bv is a graph-aware triage engine for Beads projects. Instead of parsing .beads/issues.jsonl / .beads/beads.jsonl directly or hallucinating graph traversal, use robot flags for deterministic, dependency-aware outputs with precomputed metrics (PageRank, betweenness, critical path, cycles, HITS, eigenvector, k-core).
+
+**Scope boundary:** bv handles *what to work on* (triage, priority, planning). The selected tracker CLI (`bd` or `br`) handles creating, claiming, modifying, and closing beads.
+
+**CRITICAL: Use ONLY --robot-* flags. Bare bv launches an interactive TUI that blocks your session.**
+
+#### The Workflow: Start With Triage
+
+**`bv --robot-triage` is your single entry point.** Its `triage` object contains:
+- `quick_ref`: at-a-glance counts + top 3 picks
+- `recommendations`: ranked actionable items with scores, reasons, unblock info
+- `quick_wins`: low-effort high-impact items
+- `blockers_to_clear`: items that unblock the most downstream work
+- `project_health`: status/type/priority distributions, graph metrics
+- `commands`: copy-paste shell commands for next steps
+
+```bash
+bv --robot-triage        # THE MEGA-COMMAND: start here
+bv --robot-next          # Minimal: just the single top pick + claim command
+
+# TOON output (--format toon): a compact tabular encoding. Measured on this
+# repository it is 7% smaller than JSON for --robot-graph but 9-15% LARGER for
+# nested payloads (--robot-triage, --robot-plan, --robot-insights,
+# --robot-label-health); use --stats to see both sizes before adopting it.
+bv --robot-graph --format toon
+bv --robot-triage --format toon --stats
+```
+
+Recommendations can include blocked or assigned work; `triage.quick_ref.top_picks` reflects snapshot readiness. A suggested action records its original local ID, working directory, and tracker route. Use that route rather than a namespaced display ID or an unrelated current directory. Inspect current tracker state before execution: analysis does not reserve work or guarantee that a later claim succeeds.
+
+#### Other bv Commands
+
+| Command | Returns |
+|---------|---------|
+| `--robot-plan` | Parallel execution tracks with unblocks lists |
+| `--robot-priority` | Priority misalignment detection with confidence |
+| `--robot-insights` | Full metrics: PageRank, betweenness, HITS, eigenvector, critical path, cycles, k-core |
+| `--robot-alerts` | Stale issues, blocking cascades, priority mismatches |
+| `--robot-suggest` | Hygiene: duplicates, missing deps, label suggestions, cycle breaks |
+| `--robot-diff --diff-since <ref>` | Changes since ref: new/closed/modified issues |
+| `--robot-graph [--graph-format=json\|dot\|mermaid]` | Dependency graph export |
+
+Every robot command emits one JSON object; with `--graph-format=dot` or `mermaid` the diagram text is the `graph` field (`bv --robot-graph --graph-format=dot | jq -r .graph`), not the whole output.
+
+#### Scoping & Filtering
+
+```bash
+bv --robot-plan --label backend              # Scope to label's subgraph
+bv --robot-insights --as-of HEAD~30          # Historical point-in-time
+bv --recipe actionable --robot-plan          # Pre-filter: ready to work (no blockers)
+bv --recipe high-impact --robot-triage       # Pre-filter: top PageRank scores
+```
+
+### Tracker Commands for Issue Management
+
+Use exactly one command family, matching the tracker configured for the repository.
+
+#### Rust beads_rust (`br`)
+
+```bash
+br ready --json                       # Show issues ready to work (no blockers)
+br list --status=open --json          # All open issues
+br show <id> --json                   # Full issue details with dependencies
+br create --title="..." --type=task --priority=2 --json
+br update <id> --status=in_progress --json
+br close <id> --reason="Completed" --json
+br close <id1> <id2> --reason="Completed" --json
+br sync --flush-only                  # Export DB to JSONL after Beads mutations
+```
+
+#### Go Beads (`bd`)
+
+```bash
+bd ready --json                       # Show issues ready to work
+bd show <id> --json                   # Full issue details
+bd create "..." -t task -p 2 --json
+bd update <id> --claim --json         # Atomically claim work
+bd close <id> --json
+bd dep add <issue> <depends-on>
+bd export -o .beads/issues.jsonl        # Refresh the compatibility export read by bv
+```
+
+### Workflow Pattern
+
+1. **Triage**: Run `bv --robot-triage` to find the highest-impact actionable work
+2. **Verify**: Check the selected tracker's `show`/`ready` output before claiming
+3. **Claim**: Use `br update <id> --status=in_progress --json` or `bd update <id> --claim --json`
+4. **Work**: Implement the task
+5. **Complete**: Use the selected tracker's `close` command
+6. **Refresh for bv**: Run `br sync --flush-only` or the `bd export` command above so the JSONL export is current
+
+### Key Concepts
+
+- **Dependencies**: Issues can block other issues. `br ready --json` and `bd ready --json` show unblocked work.
+- **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers 0-4, not words)
+- **Types**: task, bug, feature, epic, chore, docs, question
+- **Blocking**: Use `br dep add <issue> <depends-on>` or `bd dep add <issue> <depends-on>` to add dependencies
+
+### Git Policy
+
+Tracker commands do not grant permission to commit or push application code. Follow this repository's own git and tracker instructions before staging, committing, syncing, or pushing. If the repository says "commit only when asked," that rule overrides any generic workflow advice.
+
+<!-- end-bv-agent-instructions -->

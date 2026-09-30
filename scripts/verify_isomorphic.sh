@@ -46,16 +46,29 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[FAIL]${NC} $*"; }
 log_verbose() { [[ "$VERBOSE" == "1" ]] && echo -e "${BLUE}[DEBUG]${NC} $*" || true; }
 
-# Cleanup function
+# Cleanup function: removes the temp dir and the detached baseline worktree.
+# The caller's worktree, index, and stash are never touched by this script.
 cleanup() {
     local exit_code=$?
+    if [[ -n "${BASELINE_WORKTREE:-}" ]] && [[ -d "$BASELINE_WORKTREE" ]]; then
+        log_verbose "Removing baseline worktree $BASELINE_WORKTREE"
+        git -C "$PROJECT_ROOT" worktree remove --force "$BASELINE_WORKTREE" >/dev/null 2>&1 || rm -rf "$BASELINE_WORKTREE"
+        git -C "$PROJECT_ROOT" worktree prune >/dev/null 2>&1 || true
+    fi
     if [[ "$KEEP_TEMPS" != "1" ]] && [[ -n "${TEST_DIR:-}" ]]; then
         log_verbose "Cleaning up $TEST_DIR"
         rm -rf "$TEST_DIR"
     fi
     exit $exit_code
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
+
+# Validate the baseline ref before anything else runs. --end-of-options stops
+# an option-looking argument (e.g. "--output=x") from being parsed as a flag.
+if ! BASELINE_SHA=$(git -C "$PROJECT_ROOT" rev-parse --verify --quiet --end-of-options "${BASELINE_REF}^{commit}"); then
+    log_error "Baseline ref '$BASELINE_REF' does not resolve to a commit"
+    exit 2
+fi
 
 # Create temporary directory
 TEST_DIR=$(mktemp -d)
@@ -64,10 +77,10 @@ log_verbose "Using temporary directory: $TEST_DIR"
 # Binary paths
 BASELINE_BIN="$TEST_DIR/bv_baseline"
 CURRENT_BIN="$TEST_DIR/bv_current"
+BASELINE_WORKTREE=""
 
-# Track current branch to restore later
+# Current tree description (informational only; never modified)
 ORIGINAL_BRANCH=$(git -C "$PROJECT_ROOT" branch --show-current || git -C "$PROJECT_ROOT" rev-parse HEAD)
-HAS_UNCOMMITTED=$(git -C "$PROJECT_ROOT" status --porcelain | wc -l)
 
 echo "=============================================="
 echo "  Isomorphic Verification"
@@ -80,31 +93,17 @@ echo ""
 
 # Build baseline version
 build_baseline() {
-    log_info "Building baseline version from $BASELINE_REF..."
+    log_info "Building baseline version from $BASELINE_REF ($BASELINE_SHA)..."
 
-    # Stash any uncommitted changes
-    if [[ "$HAS_UNCOMMITTED" -gt 0 ]]; then
-        log_verbose "Stashing uncommitted changes..."
-        git -C "$PROJECT_ROOT" stash push -q -m "isomorphic-verify-temp"
-    fi
+    # Build in a detached temporary worktree so the caller's checkout, index,
+    # and stash are never modified, and an interrupted run leaves nothing to
+    # restore (the EXIT trap removes the worktree).
+    BASELINE_WORKTREE="$TEST_DIR/baseline_worktree"
+    log_verbose "Adding detached worktree at $BASELINE_WORKTREE..."
+    git -C "$PROJECT_ROOT" worktree add --detach -q "$BASELINE_WORKTREE" "$BASELINE_SHA"
 
-    # Checkout baseline
-    log_verbose "Checking out $BASELINE_REF..."
-    git -C "$PROJECT_ROOT" checkout -q "$BASELINE_REF"
-
-    # Build
     log_verbose "Building baseline binary..."
-    go build -o "$BASELINE_BIN" "$PROJECT_ROOT/cmd/bv" 2>/dev/null
-
-    # Return to original branch
-    log_verbose "Returning to $ORIGINAL_BRANCH..."
-    git -C "$PROJECT_ROOT" checkout -q "$ORIGINAL_BRANCH"
-
-    # Restore stashed changes
-    if [[ "$HAS_UNCOMMITTED" -gt 0 ]]; then
-        log_verbose "Restoring stashed changes..."
-        git -C "$PROJECT_ROOT" stash pop -q || true
-    fi
+    (cd "$BASELINE_WORKTREE" && go build -o "$BASELINE_BIN" ./cmd/bv)
 
     log_success "Baseline built: $BASELINE_BIN"
 }
@@ -130,7 +129,7 @@ setup_fixtures() {
     fi
 
     # Create .beads directories for each test case
-    for graph_file in "$FIXTURE_DIR/graphs"/*.json 2>/dev/null; do
+    for graph_file in "$FIXTURE_DIR/graphs"/*.json; do
         [[ -f "$graph_file" ]] || continue
 
         base_name=$(basename "$graph_file" .json)
@@ -147,7 +146,9 @@ setup_fixtures() {
     if [[ -d "$PROJECT_ROOT/.beads" ]]; then
         DEFAULT_CASE="$FIXTURE_DIR/cases/project"
         mkdir -p "$DEFAULT_CASE/.beads"
-        cp "$PROJECT_ROOT/.beads/beads.jsonl" "$DEFAULT_CASE/.beads/" 2>/dev/null || true
+        for jsonl in issues.jsonl beads.jsonl; do
+            cp "$PROJECT_ROOT/.beads/$jsonl" "$DEFAULT_CASE/.beads/" 2>/dev/null || true
+        done
         log_verbose "Using project .beads as test case"
     fi
 

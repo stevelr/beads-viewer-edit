@@ -174,7 +174,7 @@ func TestAgentsE2E_AcceptFlow(t *testing.T) {
 	if !strings.Contains(contentStr, agents.BlurbEndMarker) {
 		t.Error("Blurb end marker missing")
 	}
-	if !strings.Contains(contentStr, "br update <id> --status=in_progress --json") {
+	if !strings.Contains(contentStr, "br update <id> --claim --json") {
 		t.Error("Rust br workflow missing from injected blurb")
 	}
 	if !strings.Contains(contentStr, "bd update <id> --claim --json") {
@@ -527,10 +527,9 @@ func TestAgentsE2E_EdgeCase_ReadOnlyDirectory(t *testing.T) {
 	}
 }
 
-// TestAgentsE2E_EdgeCase_SymlinkHandling tests that symlinked files are detected.
-// Note: Due to atomic write semantics, the symlink is replaced with a regular file
-// after modification. This is expected behavior for data safety - atomic writes
-// cannot preserve symlinks.
+// TestAgentsE2E_EdgeCase_SymlinkHandling verifies that detection may report a
+// readable link, but mutation refuses the final symlink rather than escaping
+// the named project path and editing its target.
 func TestAgentsE2E_EdgeCase_SymlinkHandling(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -565,30 +564,34 @@ func TestAgentsE2E_EdgeCase_SymlinkHandling(t *testing.T) {
 		t.Error("Should read original content through symlink")
 	}
 
-	// Append should succeed (atomic write replaces symlink with regular file)
-	if err := agents.AppendBlurbToFile(detection.FilePath); err != nil {
-		t.Fatalf("AppendBlurbToFile failed on symlink: %v", err)
+	// Mutation must fail closed: the confirmation names linkPath, while its
+	// target can live outside that scope or be retargeted concurrently.
+	if err := agents.AppendBlurbToFile(detection.FilePath); err == nil || !strings.Contains(err.Error(), "symbolic-link") {
+		t.Fatalf("AppendBlurbToFile error=%v, want symbolic-link refusal", err)
 	}
 
-	// Verify blurb is in the file at linkPath (now a regular file)
+	// Verify neither the link nor its target changed.
 	content, err := os.ReadFile(linkPath)
 	if err != nil {
-		t.Fatalf("Failed to read file after append: %v", err)
+		t.Fatalf("Failed to read file after refused append: %v", err)
 	}
-	if !strings.Contains(string(content), agents.BlurbStartMarker) {
-		t.Error("Blurb should be present in file after append")
-	}
-	if !strings.Contains(string(content), "Real File") {
-		t.Error("Original content should be preserved")
+	if string(content) != "# Real File" {
+		t.Fatalf("symlink target bytes changed after refusal: %q", content)
 	}
 
-	// Verify linkPath is now a regular file (not a symlink)
 	info, err := os.Lstat(linkPath)
 	if err != nil {
 		t.Fatalf("Failed to stat link path: %v", err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		t.Log("Note: Symlink was preserved (implementation may have changed)")
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Error("refused append replaced the symlink")
+	}
+	targetContent, err := os.ReadFile(realPath)
+	if err != nil {
+		t.Fatalf("Failed to read symlink target after append: %v", err)
+	}
+	if string(targetContent) != "# Real File" {
+		t.Fatalf("target content changed after refusal: %q", targetContent)
 	}
 }
 

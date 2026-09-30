@@ -10,6 +10,96 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
+func TestAnalyzerMatchesIssuesRequiresExactUnambiguousRows(t *testing.T) {
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	minutes := 15
+	rows := []model.Issue{
+		{ID: "z", Title: "日本語\x00🙂", Labels: []string{"z", "a"}, EstimatedMinutes: &minutes,
+			Origin: &model.IssueOrigin{Database: "/actual/source"}, DeferUntil: &now,
+			Comments: []*model.Comment{nil, {Text: "comment"}}, Dependencies: []*model.Dependency{nil, {DependsOnID: "a", Type: model.DepBlocks}}},
+		{ID: "a", Status: model.StatusClosed, Labels: []string{}},
+	}
+	a := analysis.NewAnalyzer(rows)
+	if !a.MatchesIssues([]model.Issue{rows[1], rows[0]}) {
+		t.Fatal("equal rows in different outer order rejected")
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func([]model.Issue)
+	}{
+		{"label-order", func(r []model.Issue) { r[0].Labels[0], r[0].Labels[1] = r[0].Labels[1], r[0].Labels[0] }},
+		{"nil-versus-empty", func(r []model.Issue) { r[1].Labels = nil }},
+		{"dependency", func(r []model.Issue) { r[0].Dependencies[1].DependsOnID = "missing" }},
+		{"comment", func(r []model.Issue) { r[0].Comments[1].Text = "changed" }},
+		{"estimate-pointer", func(r []model.Issue) { *r[0].EstimatedMinutes++ }},
+		{"clock-pointer", func(r []model.Issue) { *r[0].DeferUntil = now.Add(time.Hour) }},
+		{"origin", func(r []model.Issue) { r[0].Origin.Database = "/different/source" }},
+		{"embedded-nul", func(r []model.Issue) { r[0].Title = "日本語🙂" }},
+		{"duplicate", func(r []model.Issue) { r[1] = r[0] }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := []model.Issue{rows[0].Clone(), rows[1].Clone()}
+			tc.mutate(changed)
+			if a.MatchesIssues(changed) {
+				t.Fatal("different rows accepted")
+			}
+			if !a.MatchesIssues(rows) {
+				t.Fatal("validation mutated source")
+			}
+		})
+	}
+	duplicate := []model.Issue{rows[0], rows[0]}
+	if analysis.NewAnalyzer(duplicate).MatchesIssues(duplicate) || a.MatchesIssues(rows[:1]) {
+		t.Fatal("ambiguous or missing row accepted")
+	}
+	if !analysis.NewAnalyzer(nil).MatchesIssues([]model.Issue{}) {
+		t.Fatal("empty sources differ")
+	}
+}
+
+func TestCountActionableIssuesMatchesScopedMaterializedResults(t *testing.T) {
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	issues := []model.Issue{
+		{ID: "open", Status: model.StatusOpen},
+		{ID: "owned", Status: model.StatusInProgress},
+		{ID: "parked", Status: model.StatusBlocked},
+		{ID: "later", Status: model.StatusOpen, DeferUntil: &future},
+		{ID: "missing", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "absent", Type: model.DepBlocks}}},
+		{ID: "safe", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "hidden", Type: model.DepBlocks}}},
+		{ID: "cycle-a", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "cycle-b", Type: model.DepBlocks}}},
+		{ID: "cycle-b", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "cycle-a", Type: model.DepBlocks}}},
+	}
+	authorityIssues := append(append([]model.Issue(nil), issues...), model.Issue{ID: "hidden", Status: model.StatusTombstone})
+	for _, tc := range []struct {
+		name       string
+		candidates map[string]bool
+		now        time.Time
+		want       int
+	}{
+		{"all", nil, now, 3},
+		{"after-deferral", nil, future, 4},
+		{"scoped", map[string]bool{"open": true, "later": true, "missing": true}, now, 1},
+		{"scoped-after-deferral", map[string]bool{"open": true, "later": true, "missing": true}, future, 2},
+		{"empty-scope", map[string]bool{}, now, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := analysis.NewAnalyzer(issues)
+			a.SetReadinessScope(model.NewReadinessIndex(authorityIssues), tc.candidates)
+			a.SetNow(tc.now)
+			if got, materialized := a.CountActionableIssues(), len(a.GetActionableIssues()); got != tc.want || got != materialized {
+				t.Fatalf("count=%d materialized=%d want=%d", got, materialized, tc.want)
+			}
+			if allocs := testing.AllocsPerRun(25, func() { a.CountActionableIssues() }); allocs != 0 {
+				t.Fatalf("count materialized issue data: %g allocations", allocs)
+			}
+		})
+	}
+	if got := analysis.NewAnalyzer(nil).CountActionableIssues(); got != 0 {
+		t.Fatalf("empty analyzer count=%d", got)
+	}
+}
+
 // Helper to extract IDs from issues and sort them for comparison
 func getIDs(issues []model.Issue) []string {
 	ids := make([]string, len(issues))
@@ -184,8 +274,7 @@ func TestGetActionableIssuesParallelTracks(t *testing.T) {
 }
 
 func TestGetActionableIssuesMissingBlocker(t *testing.T) {
-	// A depends on "missing" (doesn't exist) → A is actionable
-	// Missing blockers don't block (graceful degradation)
+	// Missing blockers are unknown, so A cannot be proven actionable.
 	issues := []model.Issue{
 		{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{
 			{DependsOnID: "missing", Type: model.DepBlocks},
@@ -196,8 +285,8 @@ func TestGetActionableIssuesMissingBlocker(t *testing.T) {
 	actionable := an.GetActionableIssues()
 
 	ids := getIDs(actionable)
-	if len(ids) != 1 || ids[0] != "A" {
-		t.Errorf("Expected A actionable (missing blocker), got %v", ids)
+	if len(ids) != 0 {
+		t.Errorf("Expected unknown blocker to withhold A, got %v", ids)
 	}
 }
 
@@ -404,8 +493,9 @@ func TestGetActionableIssuesInProgressStatus(t *testing.T) {
 }
 
 func TestGetActionableIssuesBlockedStatus(t *testing.T) {
-	// "Blocked" status issues are still returned if no blocking deps
-	// (status is informational, deps are structural)
+	// A "blocked" status is a parked status: `br ready` only surfaces
+	// status=open, so a blocked-status issue is not actionable even with no
+	// blocking deps (issue #199).
 	issues := []model.Issue{
 		{ID: "A", Status: model.StatusBlocked},
 	}
@@ -413,8 +503,35 @@ func TestGetActionableIssuesBlockedStatus(t *testing.T) {
 	an := analysis.NewAnalyzer(issues)
 	actionable := an.GetActionableIssues()
 
-	if len(actionable) != 1 || actionable[0].ID != "A" {
-		t.Errorf("Expected blocked-status issue (no deps) to be actionable, got %v", getIDs(actionable))
+	if len(actionable) != 0 {
+		t.Errorf("Expected blocked-status issue to be excluded from actionable, got %v", getIDs(actionable))
+	}
+}
+
+func TestGetActionableIssuesParkedStatusesExcluded(t *testing.T) {
+	// Issue #199: every non-open, non-in_progress status that `br ready`
+	// excludes must be excluded here too, even with no dependencies at all.
+	// The parked bead still blocks its dependents because it is not closed.
+	parked := []model.Status{
+		model.StatusDeferred, model.StatusDraft, model.StatusPinned,
+		model.StatusHooked, model.StatusReview, model.StatusBlocked,
+		model.Status("triage"), // custom project status
+	}
+	for _, status := range parked {
+		t.Run(string(status), func(t *testing.T) {
+			issues := []model.Issue{
+				{ID: "PARKED", Status: status, Priority: 0},
+				{ID: "DEP", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+					{IssueID: "DEP", DependsOnID: "PARKED", Type: model.DepBlocks},
+				}},
+				{ID: "READY", Status: model.StatusOpen},
+			}
+			an := analysis.NewAnalyzer(issues)
+			got := getIDs(an.GetActionableIssues())
+			if len(got) != 1 || got[0] != "READY" {
+				t.Fatalf("status %q: actionable = %v, want [READY]", status, got)
+			}
+		})
 	}
 }
 
@@ -566,6 +683,7 @@ func TestGetBlockers(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{
 			{DependsOnID: "B", Type: model.DepBlocks},
+			{DependsOnID: "B", Type: model.DepBlocks},       // Duplicate semantic edge
 			{DependsOnID: "C", Type: model.DepRelated},      // Not a blocker
 			{DependsOnID: "missing", Type: model.DepBlocks}, // Missing
 		}},
@@ -586,6 +704,7 @@ func TestGetOpenBlockers(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{
 			{DependsOnID: "B", Type: model.DepBlocks},
+			{DependsOnID: "B", Type: model.DepBlocks}, // Duplicate semantic edge
 			{DependsOnID: "C", Type: model.DepBlocks},
 		}},
 		{ID: "B", Status: model.StatusOpen},
@@ -772,6 +891,57 @@ func TestGetBlockerChain(t *testing.T) {
 		}
 		if !result.Chain[0].Actionable {
 			t.Error("Expected target to be actionable")
+		}
+	})
+
+	t.Run("future deferred root is not actionable", func(t *testing.T) {
+		now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+		future := now.Add(time.Hour)
+		issues := []model.Issue{
+			{ID: "A", Status: model.StatusOpen, Title: "Deferred root", DeferUntil: &future},
+		}
+		an := analysis.NewAnalyzer(issues)
+		an.SetNow(now)
+		result := an.GetBlockerChain("A")
+
+		if result == nil || len(result.Chain) != 1 {
+			t.Fatalf("unexpected blocker-chain result: %#v", result)
+		}
+		if result.IsBlocked {
+			t.Fatal("a scheduler deferral is not a dependency blocker")
+		}
+		if result.Chain[0].Actionable {
+			t.Fatal("future-deferred root must not be labeled actionable")
+		}
+	})
+
+	t.Run("blocked parent propagates into child chain", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "ROOT", Status: model.StatusOpen, Title: "Root blocker"},
+			{ID: "P", Status: model.StatusOpen, Title: "Blocked parent", Dependencies: []*model.Dependency{
+				{DependsOnID: "ROOT", Type: model.DepBlocks},
+			}},
+			{ID: "CHILD", Status: model.StatusOpen, Title: "Child", Dependencies: []*model.Dependency{
+				{DependsOnID: "P", Type: model.DepParentChild},
+			}},
+		}
+		an := analysis.NewAnalyzer(issues)
+		result := an.GetBlockerChain("CHILD")
+
+		if result == nil || !result.IsBlocked {
+			t.Fatalf("parent-blocked child must have a blocker chain: %#v", result)
+		}
+		if result.ChainLength != 2 {
+			t.Fatalf("chain length = %d, want CHILD <- P <- ROOT", result.ChainLength)
+		}
+		if len(result.RootBlockers) != 1 || result.RootBlockers[0].ID != "ROOT" {
+			t.Fatalf("root blockers = %#v, want ROOT", result.RootBlockers)
+		}
+		if result.Chain[0].Actionable {
+			t.Fatal("parent-blocked child must not be labeled actionable")
+		}
+		if !result.RootBlockers[0].Actionable {
+			t.Fatal("unblocked ROOT should be actionable")
 		}
 	})
 

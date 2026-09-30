@@ -58,10 +58,18 @@ func (m *VelocityComparisonModel) SetData(issues []model.Issue) {
 		return m.data[i].Label < m.data[j].Label
 	})
 
-	// Reset cursor if out of bounds
-	if m.cursor >= len(m.data) {
+	// Keep both navigation coordinates valid when a refresh shrinks or clears
+	// the label set. A stale scroll offset can otherwise put the entire new
+	// dataset above the render window even after the cursor is reset.
+	if len(m.data) == 0 {
+		m.cursor = 0
+		m.scrollOffset = 0
+		return
+	}
+	if m.cursor < 0 || m.cursor >= len(m.data) {
 		m.cursor = 0
 	}
+	m.ensureVisible()
 }
 
 // buildRow creates a velocityRow from HistoricalVelocity data
@@ -126,6 +134,7 @@ func buildSparkline(values []int, maxVal int) string {
 func (m *VelocityComparisonModel) SetSize(width, height int) {
 	m.width = width
 	m.height = height
+	m.ensureVisible()
 }
 
 // MoveUp moves cursor up

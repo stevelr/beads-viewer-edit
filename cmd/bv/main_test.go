@@ -4,13 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/export"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -298,20 +303,6 @@ func TestUnknownFlagErrorSuggestsNearestFlag(t *testing.T) {
 	}
 }
 
-func TestResolveSingleRepoWatchFile_RespectsExplicitBeadsDBFile(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "selected.db")
-	if err := os.WriteFile(dbPath, []byte("placeholder"), 0644); err != nil {
-		t.Fatalf("write selected db: %v", err)
-	}
-	t.Setenv(loader.BeadsDBEnvVar, dbPath)
-
-	got, err := resolveSingleRepoWatchFile(t.TempDir())
-	if err != nil {
-		t.Fatalf("resolveSingleRepoWatchFile: %v", err)
-	}
-	requireString(t, got, dbPath)
-}
-
 func TestResolvePagesSource_RespectsExplicitBeadsDBFile(t *testing.T) {
 	beadsDir := t.TempDir()
 	selectedPath := filepath.Join(beadsDir, "selected.jsonl")
@@ -330,6 +321,30 @@ func TestResolvePagesSource_RespectsExplicitBeadsDBFile(t *testing.T) {
 	}
 	requireString(t, source.Issues[0].ID, "SELECTED-1")
 	requireString(t, source.SourcePath, selectedPath)
+}
+
+func TestResolvePagesSource_ReadinessRetainsTombstonesAndParentGates(t *testing.T) {
+	t.Setenv("BEADS_DB", "")
+	path := filepath.Join(t.TempDir(), "issues.jsonl")
+	data := `{"id":"ready","title":"Resolved tombstone","status":"open","issue_type":"task","dependencies":[{"issue_id":"ready","depends_on_id":"deleted","type":"blocks"}]}
+{"id":"deleted","title":"Deleted","status":"tombstone","issue_type":"task"}
+{"id":"child","title":"Inherited gate","status":"open","issue_type":"task","dependencies":[{"issue_id":"child","depends_on_id":"parent","type":"parent-child"}]}
+{"id":"parent","title":"Parent","status":"open","issue_type":"epic","dependencies":[{"issue_id":"parent","depends_on_id":"missing","type":"blocks"}]}
+`
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	source, err := resolvePagesSource(&export.WizardConfig{SourcePath: path}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(source.Issues) != 3 || source.Readiness == nil {
+		t.Fatalf("wizard source must retain three visible issues and full readiness: %+v", source)
+	}
+	now := time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC)
+	if !source.Readiness.Ready("ready", now) || source.Readiness.Ready("child", now) || source.Readiness.DependencyState("child") != model.DependenciesUnknown {
+		t.Fatal("wizard source lost resolved or inherited prerequisite state")
+	}
 }
 
 func TestResolvePagesSource_RespectsSavedSourcePath(t *testing.T) {
@@ -458,6 +473,7 @@ func TestMissingFlagArgumentErrorSuggestsValueShape(t *testing.T) {
 func TestRobotNowHonorsSourceDateEpoch(t *testing.T) {
 	t.Setenv("SOURCE_DATE_EPOCH", "1234567890")
 	requireString(t, robotNow().Format(time.RFC3339), "2009-02-13T23:31:30Z")
+	requireString(t, NewRobotEnvelope("hash").GeneratedAt, "2009-02-13T23:31:30Z")
 }
 
 func TestAgentIntentArgRewrite(t *testing.T) {
@@ -637,6 +653,11 @@ func TestAgentIntentArgRewrite(t *testing.T) {
 			want: []string{"--update-dry-run"},
 		},
 		{
+			name: "update dry-run stays non-robot with structured-output alias",
+			args: []string{"--update-dry-run", "--json"},
+			want: []string{"--update-dry-run", "--format", "json"},
+		},
+		{
 			name: "upgrade --rollback maps to --rollback",
 			args: []string{"upgrade", "--rollback"},
 			want: []string{"--rollback"},
@@ -656,6 +677,34 @@ func TestAgentIntentArgRewrite(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			requireArgs(t, rewriteAgentIntentArgs(tt.args), tt.want)
+		})
+	}
+}
+
+func TestReadUpdateConfirmation(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		want      bool
+		wantError bool
+	}{
+		{name: "blank line accepts default", input: "\n", want: true},
+		{name: "yes accepts", input: " YES \n", want: true},
+		{name: "single y at EOF accepts", input: "y", want: true},
+		{name: "no cancels", input: "n\n", want: false},
+		{name: "arbitrary response cancels", input: "later\n", want: false},
+		{name: "empty EOF fails closed", input: "", wantError: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := readUpdateConfirmation(strings.NewReader(tt.input))
+			if (err != nil) != tt.wantError {
+				t.Fatalf("readUpdateConfirmation error = %v, wantError %v", err, tt.wantError)
+			}
+			if got != tt.want {
+				t.Fatalf("readUpdateConfirmation = %v, want %v", got, tt.want)
+			}
 		})
 	}
 }
@@ -741,26 +790,6 @@ func TestEnumFlagErrorSuggestsNearestValue(t *testing.T) {
 	if !strings.Contains(err.Error(), `did you mean "json"?`) {
 		t.Fatalf("missing did-you-mean hint: %v", err)
 	}
-}
-
-func TestResolveSingleRepoWatchFileUsesDiscoveredBeadsJSONL(t *testing.T) {
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("mkdir .beads: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(`{"id":"legacy"}`+"\n"), 0644); err != nil {
-		t.Fatalf("write issues.jsonl: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(`{"id":"canonical"}`+"\n"), 0644); err != nil {
-		t.Fatalf("write beads.jsonl: %v", err)
-	}
-
-	watchFile, err := resolveSingleRepoWatchFile(tmpDir)
-	if err != nil {
-		t.Fatalf("resolveSingleRepoWatchFile: %v", err)
-	}
-	requireString(t, filepath.Base(watchFile), "beads.jsonl")
 }
 
 func TestRobotCapabilitiesManifest(t *testing.T) {
@@ -1358,16 +1387,257 @@ func TestRobotRelationshipWorkflowSchemasMatchHandlerOutputs(t *testing.T) {
 		}
 	}
 	causalChainProps := requireNestedSchemaProperties(t, causalityProps["chain"], "robot-causality chain")
-	for _, name := range []string{"bead_id", "title", "status", "events", "edge_count", "start_time", "end_time", "total_time", "is_complete"} {
+	for _, name := range []string{"bead_id", "title", "status", "events", "edge_count", "start_time", "end_time", "total_time", "is_complete", "links", "duration_known", "time_basis"} {
 		if causalChainProps[name] == nil {
 			t.Fatalf("robot-causality chain schema missing %q", name)
 		}
 	}
 	causalInsightsProps := requireNestedSchemaProperties(t, causalityProps["insights"], "robot-causality insights")
-	for _, name := range []string{"total_duration", "blocked_duration", "active_duration", "blocked_percentage", "blocked_periods", "critical_path", "summary", "recommendations"} {
+	for _, name := range []string{"total_duration", "blocked_duration", "active_duration", "blocked_percentage", "blocked_periods", "critical_path", "summary", "recommendations", "coverage", "limitations", "blocked_duration_known", "explicit_blocked_duration", "dependency_wait_duration", "critical_path_duration"} {
 		if causalInsightsProps[name] == nil {
 			t.Fatalf("robot-causality insights schema missing %q", name)
 		}
+	}
+}
+
+func TestRobotCausalityCommittedWaitAndUnknownSchema(t *testing.T) {
+	exe := buildTestBinary(t)
+	start := time.Date(2025, 1, 15, 0, 0, 0, 0, time.UTC)
+	t.Setenv("SOURCE_DATE_EPOCH", strconv.FormatInt(start.Add(12*time.Hour).Unix(), 10))
+	for _, tc := range []struct {
+		name       string
+		hours      []int
+		statuses   []string
+		dependency bool
+		missing    bool
+		want       any
+	}{
+		{"known six hours scoped blocker", []int{0, 2, 8, 10}, []string{"open", "blocked", "open", "closed"}, true, false, float64(6 * time.Hour)},
+		{"known zero", []int{0, 10}, []string{"open", "closed"}, false, false, float64(0)},
+		{"unknown missing blocker", []int{0, 2}, []string{"open", "open"}, true, true, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := t.TempDir()
+			git := func(at time.Time, args ...string) string {
+				t.Helper()
+				cmd := exec.Command("git", args...)
+				cmd.Dir = repo
+				cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Fixture", "GIT_AUTHOR_EMAIL=fixture@example.invalid", "GIT_COMMITTER_NAME=Fixture", "GIT_COMMITTER_EMAIL=fixture@example.invalid", "GIT_AUTHOR_DATE="+at.Format(time.RFC3339), "GIT_COMMITTER_DATE="+at.Format(time.RFC3339))
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("git %v: %v\n%s", args, err, out)
+				}
+				return strings.TrimSpace(string(out))
+			}
+			git(start, "init", "-b", "main")
+			if err := os.Mkdir(filepath.Join(repo, ".beads"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			var blockedSHA, anchorSHA string
+			for i, hour := range tc.hours {
+				at := start.Add(time.Duration(hour) * time.Hour)
+				deps := "[]"
+				if tc.dependency && hour >= 2 {
+					deps = `[{"depends_on_id":"B","type":"blocks"}]`
+				}
+				data := fmt.Sprintf("{\"id\":\"A\",\"title\":\"Scoped target\",\"status\":%q,\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q,\"labels\":[\"backend\"],\"dependencies\":%s}\n", tc.statuses[i], start.Format(time.RFC3339), at.Format(time.RFC3339), deps)
+				if !tc.missing {
+					status := "open"
+					if hour >= 8 {
+						status = "closed"
+					}
+					data += fmt.Sprintf("{\"id\":\"B\",\"title\":\"Outside selected label\",\"status\":%q,\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q,\"labels\":[\"external\"]}\n", status, start.Format(time.RFC3339), at.Format(time.RFC3339))
+				}
+				if err := os.WriteFile(filepath.Join(repo, ".beads", "issues.jsonl"), []byte(data), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				git(at, "add", ".beads/issues.jsonl")
+				git(at, "commit", "-m", fmt.Sprintf("snapshot %d", i))
+				if tc.want == float64(6*time.Hour) && hour == 2 {
+					blockedSHA = git(at, "rev-parse", "HEAD")
+					git(start.Add(3*time.Hour), "commit", "--allow-empty", "-m", "A: code-only anchor")
+					anchorSHA = git(at, "rev-parse", "HEAD")
+				}
+			}
+			out, stderr, err := runCommandWithTimeout(t, repo, exe, "--robot-causality", "A", "--label", "backend")
+			if err != nil {
+				t.Fatalf("actual causal CLI: %v\nstdout:%s\nstderr:%s", err, out, stderr)
+			}
+			var payload struct {
+				Chain    map[string]any `json:"chain"`
+				Insights map[string]any `json:"insights"`
+			}
+			if err := json.Unmarshal([]byte(out), &payload); err != nil {
+				t.Fatalf("invalid output: %v\n%s\n%s", err, out, stderr)
+			}
+			if got := payload.Insights["blocked_duration"]; got != tc.want {
+				t.Fatalf("blocked_duration=%v expected%v\n%s\n%s", got, tc.want, out, stderr)
+			}
+			if payload.Insights["blocked_duration_known"] != (tc.want != nil) {
+				t.Fatalf("measurement availability disagrees: %s", out)
+			}
+			if payload.Chain["bead_id"] != "A" {
+				t.Fatalf("target scope changed: %s", out)
+			}
+			props := requireNestedSchemaProperties(t, robotCausalInsightsSchema(), "causal insights")
+			for _, field := range []string{"blocked_duration", "explicit_blocked_duration", "dependency_wait_duration"} {
+				definition := props[field].(map[string]interface{})
+				if !reflect.DeepEqual(definition["type"], []string{"integer", "null"}) {
+					t.Fatalf("schema rejects actual null/known duration for%s: %v", field, definition)
+				}
+			}
+			if blockedSHA != "" {
+				for _, window := range [][]string{{"--history-limit", "2"}, {"--history-since", "2025-01-15T03:30:00Z"}} {
+					t.Run(window[0], func(t *testing.T) {
+						args := append([]string{"--robot-causality", "A", "--label", "backend"}, window...)
+						out, stderr, err := runCommandWithTimeout(t, repo, exe, args...)
+						if err != nil {
+							t.Fatalf("bounded causal CLI %v: %v\n%s\n%s", args, err, out, stderr)
+						}
+						var got correlation.CausalityResult
+						if err := json.Unmarshal([]byte(out), &got); err != nil {
+							t.Fatal(err)
+						}
+						if got.Insights.BlockedDurationKnown || got.Insights.Coverage != "partial" || !strings.Contains(out, `"blocked_duration":null`) || strings.Contains(out, blockedSHA) {
+							t.Fatalf("truncated history claimed complete measurement or included excluded commit:\n%s", out)
+						}
+					})
+				}
+				t.Run("invalid since rejected", func(t *testing.T) {
+					out, stderr, err := runCommandWithTimeout(t, repo, exe, "--robot-causality", "A", "--history-since", "invalid-date")
+					if err == nil || !strings.Contains(stderr, "parsing --history-since") || strings.Contains(out, `"chain"`) {
+						t.Fatalf("invalid history bound accepted or misdiagnosed: %v\n%s\n%s", err, out, stderr)
+					}
+				})
+				checkRevision := func(t *testing.T, sha string, hours int, wantBlocked time.Duration) string {
+					t.Helper()
+					out, stderr, err := runCommandWithTimeout(t, repo, exe, "--robot-causality", "A", "--label", "backend", "--as-of", sha)
+					if err != nil {
+						t.Fatalf("revision-bound causal CLI: %v\n%s\n%s", err, out, stderr)
+					}
+					var got correlation.CausalityResult
+					if err := json.Unmarshal([]byte(out), &got); err != nil {
+						t.Fatal(err)
+					}
+					end := start.Add(time.Duration(hours) * time.Hour)
+					if !got.Chain.EndTime.Equal(end) || !got.Insights.BlockedDurationKnown || got.Insights.BlockedDuration != wantBlocked || got.Insights.Coverage != "complete" {
+						t.Fatalf("wrong revision measurement, want end%s wait%s:\n%s", end, wantBlocked, out)
+					}
+					for _, event := range got.Chain.Events {
+						if event.Timestamp.After(end) || event.Type == correlation.CausalClosed {
+							t.Fatalf("future lifecycle leaked into %s: %+v\n%s", sha, event, out)
+						}
+					}
+					if strings.Contains(out, `"unsupported":["as_of"]`) {
+						t.Fatalf("implemented as-of still declared unsupported:\n%s", out)
+					}
+					return out
+				}
+				t.Run("revision cold and warm", func(t *testing.T) {
+					cold := checkRevision(t, blockedSHA, 2, 0)
+					warm := checkRevision(t, blockedSHA, 2, 0)
+					if cold != warm {
+						t.Fatalf("revision cache changed exact output:\ncold%s\nwarm%s", cold, warm)
+					}
+				})
+				t.Run("code-only revision extends observed ongoing wait", func(t *testing.T) {
+					checkRevision(t, anchorSHA, 3, time.Hour)
+				})
+				t.Run("current cache remains distinct", func(t *testing.T) {
+					again, stderr, err := runCommandWithTimeout(t, repo, exe, "--robot-causality", "A", "--label", "backend")
+					if err != nil || again != out {
+						t.Fatalf("historical query contaminated current result: %v\n%s\n%s", err, again, stderr)
+					}
+				})
+				t.Run("backdated descendant excluded by ancestry", func(t *testing.T) {
+					path := filepath.Join(repo, ".beads", "issues.jsonl")
+					data, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					data = bytes.ReplaceAll(data, []byte("Scoped target"), []byte("Future target edit"))
+					if err := os.WriteFile(path, data, 0o644); err != nil {
+						t.Fatal(err)
+					}
+					git(start.Add(time.Hour), "add", ".beads/issues.jsonl")
+					git(start.Add(time.Hour), "commit", "-m", "A: backdated future descendant")
+					future := git(start, "rev-parse", "HEAD")
+					bounded := checkRevision(t, blockedSHA, 2, 0)
+					if strings.Contains(bounded, future) || strings.Contains(bounded, "Future target edit") {
+						t.Fatalf("backdated descendant leaked:\n%s", bounded)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestRobotCausalityUsesHistoricalSourcePath(t *testing.T) {
+	exe := buildTestBinary(t)
+	repo := t.TempDir()
+	start := time.Date(2025, 1, 15, 0, 0, 0, 0, time.UTC)
+	t.Setenv("SOURCE_DATE_EPOCH", strconv.FormatInt(start.Add(12*time.Hour).Unix(), 10))
+	git := func(hour int, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		at := start.Add(time.Duration(hour) * time.Hour).Format(time.RFC3339)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Fixture", "GIT_AUTHOR_EMAIL=fixture@example.invalid", "GIT_COMMITTER_NAME=Fixture", "GIT_COMMITTER_EMAIL=fixture@example.invalid", "GIT_AUTHOR_DATE="+at, "GIT_COMMITTER_DATE="+at)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git(0, "init", "-b", "main")
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.Mkdir(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var historicalSHA string
+	for _, step := range []struct {
+		hour         int
+		file, status string
+	}{{0, "beads.jsonl", "open"}, {2, "beads.jsonl", "blocked"}, {8, "issues.jsonl", "closed"}} {
+		data := fmt.Sprintf("{\"id\":\"A\",\"title\":\"Historical target\",\"status\":%q,\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q}\n", step.status, start.Format(time.RFC3339), start.Add(time.Duration(step.hour)*time.Hour).Format(time.RFC3339))
+		if err := os.WriteFile(filepath.Join(beadsDir, step.file), []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git(step.hour, "add", ".beads/"+step.file)
+		git(step.hour, "commit", "-m", step.status)
+		if step.hour == 2 {
+			historicalSHA = git(2, "rev-parse", "HEAD")
+		}
+	}
+	var firstOutput string
+	for _, live := range []bool{true, false} {
+		t.Run(fmt.Sprintf("live_directory_%v", live), func(t *testing.T) {
+			if !live {
+				// Preserve the fixture bytes while proving the query requires no live source.
+				if err := os.Rename(beadsDir, filepath.Join(repo, "preserved-live-beads")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out, stderr, err := runCommandWithTimeout(t, repo, exe, "--robot-causality", "A", "--as-of", historicalSHA)
+			if err != nil {
+				t.Fatalf("historical path CLI: %v\n%s\n%s", err, out, stderr)
+			}
+			var got struct {
+				correlation.CausalityResult
+				SourceAuthority RobotSourceAuthority `json:"source_authority"`
+			}
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatal(err)
+			}
+			if len(got.SourceAuthority.Sources) != 1 || got.SourceAuthority.Sources[0].SourcePath != ".beads/beads.jsonl@"+historicalSHA || got.Chain.Status != "blocked" || got.Insights.Coverage != "complete" || !got.Insights.BlockedDurationKnown || got.Insights.BlockedDuration != 0 || !got.Chain.EndTime.Equal(start.Add(2*time.Hour)) || len(got.Chain.Events) < 2 {
+				t.Fatalf("historical authority and causal consumer disagree:\n%s\n%s", out, stderr)
+			}
+			if live {
+				firstOutput = out
+			} else if firstOutput != out {
+				t.Fatalf("live file presence changed historical result:\n%s\n%s", firstOutput, out)
+			}
+		})
 	}
 }
 
@@ -2022,7 +2292,7 @@ func TestModifierFlagValidation(t *testing.T) {
 			name: "history since requires history mode",
 			args: []string{"--history-since", "30 days ago"},
 			wantMessages: []string{
-				"Error: --history-since requires one of --robot-history or --bead-history",
+				"Error: --history-since requires one of --robot-history, --bead-history or --robot-causality",
 				"Try: `bv robot-history --history-since \"30 days ago\" --json`.",
 			},
 		},
@@ -2062,136 +2332,168 @@ func TestModifierFlagValidation(t *testing.T) {
 	}
 }
 
-func TestApplyRecipeFilters_ActionableAndHasBlockers(t *testing.T) {
-	now := time.Now()
-	a := model.Issue{ID: "A", Title: "Root", Status: model.StatusOpen, Priority: 2, CreatedAt: now}
-	b := model.Issue{
-		ID:     "B",
-		Title:  "Blocked by A",
-		Status: model.StatusOpen,
-		Dependencies: []*model.Dependency{
-			{DependsOnID: "A", Type: model.DepBlocks},
-		},
-		CreatedAt: now.Add(-time.Hour),
+// mustApplyRecipe runs the CLI's single recipe entry point (applyRecipe, which
+// wires analyzer/triage metrics into recipe.Apply) and fails the test on error.
+func mustApplyRecipe(t *testing.T, issues []model.Issue, r *recipe.Recipe) []model.Issue {
+	t.Helper()
+	got, err := applyRecipe(issues, r)
+	if err != nil {
+		t.Fatalf("applyRecipe: %v", err)
 	}
-	issues := []model.Issue{a, b}
+	return got
+}
+
+// The per-filter and per-sort-field semantics are covered in pkg/recipe
+// (apply_test.go); this proves the CLI path routes every FilterConfig field,
+// the sort chain and view.max_items through that one engine.
+func TestApplyRecipe_FiltersSortAndLimitThroughSharedEngine(t *testing.T) {
+	// Own the relative-date clock instead of inheriting a packaging epoch.
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	t.Setenv("SOURCE_DATE_EPOCH", strconv.FormatInt(now.Unix(), 10))
+	issues := []model.Issue{
+		{ID: "A", Title: "Root", Status: model.StatusOpen, Priority: 2, CreatedAt: now, UpdatedAt: now},
+		{ID: "B", Title: "Blocked by A", Status: model.StatusOpen, Priority: 0, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour),
+			Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+		{ID: "C", Title: "Login endpoint", Status: model.StatusClosed, Priority: 1, Labels: []string{"backend", "p0"},
+			CreatedAt: now.Add(-72 * time.Hour), UpdatedAt: now.Add(-72 * time.Hour)},
+	}
+
+	r := &recipe.Recipe{Filters: recipe.FilterConfig{Actionable: ptrBool(true)}}
+	// Closed records are not ready work, even without an explicit status filter.
+	requireIssueIDs(t, mustApplyRecipe(t, issues, r), "A")
+	r = &recipe.Recipe{Filters: recipe.FilterConfig{Status: []string{"open"}, HasBlockers: ptrBool(true)}}
+	requireIssueIDs(t, mustApplyRecipe(t, issues, r), "B")
+	r = &recipe.Recipe{Filters: recipe.FilterConfig{Priority: []int{1, 2}, TitleContains: "login", Tags: []string{"BACKEND"}, IDPrefix: "C"}}
+	requireIssueIDs(t, mustApplyRecipe(t, issues, r), "C")
+	r = &recipe.Recipe{Filters: recipe.FilterConfig{CreatedBefore: "1d", UpdatedBefore: "1d"}}
+	requireIssueIDs(t, mustApplyRecipe(t, issues, r), "C")
+	r = &recipe.Recipe{Filters: recipe.FilterConfig{CreatedAfter: "1d", UpdatedAfter: "1d", ExcludeTags: []string{"P0"}}}
+	requireIssueIDs(t, mustApplyRecipe(t, issues, r), "A", "B")
+
+	// Sort chain and max_items go through the same call.
+	r = &recipe.Recipe{Sort: recipe.SortConfig{Field: "priority", Secondary: &recipe.SortConfig{Field: "id"}}, View: recipe.ViewConfig{MaxItems: 2}}
+	requireIssueIDs(t, mustApplyRecipe(t, issues, r), "B", "C")
+	r = &recipe.Recipe{Sort: recipe.SortConfig{Field: "created"}} // dates default newest-first
+	requireIssueIDs(t, mustApplyRecipe(t, issues, r), "A", "B", "C")
+
+	// The caller's slice is never reordered or truncated.
+	requireIssueIDs(t, issues, "A", "B", "C")
+
+	// A nil recipe passes issues through untouched.
+	if got, err := applyRecipe(issues, nil); err != nil || len(got) != len(issues) {
+		t.Fatalf("applyRecipe(nil) = %d issues, %v", len(got), err)
+	}
+
+	// A malformed time filter is an error naming the field, never a silently skipped filter.
+	r = &recipe.Recipe{Name: "bad", Filters: recipe.FilterConfig{UpdatedAfter: "whenever"}}
+	if _, err := applyRecipe(issues, r); err == nil || !strings.Contains(err.Error(), "filters.updated_after") {
+		t.Fatalf("applyRecipe(bad) error = %v, want filters.updated_after named", err)
+	}
+}
+
+// Metric sorts need real scores: applyRecipe must run the analyzer for
+// pagerank/betweenness and compute triage scores for triage, on the same
+// issue set the robot handlers see.
+func TestApplyRecipe_MetricSortsUseAnalyzerAndTriage(t *testing.T) {
+	blocks := func(on string) []*model.Dependency {
+		return []*model.Dependency{{DependsOnID: on, Type: model.DepBlocks}}
+	}
+	// root blocks mid blocks leaf; solo is independent; done is closed.
+	issues := []model.Issue{
+		{ID: "leaf", Title: "Leaf", Status: model.StatusOpen, Priority: 1, Dependencies: blocks("mid")},
+		{ID: "solo", Title: "Solo", Status: model.StatusOpen, Priority: 0},
+		{ID: "root", Title: "Root", Status: model.StatusOpen, Priority: 3},
+		{ID: "mid", Title: "Mid", Status: model.StatusOpen, Priority: 2, Dependencies: blocks("root")},
+		{ID: "done", Title: "Done", Status: model.StatusClosed, Priority: 0},
+	}
+
+	stats := analysis.NewAnalyzer(issues).AnalyzeAsync(context.Background())
+	stats.WaitForPhase2()
+	if stats.GetPageRankScore("root") <= stats.GetPageRankScore("leaf") {
+		t.Fatalf("fixture has no PageRank gradient: root=%v leaf=%v", stats.GetPageRankScore("root"), stats.GetPageRankScore("leaf"))
+	}
 
 	r := &recipe.Recipe{
-		Filters: recipe.FilterConfig{
-			Actionable: ptrBool(true),
-		},
+		Name:    "pagerank-desc",
+		Filters: recipe.FilterConfig{Status: []string{"open"}},
+		Sort:    recipe.SortConfig{Field: "pagerank", Direction: "desc", Secondary: &recipe.SortConfig{Field: "priority"}},
 	}
-	actionable := applyRecipeFilters(issues, r)
-	requireIssueIDs(t, actionable, "A")
+	got := mustApplyRecipe(t, issues, r)
+	if len(got) != 4 || got[0].ID != "root" {
+		t.Fatalf("pagerank order = %v, want root first and the closed issue gone", issueIDs(got))
+	}
+	for i := 1; i < len(got); i++ {
+		prev, cur := stats.GetPageRankScore(got[i-1].ID), stats.GetPageRankScore(got[i].ID)
+		if prev < cur {
+			t.Fatalf("not in descending PageRank order at %d: %v", i, issueIDs(got))
+		}
+		if prev == cur && got[i-1].Priority > got[i].Priority {
+			t.Fatalf("secondary priority sort not applied on PageRank tie: %v", issueIDs(got))
+		}
+	}
 
-	r.Filters.Actionable = nil
-	r.Filters.HasBlockers = ptrBool(true)
-	blocked := applyRecipeFilters(issues, r)
-	requireIssueIDs(t, blocked, "B")
+	// mid is the only node on the root->leaf path, so it has the top betweenness;
+	// the rest tie at 0 and fall through to natural ID order.
+	r = &recipe.Recipe{Name: "bottleneck", Filters: recipe.FilterConfig{Status: []string{"open"}}, Sort: recipe.SortConfig{Field: "betweenness"}}
+	requireIssueIDs(t, mustApplyRecipe(t, issues, r), "mid", "leaf", "root", "solo")
+
+	// Triage order equals the analysis package's own triage ranking.
+	open := issues[:4]
+	var want []string
+	for _, ts := range analysis.ComputeTriageScores(open) {
+		want = append(want, ts.IssueID)
+	}
+	if len(want) != 4 {
+		t.Fatalf("ComputeTriageScores returned %d scores for 4 open issues", len(want))
+	}
+	r = &recipe.Recipe{Name: "triage-desc", Sort: recipe.SortConfig{Field: "triage"}}
+	requireIssueIDs(t, mustApplyRecipe(t, open, r), want...)
 }
 
-func TestApplyRecipeFilters_TitleAndPrefix(t *testing.T) {
-	issues := []model.Issue{
-		{ID: "UI-1", Title: "Add login button"},
-		{ID: "API-2", Title: "Login endpoint"},
-		{ID: "API-3", Title: "Health check"},
+func issueIDs(issues []model.Issue) []string {
+	ids := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		ids = append(ids, issue.ID)
 	}
-	r := &recipe.Recipe{
-		Filters: recipe.FilterConfig{
-			TitleContains: "login",
-			IDPrefix:      "API",
-		},
-	}
-	got := applyRecipeFilters(issues, r)
-	requireIssueIDs(t, got, "API-2")
+	return ids
 }
 
-func TestApplyRecipeFilters_TagsAndDates(t *testing.T) {
-	now := time.Now()
-	old := now.Add(-48 * time.Hour)
+func TestScopeLoadedIssuesKeepsFullSourceMetricContext(t *testing.T) {
 	issues := []model.Issue{
-		{ID: "T1", Title: "Tagged", Labels: []string{"backend", "p0"}, CreatedAt: now, UpdatedAt: now},
-		{ID: "T2", Title: "Old", Labels: []string{"backend"}, CreatedAt: old, UpdatedAt: old},
+		{ID: "a", Status: model.StatusOpen, SourceRepo: "selected", Labels: []string{"focus"}},
+		{ID: "z", Status: model.StatusOpen, SourceRepo: "selected", Labels: []string{"focus"}},
+		{ID: "outside", Status: model.StatusOpen, SourceRepo: "other", Dependencies: []*model.Dependency{
+			{IssueID: "outside", DependsOnID: "z", Type: model.DepBlocks},
+		}},
 	}
-	r := &recipe.Recipe{
-		Filters: recipe.FilterConfig{
-			Tags:         []string{"backend"},
-			ExcludeTags:  []string{"p0"},
-			CreatedAfter: "1d",
-			UpdatedAfter: "1d",
-		},
+	r := &recipe.Recipe{Name: "impact", Sort: recipe.SortConfig{Field: "pagerank"}, View: recipe.ViewConfig{MaxItems: 1}}
+	ctx := RobotContext{Issues: issues, Repo: "selected", LabelScope: "focus", Readiness: model.NewReadinessIndex(issues)}
+	got, err := scopeLoadedIssues(ctx, r)
+	if err != nil {
+		t.Fatal(err)
 	}
-	got := applyRecipeFilters(issues, r)
-	if len(got) != 0 {
-		t.Fatalf("expected all filtered out (exclude p0 and date), got %#v", got)
+	// With the hidden dependent dropped before ranking, a and z tie and the
+	// ID tie-break incorrectly keeps a. Real full-source PageRank keeps z.
+	requireIssueIDs(t, got.Issues, "z")
+	if got.DataHash != analysis.ComputeDataHash(issues[:2]) || got.DataHashMatchesIssues {
+		t.Fatalf("scope lost its pre-recipe hash: %+v", got)
 	}
-}
-
-func TestApplyRecipeFilters_DatesBlockersAndPrefix(t *testing.T) {
-	now := time.Now()
-	early := now.Add(-72 * time.Hour)
-	issues := []model.Issue{
-		{ID: "API-1", Title: "Fresh", CreatedAt: now, UpdatedAt: now},
-		{ID: "API-2", Title: "Stale", CreatedAt: early, UpdatedAt: early,
-			Dependencies: []*model.Dependency{{DependsOnID: "API-1", Type: model.DepBlocks}}},
+	if got.LabelContext == nil || got.LabelContext.Label != "focus" {
+		t.Fatal("missing label context")
 	}
-	r := &recipe.Recipe{Filters: recipe.FilterConfig{
-		CreatedBefore: "1h",
-		UpdatedBefore: "1h",
-		HasBlockers:   ptrBool(true),
-		IDPrefix:      "API-2",
-	}}
-	got := applyRecipeFilters(issues, r)
-	requireIssueIDs(t, got, "API-2")
-
-	r.Filters.HasBlockers = ptrBool(false)
-	got = applyRecipeFilters(issues, r)
-	if len(got) != 0 {
-		t.Fatalf("expected blockers=false to exclude API-2, got %#v", got)
+	requireIssueIDs(t, ctx.Issues, "a", "z", "outside")
+	// Reuse the prior dispatch context with a newly loaded source. Old
+	// candidate membership and label health must not survive an empty scope.
+	got.Issues = issues[2:]
+	got.Readiness = model.NewReadinessIndex(got.Issues)
+	got.DataHash = ""
+	empty, err := scopeLoadedIssues(got, r)
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestApplyRecipeSort_DefaultsAndFields(t *testing.T) {
-	now := time.Now()
-	issues := []model.Issue{
-		{ID: "A", Title: "zzz", Priority: 2, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-30 * time.Minute)},
-		{ID: "B", Title: "aaa", Priority: 0, CreatedAt: now, UpdatedAt: now},
+	if len(empty.Issues) != 0 || len(empty.CandidateIDs) != 0 || empty.LabelContext != nil {
+		t.Fatalf("empty reload retained old scope: %+v", empty)
 	}
-
-	// Priority default ascending
-	r := &recipe.Recipe{Sort: recipe.SortConfig{Field: "priority"}}
-	sorted := applyRecipeSort(append([]model.Issue{}, issues...), r)
-	requireIssueIDs(t, sorted[:1], "B")
-
-	// Created default descending (newest first)
-	r.Sort = recipe.SortConfig{Field: "created"}
-	sorted = applyRecipeSort(append([]model.Issue{}, issues...), r)
-	requireIssueIDs(t, sorted[:1], "B")
-
-	// Title ascending explicit desc
-	r.Sort = recipe.SortConfig{Field: "title", Direction: "desc"}
-	sorted = applyRecipeSort(append([]model.Issue{}, issues...), r)
-	requireIssueIDs(t, sorted[:1], "A")
-
-	// Status ascending (string compare)
-	r.Sort = recipe.SortConfig{Field: "status"}
-	sorted = applyRecipeSort(append([]model.Issue{}, issues...), r)
-	requireIssueIDs(t, sorted[:1], "A")
-
-	// ID natural sort
-	idIssues := []model.Issue{
-		{ID: "bv-10"},
-		{ID: "bv-2"},
-		{ID: "bv-1"},
-	}
-	r.Sort = recipe.SortConfig{Field: "id"}
-	sortedIDs := applyRecipeSort(append([]model.Issue{}, idIssues...), r)
-	requireIssueIDs(t, sortedIDs, "bv-1", "bv-2", "bv-10")
-
-	// Unknown field should preserve order
-	r.Sort = recipe.SortConfig{Field: "unknown"}
-	sorted = applyRecipeSort(append([]model.Issue{}, issues...), r)
-	requireIssueIDs(t, sorted, "A", "B")
 }
 
 func TestFormatCycle(t *testing.T) {
@@ -2331,4 +2633,63 @@ func TestIssuesFingerprintDetectsContentChangesOrderIndependently(t *testing.T) 
 	if issuesFingerprint(base) == issuesFingerprint(depChanged) {
 		t.Fatalf("fingerprint must change when a dependency changes without an updated_at bump")
 	}
+}
+
+// TestMain isolates HOME and XDG_CONFIG_HOME for every cmd/bv test (and the
+// bv binaries they exec, which inherit the environment) so nothing can write
+// into the real ~/.config/bv (H3). The teardown fails the package if the real
+// directory changed during the run.
+func TestMain(m *testing.M) {
+	realConfig, _ := os.UserConfigDir()
+	before := fingerprintConfigDir(realConfig)
+
+	tmp, err := os.MkdirTemp("", "bv-cmd-test-home-")
+	if err != nil {
+		panic("creating isolated HOME: " + err.Error())
+	}
+	os.Setenv("HOME", tmp)
+	os.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, ".config"))
+	os.Setenv("BV_NO_BROWSER", "1")
+
+	// RCH can execute as a different uid from the copied checkout's owner.
+	// Trust only this checkout in the disposable HOME so nested builds retain
+	// VCS stamping without depending on the worker's real Git configuration.
+	repoDir, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		panic("resolving test checkout: " + err.Error())
+	}
+	repoDir, err = filepath.EvalSymlinks(repoDir)
+	if err != nil {
+		panic("resolving test checkout symlinks: " + err.Error())
+	}
+	gitConfig := exec.Command("git", "config", "--file", filepath.Join(tmp, ".gitconfig"), "--add", "safe.directory", repoDir)
+	if out, err := gitConfig.CombinedOutput(); err != nil {
+		panic(fmt.Sprintf("configuring isolated checkout trust: %v\n%s", err, out))
+	}
+
+	code := m.Run()
+
+	if after := fingerprintConfigDir(realConfig); before != after {
+		fmt.Fprintf(os.Stderr, "cmd/bv tests modified the real config dir %s:\nbefore: %s\nafter:  %s\n", realConfig, before, after)
+		if code == 0 {
+			code = 1
+		}
+	}
+	os.RemoveAll(tmp)
+	os.Exit(code)
+}
+
+func fingerprintConfigDir(configDir string) string {
+	if configDir == "" {
+		return ""
+	}
+	var out string
+	_ = filepath.Walk(filepath.Join(configDir, "bv"), func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		out += fmt.Sprintf("%s:%d;", path, info.Size())
+		return nil
+	})
+	return out
 }

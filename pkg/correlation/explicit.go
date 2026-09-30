@@ -79,9 +79,11 @@ func builtinPatterns() []*regexp.Regexp {
 		regexp.MustCompile(`(?i)refs?:?\s*#?([A-Za-z]+-\d+)`),
 		regexp.MustCompile(`(?i)resolves?:?\s*#?([A-Za-z]+-\d+)`),
 
-		// beads-123 or bead-123 format (common for this project)
-		regexp.MustCompile(`(?i)beads?[-_](\d+)`),
-		regexp.MustCompile(`(?i)bv[-_](\d+)`),
+		// beads-123 or bead-123 format (common for this project). The trailing
+		// boundary keeps hash-style ids such as bv-8a4r from yielding a phantom
+		// numeric id ("bv-8") that would link the commit to the wrong bead.
+		regexp.MustCompile(`(?i)beads?[-_](\d+)\b`),
+		regexp.MustCompile(`(?i)bv[-_](\d+)\b`),
 
 		// Generic ID at word boundary (PROJECT-123 style)
 		regexp.MustCompile(`\b([A-Z]{2,10}-\d+)\b`),
@@ -304,6 +306,9 @@ func (m *ExplicitMatcher) searchWithGrep(pattern string, opts ExtractOptions) ([
 	if opts.Limit > 0 {
 		args = append(args, fmt.Sprintf("-n%d", opts.Limit))
 	}
+	if opts.Revision != "" {
+		args = append(args, opts.Revision)
+	}
 
 	cmd := gitCommand(m.ctx, args...)
 	cmd.Dir = m.repoPath
@@ -409,6 +414,41 @@ func (m *ExplicitMatcher) CreateCorrelatedCommit(match ExplicitMatch, coCommitte
 		Confidence:  match.Confidence,
 		Reason:      reason,
 	}
+}
+
+// MatchWalkedCommits scans already-walked commits (subject and body) for bead
+// ID references and returns one ExplicitMatch per (commit, id) pair, in walk
+// order. It spawns no git subprocesses; the walk is the single bounded window
+// shared with the temporal strategy and the orphan detector. beadFilter, when
+// non-empty, keeps only matches for that id (case-insensitive) so a
+// single-bead report does not carry every other bead's references. Unknown
+// ids are NOT filtered here: the artifact is a pure function of HEAD, and
+// assembleReport drops pairs whose bead does not exist in the current bead
+// set.
+func (m *ExplicitMatcher) MatchWalkedCommits(commits []walkedCommit, beadFilter string) []ExplicitMatch {
+	var matches []ExplicitMatch
+	for _, wc := range commits {
+		ids := m.ExtractIDsFromMessage(wc.message())
+		if len(ids) == 0 {
+			continue
+		}
+		for _, id := range ids {
+			if beadFilter != "" && !strings.EqualFold(id.ID, beadFilter) {
+				continue
+			}
+			matches = append(matches, ExplicitMatch{
+				BeadID:      id.ID,
+				CommitSHA:   wc.SHA,
+				Message:     wc.Subject,
+				Author:      wc.Author,
+				AuthorEmail: wc.AuthorEmail,
+				Timestamp:   wc.Timestamp,
+				MatchType:   id.MatchType,
+				Confidence:  CalculateConfidence(id.MatchType, len(ids)),
+			})
+		}
+	}
+	return matches
 }
 
 // FindAllExplicitMatches finds explicit references for all known bead IDs.

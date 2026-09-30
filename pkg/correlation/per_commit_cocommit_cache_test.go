@@ -200,12 +200,13 @@ func TestPruneAndBoundPerCommitCoCommitEntries(t *testing.T) {
 		"ns": {Commits: map[string]perCommitCoCommitEntry{}},
 	}
 	total := perCommitCoCommitCacheMaxCommits + 50
+	base := now.Add(-time.Duration(total) * time.Second)
 	for i := 0; i < total; i++ {
 		entries["ns"].Commits[fmt.Sprintf("sha-%05d", i)] = perCommitCoCommitEntry{
-			CreatedAt: now.Add(time.Duration(i) * time.Second),
+			CreatedAt: base.Add(time.Duration(i) * time.Second),
 		}
 	}
-	pruneAndBoundPerCommitCoCommitEntries(now.Add(time.Hour), entries)
+	pruneAndBoundPerCommitCoCommitEntries(now, entries)
 	got := len(entries["ns"].Commits)
 	if got != perCommitCoCommitCacheMaxCommits {
 		t.Fatalf("after bound: %d commits, want %d", got, perCommitCoCommitCacheMaxCommits)
@@ -217,5 +218,68 @@ func TestPruneAndBoundPerCommitCoCommitEntries(t *testing.T) {
 	sort.Strings(keys)
 	if keys[0] < fmt.Sprintf("sha-%05d", 50) {
 		t.Fatalf("oldest surviving key %q suggests wrong entries evicted", keys[0])
+	}
+}
+
+func TestPruneAndBoundPerCommitCoCommitEntriesRejectsInvalidFreshness(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	entries := map[string]perCommitCoCommitNamespaceBucket{
+		"ns": {Commits: map[string]perCommitCoCommitEntry{
+			"fresh":  {CreatedAt: now.Add(-time.Hour)},
+			"future": {CreatedAt: now.Add(time.Nanosecond)},
+			"stale":  {CreatedAt: now.Add(-perCommitCoCommitCacheMaxAge - time.Nanosecond)},
+			"zero":   {},
+		}},
+	}
+
+	pruneAndBoundPerCommitCoCommitEntries(now, entries)
+
+	bucket, ok := entries["ns"]
+	if !ok || len(bucket.Commits) != 1 {
+		t.Fatalf("prune retained %+v, want only fresh entry", entries)
+	}
+	if _, ok := bucket.Commits["fresh"]; !ok {
+		t.Fatal("prune removed fresh entry")
+	}
+}
+
+func TestLoadPerCommitCoCommitRejectsInvalidFreshness(t *testing.T) {
+	t.Setenv("BV_NO_CACHE", "")
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+	now := time.Now().UTC()
+	namespace := "freshness"
+	path, err := perCommitCoCommitCachePath(true)
+	if err != nil {
+		t.Fatalf("cache path: %v", err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open cache: %v", err)
+	}
+	cacheFile := perCommitCoCommitCacheFile{
+		Version: perCommitCoCommitCacheVersion,
+		Entries: map[string]perCommitCoCommitNamespaceBucket{
+			namespace: {Commits: map[string]perCommitCoCommitEntry{
+				"fresh":  {CreatedAt: now.Add(-time.Hour)},
+				"future": {CreatedAt: now.Add(time.Hour)},
+				"stale":  {CreatedAt: now.Add(-perCommitCoCommitCacheMaxAge - time.Hour)},
+			}},
+		},
+	}
+	if err := writePerCommitCoCommitCacheLocked(f, cacheFile); err != nil {
+		_ = f.Close()
+		t.Fatalf("write cache: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close cache: %v", err)
+	}
+
+	loaded := loadPerCommitCoCommit(namespace)
+	if len(loaded) != 1 {
+		t.Fatalf("load returned %+v, want only fresh entry", loaded)
+	}
+	if _, ok := loaded["fresh"]; !ok {
+		t.Fatal("load removed fresh entry")
 	}
 }

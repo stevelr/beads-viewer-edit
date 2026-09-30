@@ -2,11 +2,17 @@ package main_test
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // Race Condition Tests for bv-kozq
@@ -160,6 +166,12 @@ func TestRace_ConcurrentTriageRequests(t *testing.T) {
 
 // TestRace_DataConsistency verifies that concurrent reads return consistent data.
 func TestRace_DataConsistency(t *testing.T) {
+	const (
+		pinnedEpochSeconds  = "1234567890"
+		pinnedGeneratedAt   = "2009-02-13T23:31:30Z"
+		robotCommandTimeout = 30 * time.Second
+	)
+
 	bv := buildBvBinary(t)
 	env := t.TempDir()
 
@@ -169,45 +181,309 @@ func TestRace_DataConsistency(t *testing.T) {
 		t.Fatalf("failed to create .beads dir: %v", err)
 	}
 
-	issues := `{"id":"A","title":"Task A","status":"open","priority":1}
-{"id":"B","title":"Task B","status":"open","priority":1,"dependencies":[{"depends_on_id":"A","type":"blocks"}]}
-{"id":"C","title":"Task C","status":"open","priority":1,"dependencies":[{"depends_on_id":"B","type":"blocks"}]}`
+	// A's deferral is active at the pinned epoch but expired in real time. D is
+	// therefore the only ready diagnostic top pick at the pinned epoch. This
+	// JSONL fixture has no verified live tracker, so it must not emit a claim.
+	// E closed one
+	// day before that epoch, so both triage and insights must count it in their
+	// seven-day velocity windows. These values make failures to plumb the pinned
+	// clock into analysis observable instead of merely checking stable bytes.
+	issues := `{"id":"A","title":"Deferred task","status":"open","issue_type":"task","priority":0,"created_at":"2009-02-01T23:31:30Z","updated_at":"2009-02-13T22:31:30Z","defer_until":"2009-02-14T23:31:30Z"}
+{"id":"B","title":"Planning parent","status":"open","issue_type":"epic","priority":1,"created_at":"2009-02-01T23:31:30Z","updated_at":"2009-02-13T21:31:30Z"}
+{"id":"C","title":"Blocked child","status":"open","issue_type":"task","priority":1,"created_at":"2009-02-01T23:31:30Z","updated_at":"2009-02-13T21:31:30Z","dependencies":[{"depends_on_id":"B","type":"blocks"}]}
+{"id":"D","title":"Ready task","status":"open","issue_type":"task","priority":4,"created_at":"2009-02-01T23:31:30Z","updated_at":"2009-02-13T20:31:30Z"}
+{"id":"E","title":"Recently closed task","status":"closed","issue_type":"task","priority":2,"created_at":"2009-02-01T23:31:30Z","updated_at":"2009-02-12T23:31:30Z","closed_at":"2009-02-12T23:31:30Z"}`
 
 	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
 	if err := os.WriteFile(issuesPath, []byte(issues), 0644); err != nil {
 		t.Fatalf("failed to write issues.jsonl: %v", err)
 	}
 
-	// Run multiple reads and verify consistency
-	const numReads = 5
-	var wg sync.WaitGroup
-	results := make([]string, numReads)
-
-	for i := 0; i < numReads; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			cmd := exec.Command(bv, "--robot-next")
-			cmd.Dir = env
-			var stdout bytes.Buffer
-			cmd.Stdout = &stdout
-			if err := cmd.Run(); err != nil {
-				t.Errorf("read %d failed: %v", idx, err)
-				return
-			}
-			results[idx] = stdout.String()
-		}(i)
+	commands := []struct {
+		name string
+		args []string
+	}{
+		{name: "next", args: []string{"--robot-next"}},
+		{name: "triage", args: []string{"--robot-triage"}},
+		{name: "insights", args: []string{"--robot-insights"}},
 	}
 
-	wg.Wait()
+	type velocityProjection struct {
+		ClosedLast7Days int `json:"closed_last_7_days"`
+	}
+	type robotProjection struct {
+		GeneratedAt  string `json:"generated_at"`
+		ID           string `json:"id"`
+		Actionable   bool   `json:"actionable"`
+		ClaimCommand string `json:"claim_command"`
+		Actions      *struct {
+			LocalID           string          `json:"local_id"`
+			UnavailableReason string          `json:"unavailable_reason"`
+			Show              json.RawMessage `json:"show"`
+			Claim             json.RawMessage `json:"claim"`
+		} `json:"actions"`
+		DiagnosticTopPick *struct {
+			ID string `json:"id"`
+		} `json:"diagnostic_top_pick"`
+		Velocity *velocityProjection `json:"Velocity"`
+		Triage   *struct {
+			Meta struct {
+				HistoryStatus string `json:"history_status"`
+			} `json:"meta"`
+			QuickRef struct {
+				TopPicks []struct {
+					ID string `json:"id"`
+				} `json:"top_picks"`
+			} `json:"quick_ref"`
+			ProjectHealth struct {
+				Velocity *velocityProjection `json:"velocity"`
+			} `json:"project_health"`
+		} `json:"triage"`
+	}
 
-	// All results should be identical (deterministic)
-	if len(results) > 0 && results[0] != "" {
-		for i := 1; i < numReads; i++ {
-			if results[i] != results[0] {
-				t.Errorf("inconsistent results: read 0 != read %d", i)
-			}
+	validatePinnedClock := func(command string, output []byte) error {
+		var payload robotProjection
+		if err := json.Unmarshal(output, &payload); err != nil {
+			return fmt.Errorf("%s returned invalid JSON: %w; output=%q", command, err, output)
 		}
+		if payload.GeneratedAt != pinnedGeneratedAt {
+			return fmt.Errorf("%s generated_at = %q, want pinned epoch %q", command, payload.GeneratedAt, pinnedGeneratedAt)
+		}
+
+		switch command {
+		case "next":
+			if payload.DiagnosticTopPick == nil || payload.DiagnosticTopPick.ID != "D" {
+				return fmt.Errorf("next diagnostic pick = %+v, want D while A is deferred at %s", payload.DiagnosticTopPick, pinnedGeneratedAt)
+			}
+			if payload.Actionable || payload.ID != "" || payload.ClaimCommand != "" || payload.Actions == nil || payload.Actions.LocalID != "D" || payload.Actions.UnavailableReason == "" || len(payload.Actions.Show) != 0 || len(payload.Actions.Claim) != 0 {
+				return fmt.Errorf("unbound next response emitted an actionable route: %s", output)
+			}
+		case "triage":
+			if payload.Triage == nil {
+				return fmt.Errorf("triage response omitted triage payload")
+			}
+			if payload.Triage.Meta.HistoryStatus != "skipped" {
+				return fmt.Errorf("triage history_status = %q, want skipped under pinned clock", payload.Triage.Meta.HistoryStatus)
+			}
+			foundReady := false
+			for _, pick := range payload.Triage.QuickRef.TopPicks {
+				switch pick.ID {
+				case "A":
+					return fmt.Errorf("triage included A in top picks despite defer_until after %s", pinnedGeneratedAt)
+				case "D":
+					foundReady = true
+				}
+			}
+			if !foundReady {
+				return fmt.Errorf("triage top picks omitted D at pinned epoch %s", pinnedGeneratedAt)
+			}
+			if payload.Triage.ProjectHealth.Velocity == nil {
+				return fmt.Errorf("triage response omitted project velocity")
+			}
+			if got := payload.Triage.ProjectHealth.Velocity.ClosedLast7Days; got != 1 {
+				return fmt.Errorf("triage closed_last_7_days = %d, want 1 at pinned epoch %s", got, pinnedGeneratedAt)
+			}
+		case "insights":
+			if payload.Velocity == nil {
+				return fmt.Errorf("insights response omitted velocity")
+			}
+			if got := payload.Velocity.ClosedLast7Days; got != 1 {
+				return fmt.Errorf("insights closed_last_7_days = %d, want 1 at pinned epoch %s", got, pinnedGeneratedAt)
+			}
+		default:
+			return fmt.Errorf("missing pinned-clock validation for command %q", command)
+		}
+		return nil
+	}
+
+	for _, tt := range commands {
+		t.Run(tt.name, func(t *testing.T) {
+			cacheDir := t.TempDir()
+			snapshotCache := func() (map[string][]byte, error) {
+				paths, err := filepath.Glob(filepath.Join(cacheDir, "analysis_cache", "*.json"))
+				if err != nil {
+					return nil, fmt.Errorf("glob analysis cache: %w", err)
+				}
+				if len(paths) == 0 {
+					return nil, fmt.Errorf("analysis command created no disk-cache entry under %s", cacheDir)
+				}
+				snapshot := make(map[string][]byte, len(paths))
+				for _, path := range paths {
+					raw, err := os.ReadFile(path)
+					if err != nil {
+						return nil, fmt.Errorf("read analysis cache entry %s: %w", path, err)
+					}
+					snapshot[filepath.Base(path)] = raw
+				}
+				return snapshot, nil
+			}
+			run := func() (string, error) {
+				ctx, cancel := context.WithTimeout(context.Background(), robotCommandTimeout)
+				defer cancel()
+
+				cmd := exec.CommandContext(ctx, bv, tt.args...)
+				cmd.Dir = env
+				cmd.Env = append(os.Environ(),
+					"SOURCE_DATE_EPOCH="+pinnedEpochSeconds,
+					"BV_CACHE_DIR="+cacheDir,
+					"BV_NO_BROWSER=1",
+					"BV_TEST_MODE=1",
+				)
+				var stdout, stderr bytes.Buffer
+				cmd.Stdout = &stdout
+				cmd.Stderr = &stderr
+				command := strings.Join(tt.args, " ")
+				if err := cmd.Run(); err != nil {
+					if ctx.Err() == context.DeadlineExceeded {
+						return "", fmt.Errorf("%s timed out after %s in %s; stderr=%q; stdout=%q", command, robotCommandTimeout, env, stderr.String(), stdout.String())
+					}
+					return "", fmt.Errorf("%s failed in %s: %w; stderr=%q; stdout=%q", command, env, err, stderr.String(), stdout.String())
+				}
+				output := stdout.Bytes()
+				if len(bytes.TrimSpace(output)) == 0 {
+					return "", fmt.Errorf("%s returned empty robot output; stderr=%q", command, stderr.String())
+				}
+				if err := validatePinnedClock(tt.name, output); err != nil {
+					return "", err
+				}
+				return stdout.String(), nil
+			}
+
+			// The first execution populates a cold cache; the second exercises the
+			// warm-cache path. A pinned robot clock must make both byte-identical.
+			want, err := run()
+			if err != nil {
+				t.Fatal(err)
+			}
+			coldCache, err := snapshotCache()
+			if err != nil {
+				t.Fatal(err)
+			}
+			warm, err := run()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if warm != want {
+				t.Fatalf("cold and warm output differ\ncold: %s\nwarm: %s", want, warm)
+			}
+			warmCache, err := snapshotCache()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(warmCache, coldCache) {
+				t.Fatalf("warm invocation rewrote or added cache entries; cold entry count=%d, warm entry count=%d", len(coldCache), len(warmCache))
+			}
+
+			const concurrentReads = 3
+			type readResult struct {
+				output string
+				err    error
+			}
+			results := make(chan readResult, concurrentReads)
+			var wg sync.WaitGroup
+			for i := 0; i < concurrentReads; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					output, err := run()
+					results <- readResult{output: output, err: err}
+				}()
+			}
+			wg.Wait()
+			close(results)
+
+			for result := range results {
+				if result.err != nil {
+					t.Error(result.err)
+					continue
+				}
+				if result.output != want {
+					t.Errorf("concurrent output differs from cold/warm baseline\nbaseline: %s\nconcurrent: %s", want, result.output)
+				}
+			}
+		})
+	}
+}
+
+func TestRobotInsightsPinnedClockOmitsParallelGainDuration(t *testing.T) {
+	bv := buildBvBinary(t)
+	project := t.TempDir()
+	beadsDir := filepath.Join(project, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Independent issues require a real O(n²) parallel-gain sweep. The tiny
+	// consistency fixture can finish within one millisecond and hide a leaked
+	// duration behind omitempty; this workload also checks ordinary timing survives.
+	const issueCount = 200
+	var issues strings.Builder
+	for i := 0; i < issueCount; i++ {
+		fmt.Fprintf(&issues, "{\"id\":\"independent-%04d\",\"title\":\"Independent task\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2,\"created_at\":\"2009-02-01T00:00:00Z\",\"updated_at\":\"2009-02-01T00:00:00Z\"}\n", i)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(issues.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range []struct {
+		name   string
+		epoch  string
+		pinned bool
+	}{
+		{name: "ordinary"},
+		{name: "invalid epoch", epoch: "not-an-epoch"},
+		{name: "pinned", epoch: "1234567890", pinned: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("SOURCE_DATE_EPOCH", tt.epoch)
+			cacheDir := t.TempDir()
+			run := func() []byte {
+				t.Helper()
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, bv, "--robot-insights")
+				cmd.Dir = project
+				cmd.Env = append(os.Environ(), "BV_CACHE_DIR="+cacheDir, "BV_NO_BROWSER=1", "BV_TEST_MODE=1")
+				var stdout, stderr bytes.Buffer
+				cmd.Stdout, cmd.Stderr = &stdout, &stderr
+				if err := cmd.Run(); err != nil {
+					t.Fatalf("insights failed: %v; stdout=%s; stderr=%s", err, stdout.String(), stderr.String())
+				}
+				var payload struct {
+					AdvancedInsights struct {
+						ParallelGain *struct {
+							CurrentParallel int `json:"current_parallel"`
+							Status          struct {
+								State      string `json:"state"`
+								Capped     bool   `json:"capped"`
+								DurationMs *int64 `json:"duration_ms"`
+							} `json:"status"`
+						} `json:"parallel_gain"`
+					} `json:"advanced_insights"`
+				}
+				if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+					t.Fatalf("decode insights: %v; stdout=%s; stderr=%s", err, stdout.String(), stderr.String())
+				}
+				gain := payload.AdvancedInsights.ParallelGain
+				if gain == nil || gain.Status.State != "computed" || gain.CurrentParallel != issueCount {
+					t.Fatalf("parallel gain did not compute %d independent tracks: %s", issueCount, stdout.String())
+				}
+				if tt.pinned {
+					if gain.Status.DurationMs != nil || gain.Status.Capped {
+						t.Fatalf("pinned parallel gain leaked timing or capped computation: %s", stdout.String())
+					}
+				} else if gain.Status.DurationMs == nil || *gain.Status.DurationMs <= 0 {
+					t.Fatalf("ordinary parallel gain lost its measured duration: %s", stdout.String())
+				}
+				return stdout.Bytes()
+			}
+			cold := run()
+			if tt.pinned {
+				if warm := run(); !bytes.Equal(cold, warm) {
+					t.Fatalf("pinned insights changed between cold and warm cache\ncold: %s\nwarm: %s", cold, warm)
+				}
+			}
+		})
 	}
 }
 

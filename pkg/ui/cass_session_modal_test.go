@@ -1,15 +1,91 @@
 package ui
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/cass"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/drift"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 // testTheme is defined in history_test.go and reused here
+
+// Opt in with an existing, indexed bead ID and its workspace. This executes the
+// installed cass against its real archive; ordinary suites use no user data.
+func TestModel_CassInstalledSessionLookup(t *testing.T) {
+	id := os.Getenv("BV_CASS_LIVE_BEAD")
+	workspace := os.Getenv("BV_CASS_LIVE_WORKSPACE")
+	if id == "" || workspace == "" {
+		t.Skip("requires BV_CASS_LIVE_BEAD and BV_CASS_LIVE_WORKSPACE")
+	}
+	path, err := exec.LookPath("cass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, "search", `"`+id+`"`, "--robot", "--robot-format", "json", "--limit", "3", "--workspace", workspace, "--fields", "source_path,line_number,agent,title,content,created_at", "--max-content-length", "4000")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	output, err := cmd.Output()
+	t.Logf("cass=%s direct_search_exit=%v stderr=%q", path, err, stderr.String())
+	if err != nil {
+		t.Fatal("direct installed cass search failed")
+	}
+	var direct struct {
+		Hits []struct {
+			SourcePath string `json:"source_path"`
+			LineNumber int    `json:"line_number"`
+			Agent      string `json:"agent"`
+			Title      string `json:"title"`
+			Content    string `json:"content"`
+			CreatedAt  *int64 `json:"created_at"`
+		} `json:"hits"`
+	}
+	if err := json.Unmarshal(output, &direct); err != nil || len(direct.Hits) == 0 {
+		t.Fatalf("live prerequisite must return known sessions: parse=%v hits=%d", err, len(direct.Hits))
+	}
+	m := NewModel([]model.Issue{{ID: id, Title: "Live session lookup", Status: model.StatusOpen, IssueType: model.TypeTask}}, nil, "")
+	m.workDir = workspace
+	m.width, m.height = 120, 40
+	health := CheckCassHealthCmd()().(CassHealthMsg)
+	m = asModelPtr(t, must2(m.Update(health)))
+	updated, lookup := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+	got := completeCassLookup(t, asModelPtr(t, updated), lookup)
+	if !got.showCassModal || len(got.cassModal.sessions) == 0 {
+		t.Fatalf("direct cass returned %d hits but V has no modal: health=%s status=%q", len(direct.Hits), health.Status, got.statusMsg)
+	}
+	matched := false
+	for _, session := range got.cassModal.sessions {
+		for _, hit := range direct.Hits {
+			if hit.CreatedAt != nil && session.SourcePath == hit.SourcePath && session.LineNumber == hit.LineNumber && session.Agent == hit.Agent && session.Title == hit.Title && session.Snippet == hit.Content && session.Timestamp.Equal(time.UnixMilli(*hit.CreatedAt)) {
+				matched = session.Title != "" && session.Snippet != "" && !session.Timestamp.IsZero()
+			}
+		}
+	}
+	if !matched {
+		t.Fatal("modal did not preserve a live hit's location, title, content and timestamp")
+	}
+	rendered := got.cassModal.View()
+	if !strings.Contains(rendered, got.cassModal.sessions[0].Agent) || strings.Contains(rendered, "(no preview available)") || !strings.Contains(rendered, id) {
+		t.Fatal("live modal render omitted the bead, agent or session preview")
+	}
+	if got.cassStatus != health.Status {
+		t.Fatal("opening sessions changed the reported archive health")
+	}
+	t.Logf("direct_hits=%d modal_sessions=%d archive_health=%s", len(direct.Hits), len(got.cassModal.sessions), got.cassStatus)
+}
 
 func TestNewCassSessionModal(t *testing.T) {
 	theme := testTheme()
@@ -163,10 +239,35 @@ func TestCassSessionModal_Update_CopyCommand(t *testing.T) {
 		t.Errorf("Search command should contain keywords, got: %s", modal.searchCmd)
 	}
 
-	// Press 'y' to copy - note: actual clipboard copy may fail in test environment
-	// but the copied flag should be set if successful, we mainly test it doesn't panic
-	modal, _ = modal.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
-	// Can't reliably test clipboard in CI, just verify no panic
+	// Pressing 'y' must schedule the potentially blocking helper rather than run
+	// it on Bubble Tea's Update loop.
+	modal, cmd := modal.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if cmd == nil {
+		t.Fatal("copy should return an asynchronous Bubble Tea command")
+	}
+	if modal.copied {
+		t.Fatal("copy feedback should wait for the asynchronous result")
+	}
+
+	modal, _ = modal.Update(cassClipboardCopyMsg{modalToken: modal.copyToken})
+	if !modal.copied {
+		t.Fatal("successful copy result should enable feedback")
+	}
+
+	failed := NewCassSessionModal("bv-copy", result, theme)
+	failed, _ = failed.Update(cassClipboardCopyMsg{
+		modalToken: failed.copyToken,
+		err:        fmt.Errorf("clipboard unavailable"),
+	})
+	if failed.copied {
+		t.Fatal("failed copy result must not enable feedback")
+	}
+
+	reopened := NewCassSessionModal("bv-copy", result, theme)
+	reopened, _ = reopened.Update(cassClipboardCopyMsg{modalToken: modal.copyToken})
+	if reopened.copied {
+		t.Fatal("late copy result from a dismissed modal must be ignored")
+	}
 }
 
 func TestCassSessionModal_View_RendersCorrectly(t *testing.T) {
@@ -735,5 +836,475 @@ func TestCassSessionModal_UnhandledKeyIgnored(t *testing.T) {
 
 	if modal.selected != initialSelected {
 		t.Errorf("Unhandled keys should not change selection, got %d", modal.selected)
+	}
+}
+
+// writeStubCass puts a fake `cass` on PATH whose `health` exit code is
+// controlled by CASS_STUB_EXIT (0 healthy, 1 needs index).
+func writeStubCass(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\nif [ \"$1\" = \"health\" ]; then exit \"${CASS_STUB_EXIT:-0}\"; fi\nif [ \"$1\" = \"search\" ]; then printf '%s' \"${CASS_STUB_SEARCH:-}\"; exit \"${CASS_STUB_SEARCH_EXIT:-0}\"; fi\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "cass"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write stub cass: %v", err)
+	}
+	return dir
+}
+
+func TestModel_CassLookupYieldsBeforeSearch(t *testing.T) {
+	t.Setenv("PATH", writeStubCass(t))
+	t.Setenv("CASS_STUB_SEARCH", `{"hits":[{"source_path":"/session","agent":"codex","content":"OAuth preview"}],"total_matches":1}`)
+	m := NewModel([]model.Issue{{ID: "bv-preview", Title: "OAuth preview", Status: model.StatusOpen, IssueType: model.TypeTask}}, nil, "")
+	m.width, m.height = 120, 40
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+	got := asModelPtr(t, updated)
+	if cmd == nil || got.showCassModal || !strings.Contains(got.statusMsg, "Looking up sessions") {
+		t.Fatalf("V must yield a pending lookup before executing Cass: command=%v modal=%v status=%q", cmd != nil, got.showCassModal, got.statusMsg)
+	}
+	t.Cleanup(got.Stop)
+}
+
+// Execute the actual command tree returned by Update, including tea.Batch.
+// Other UI commands can also be queued; only the session completion is needed.
+func cassLookupMessage(cmd tea.Cmd) tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	msg := cmd()
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		for _, child := range batch {
+			if result := cassLookupMessage(child); result != nil {
+				return result
+			}
+		}
+		return nil
+	}
+	if _, ok := msg.(cassSessionsLoadedMsg); ok {
+		return msg
+	}
+	return nil
+}
+
+func completeCassLookup(t *testing.T, m *Model, cmd tea.Cmd) *Model {
+	t.Helper()
+	msg := cassLookupMessage(cmd)
+	if msg == nil {
+		t.Fatal("V did not queue a session lookup completion")
+	}
+	return asModelPtr(t, must2(m.Update(msg)))
+}
+
+func TestModel_CassLookupKeepsInputResponsive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("controlled POSIX subprocess; native Windows is a separate acceptance gate")
+	}
+	for _, stage := range []string{"health", "search"} {
+		t.Run(stage, func(t *testing.T) {
+			dir := t.TempDir()
+			started, release := filepath.Join(dir, "started"), filepath.Join(dir, "release")
+			script := `#!/bin/sh
+if [ "$1" = "$CASS_BLOCK_STAGE" ]; then
+  : > "$CASS_STARTED"
+  while [ ! -e "$CASS_RELEASE" ]; do /bin/sleep 0.01; done
+fi
+if [ "$1" = "health" ]; then exit 0; fi
+printf '%s' '{"hits":[{"source_path":"/session","agent":"codex","content":"preview"}],"total_matches":1}'
+`
+			if err := os.WriteFile(filepath.Join(dir, "cass"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir)
+			t.Setenv("CASS_BLOCK_STAGE", stage)
+			t.Setenv("CASS_STARTED", started)
+			t.Setenv("CASS_RELEASE", release)
+			m := NewModel([]model.Issue{
+				{ID: "A", Title: "First", Status: model.StatusOpen, IssueType: model.TypeTask},
+				{ID: "B", Title: "Second", Status: model.StatusOpen, IssueType: model.TypeTask},
+			}, nil, "")
+			m = asModelPtr(t, must2(m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})))
+			_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+			done := make(chan tea.Msg, 1)
+			go func() { done <- cassLookupMessage(cmd) }()
+			t.Cleanup(func() {
+				m.Stop()
+				if err := os.WriteFile(release, nil, 0o600); err != nil {
+					t.Error(err)
+				}
+			})
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				if _, err := os.Stat(started); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("controlled Cass did not enter the blocked subprocess")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			m = asModelPtr(t, must2(m.Update(tea.WindowSizeMsg{Width: 90, Height: 25})))
+			if m.width != 90 || m.height != 25 || m.cassRequest == nil || !strings.Contains(m.View(), "Looking up sessions") {
+				t.Fatal("resize/render did not proceed while Cass was blocked")
+			}
+			select {
+			case <-done:
+				t.Fatal("subprocess completed before release: this did not exercise a pending lookup")
+			default:
+			}
+			before := m.focusedIssueForSessions().ID
+			m = asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyDown})))
+			if m.focusedIssueForSessions().ID == before || m.cassRequest != nil {
+				t.Fatal("navigation must proceed and cancel the old selection's lookup")
+			}
+			if err := os.WriteFile(release, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case result := <-done:
+				m = asModelPtr(t, must2(m.Update(result)))
+				if m.showCassModal || m.focusedIssueForSessions().ID == before {
+					t.Fatal("cancelled completion replaced the user's current selection")
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("cancelled lookup did not finish")
+			}
+		})
+	}
+}
+
+func TestModel_CassLookupDiscardsStaleCompletions(t *testing.T) {
+	for _, invalidate := range []string{"V", "esc", "selection", "dataset", "workspace", "help", "alerts", "filter", "quit", "stop"} {
+		t.Run(invalidate, func(t *testing.T) {
+			t.Setenv("PATH", writeStubCass(t))
+			t.Setenv("CASS_STUB_SEARCH", `{"hits":[{"source_path":"/session","agent":"codex","content":"preview"}],"total_matches":1}`)
+			m := NewModel([]model.Issue{
+				{ID: "A", Title: "First", Status: model.StatusOpen, IssueType: model.TypeTask},
+				{ID: "B", Title: "Second", Status: model.StatusOpen, IssueType: model.TypeTask},
+			}, nil, "")
+			t.Cleanup(m.Stop)
+			m.width, m.height = 120, 40
+			_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+			old := cassLookupMessage(cmd)
+			if old == nil {
+				t.Fatal("missing original completion")
+			}
+			switch invalidate {
+			case "V", "esc":
+				key := tea.KeyMsg{Type: tea.KeyEsc}
+				if invalidate == "V" {
+					key = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")}
+				}
+				_, duplicate := m.Update(key)
+				if duplicate != nil || m.cassRequest != nil {
+					t.Fatal("cancel must not start a duplicate lookup")
+				}
+			case "selection":
+				m.Update(tea.KeyMsg{Type: tea.KeyDown})
+			case "dataset":
+				m.beginSemanticDatasetUpdate()
+			case "workspace":
+				m.workDir = t.TempDir()
+			case "help":
+				m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
+			case "alerts":
+				m.alerts = []drift.Alert{{Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning, IssueID: "A", Message: "Test alert"}}
+				m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("!")})
+				if !m.showAlertsPanel {
+					t.Fatal("alerts key did not open the intended overlay")
+				}
+			case "filter":
+				m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+				if m.list.FilterState() != list.Filtering {
+					t.Fatal("filter key did not start editing the filter")
+				}
+			case "quit":
+				m.quitCommand()
+			case "stop":
+				m.Stop()
+			}
+			m.Update(old)
+			if m.showCassModal || m.cassRequest != nil {
+				t.Fatal("stale completion opened the modal or retained the pending request")
+			}
+			// A fresh request for the same ID must not accept the older reply.
+			m.focused, m.showHelp = focusList, false
+			m.showAlertsPanel = false
+			m.list.ResetFilter()
+			m.list.Select(0)
+			_, next := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+			request := m.cassRequest
+			m.Update(old)
+			if m.showCassModal || request == nil || m.cassRequest != request {
+				t.Fatal("out-of-order completion stole the newer lookup")
+			}
+			got := completeCassLookup(t, m, next)
+			if !got.showCassModal || got.cassModal.beadID != got.list.SelectedItem().(IssueItem).Issue.ID {
+				t.Fatal("fresh retry failed to display the selected bead's sessions")
+			}
+		})
+	}
+}
+
+func TestModel_CassLookupRefreshDiscardsOldCache(t *testing.T) {
+	for _, refresh := range []string{"dataset", "workspace"} {
+		t.Run(refresh, func(t *testing.T) {
+			t.Setenv("PATH", writeStubCass(t))
+			t.Setenv("CASS_STUB_SEARCH", `{"hits":[{"source_path":"/old","agent":"codex","content":"old preview"}],"total_matches":1}`)
+			m := NewModel([]model.Issue{{ID: "A", Title: "First", Status: model.StatusOpen, IssueType: model.TypeTask}}, nil, "")
+			t.Cleanup(m.Stop)
+			_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+			old := cassLookupMessage(cmd)
+			oldCorrelator := m.cassCorrelator
+			if old == nil || oldCorrelator.GetCached("A") == nil {
+				t.Fatal("original real command did not populate its correlation cache")
+			}
+			if refresh == "dataset" {
+				m.beginSemanticDatasetUpdate()
+			} else {
+				m.workDir = t.TempDir()
+			}
+			m.Update(old)
+			t.Setenv("CASS_STUB_SEARCH", `{"hits":[{"source_path":"/new","agent":"codex","content":"fresh preview"}],"total_matches":1}`)
+			_, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+			got := completeCassLookup(t, m, cmd)
+			if got.cassCorrelator == oldCorrelator || !got.showCassModal || got.cassModal.sessions[0].Snippet != "fresh preview" {
+				t.Fatal("new lookup reused an older dataset/workspace correlation cache")
+			}
+		})
+	}
+}
+
+func TestModel_CassStartupHealthAfterCancelledLookup(t *testing.T) {
+	t.Setenv("PATH", writeStubCass(t))
+	t.Setenv("CASS_STUB_SEARCH", `{"hits":[{"source_path":"/session","agent":"codex","content":"preview"}],"total_matches":1}`)
+	m := NewModel([]model.Issue{{ID: "A", Title: "First", Status: model.StatusOpen, IssueType: model.TypeTask}}, nil, "")
+	t.Cleanup(m.Stop)
+	_, pending := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+	detector, correlator := m.cassDetector, m.cassCorrelator
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	startup := CheckCassHealthCmd()().(CassHealthMsg)
+	m.Update(startup)
+	if startup.Status != cass.StatusHealthy || m.cassStatus != startup.Status || m.cassDetector != detector || m.cassCorrelator != correlator {
+		t.Fatal("cancelled early lookup hid startup health or replaced its detector/correlator")
+	}
+	m.Update(cassLookupMessage(pending))
+	if m.showCassModal || m.cassStatus != cass.StatusHealthy {
+		t.Fatal("cancelled command disturbed the startup health result")
+	}
+	_, lookup := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+	m = completeCassLookup(t, m, lookup)
+	m.Update(CassHealthMsg{Status: cass.StatusNeedsIndex, Detector: startup.Detector})
+	if !m.showCassModal || m.cassStatus != cass.StatusHealthy || m.cassDetector != detector {
+		t.Fatal("late startup probe overwrote a newer completed lookup's health")
+	}
+}
+
+func TestModel_CassLookupReturnsToOriginatingView(t *testing.T) {
+	for _, origin := range []focus{focusList, focusDetail, focusBoard, focusTree, focusHistory} {
+		t.Run(fmt.Sprint(origin), func(t *testing.T) {
+			t.Setenv("PATH", writeStubCass(t))
+			t.Setenv("CASS_STUB_SEARCH", `{"hits":[{"source_path":"/session","agent":"codex","content":"preview"}],"total_matches":1}`)
+			m := NewModel([]model.Issue{{ID: "A", Title: "First", Status: model.StatusOpen, IssueType: model.TypeTask}}, nil, "")
+			m.width, m.height = 120, 40
+			if origin == focusTree {
+				m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("E")})
+			}
+			if origin == focusHistory {
+				m.historyView = NewHistoryModel(createTestHistoryReport(), m.theme)
+				m.issues = append(m.issues, model.Issue{ID: m.historyView.SelectedBeadID(), Title: "History", Status: model.StatusOpen, IssueType: model.TypeTask})
+				m.historyReportDataGeneration = m.semanticDataGeneration
+			}
+			m.focused = origin
+			m.isBoardView, m.isHistoryView = origin == focusBoard, origin == focusHistory
+			want := m.focusedIssueForSessions()
+			if want == nil {
+				t.Fatal("origin has no selected issue")
+			}
+			_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+			got := completeCassLookup(t, m, cmd)
+			if !got.showCassModal || got.cassModal.beadID != want.ID {
+				t.Fatal("origin did not receive its selected issue's sessions")
+			}
+			got.Update(tea.WindowSizeMsg{Width: 70, Height: 30})
+			if got.cassModal.width != 60 || got.cassModal.height != 30 {
+				t.Fatal("open session modal did not adapt to the terminal resize")
+			}
+			got.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			if got.showCassModal || got.focused != origin {
+				t.Fatalf("dismiss returned to %v instead of %v", got.focused, origin)
+			}
+			if origin == focusList || origin == focusBoard || origin == focusHistory {
+				_, pending := got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+				result := cassLookupMessage(pending)
+				got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+				searching := (origin == focusList && got.list.FilterState() == list.Filtering) ||
+					(origin == focusBoard && got.board.IsSearchMode()) ||
+					(origin == focusHistory && got.historyView.IsSearchActive())
+				if result == nil || !searching || got.cassRequest != nil {
+					t.Fatal("starting an embedded search did not cancel the pending session lookup")
+				}
+				got.Update(result)
+				if got.showCassModal {
+					t.Fatal("late session completion interrupted the active search input")
+				}
+			}
+		})
+	}
+}
+
+func TestModel_CassLookupUsesSearchOutcome(t *testing.T) {
+	// Controlled subprocess cases, separate from the installed-archive proof.
+	for _, tc := range []struct {
+		name, output, exit string
+		wantModal          bool
+		wantStatus         string
+	}{
+		{"stale searchable", `{"hits":[{"source_path":"/session","agent":"codex","content":"OAuth preview","created_at":1788322597432}],"total_matches":1}`, "0", true, ""},
+		{"empty success", `{"hits":[],"total_matches":0}`, "0", false, "No correlated sessions found"},
+		{"failed search", "", "1", false, "Session lookup incomplete"},
+		{"malformed response", `{"hits":`, "0", false, "Session lookup incomplete"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PATH", writeStubCass(t))
+			t.Setenv("CASS_STUB_EXIT", "1")
+			t.Setenv("CASS_STUB_SEARCH", tc.output)
+			t.Setenv("CASS_STUB_SEARCH_EXIT", tc.exit)
+			m := NewModel([]model.Issue{{ID: "bv-preview", Title: "OAuth preview", Status: model.StatusOpen, IssueType: model.TypeTask}}, nil, "")
+			m.width, m.height = 120, 40
+			updated, lookup := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+			got := completeCassLookup(t, asModelPtr(t, updated), lookup)
+			if got.showCassModal != tc.wantModal || !strings.Contains(got.statusMsg, tc.wantStatus) || got.cassStatus != cass.StatusNeedsIndex {
+				t.Fatalf("modal=%v status=%q health=%s", got.showCassModal, got.statusMsg, got.cassStatus)
+			}
+			if tc.wantModal && (!strings.Contains(got.cassModal.View(), "OAuth preview") || !strings.Contains(got.cassModal.View(), "codex")) {
+				t.Fatal("modal lost preview text or agent")
+			}
+		})
+	}
+}
+
+// TestModel_CassDetectionOnStartup (E4): the startup health check feeds the
+// footer badge: healthy shows "🤖 cass", an unindexed install shows
+// "⚠ cass index", and no cass on PATH shows nothing.
+func TestModel_CassDetectionOnStartup(t *testing.T) {
+	issues := []model.Issue{{ID: "A", Title: "Issue A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask}}
+	footerAfter := func(t *testing.T, path, stubExit string) string {
+		t.Helper()
+		t.Setenv("PATH", path)
+		t.Setenv("CASS_STUB_EXIT", stubExit)
+		t.Setenv("BV_TEST_MODE", "")
+		m := NewModel(issues, nil, "")
+		m.width, m.height = 120, 40
+		msg := CheckCassHealthCmd()()
+		health, ok := msg.(CassHealthMsg)
+		if !ok {
+			t.Fatalf("CheckCassHealthCmd returned %T", msg)
+		}
+		got := asModelPtr(t, must2(m.Update(health)))
+		if got.cassStatus != health.Status || got.cassDetector == nil {
+			t.Fatalf("model did not record the detection result: status=%v detector=%v", got.cassStatus, got.cassDetector)
+		}
+		return got.renderFooter()
+	}
+
+	stub := writeStubCass(t)
+	if footer := footerAfter(t, stub, "0"); !strings.Contains(footer, "🤖 cass") {
+		t.Fatalf("healthy cass should show the badge, footer=%q", footer)
+	}
+	if footer := footerAfter(t, stub, "1"); !strings.Contains(footer, "⚠ cass index") {
+		t.Fatalf("unindexed cass should ask for an index, footer=%q", footer)
+	}
+	if footer := footerAfter(t, t.TempDir(), "0"); strings.Contains(footer, "cass") {
+		t.Fatalf("no cass on PATH must show nothing, footer=%q", footer)
+	}
+}
+
+// TestModel_InitSkipsCassProbeInTestMode: BV_TEST_MODE (set by TestMain for
+// every other test) must keep Init from executing cass.
+func TestModel_InitSkipsCassProbeInTestMode(t *testing.T) {
+	t.Setenv("BV_TEST_MODE", "1")
+	t.Setenv("BV_NO_UPDATE_CHECK", "1")
+	issues := []model.Issue{{ID: "A", Title: "Issue A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask}}
+	m := NewModel(issues, nil, "")
+	m.analysis = nil
+	n := 0
+	if cmd := m.Init(); cmd != nil {
+		if batch, ok := cmd().(tea.BatchMsg); ok {
+			n = len(batch)
+		} else {
+			n = 1
+		}
+	}
+	t.Setenv("BV_TEST_MODE", "")
+	m2 := NewModel(issues, nil, "")
+	m2.analysis = nil
+	n2 := 0
+	if cmd := m2.Init(); cmd != nil {
+		if batch, ok := cmd().(tea.BatchMsg); ok {
+			n2 = len(batch)
+		} else {
+			n2 = 1
+		}
+	}
+	if n2 != n+1 {
+		t.Fatalf("Init should queue exactly one extra command (the cass probe) outside test mode: test=%d normal=%d", n, n2)
+	}
+}
+
+// TestModel_VUsesFocusedSelection (E4): the session lookup follows the
+// focused view's selection, and V is reachable from the board, tree, and
+// history views (a missing cass turns into a status message, not silence).
+func TestModel_VUsesFocusedSelection(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // no cass anywhere
+	issues := []model.Issue{
+		{ID: "A", Title: "Issue A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		{ID: "B", Title: "Issue B", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask},
+		{ID: "C", Title: "Issue C", Status: model.StatusInProgress, Priority: 2, IssueType: model.TypeTask},
+	}
+	m := NewModel(issues, nil, "")
+	m.width, m.height = 120, 40
+
+	// List: the list item.
+	m.focused = focusList
+	m.list.Select(1)
+	if got := m.focusedIssueForSessions(); got == nil || got.ID != issues[1].ID && got.ID != m.list.Items()[1].(IssueItem).Issue.ID {
+		t.Fatalf("list selection: got %+v", got)
+	}
+
+	// Board: the selected card.
+	m.board = NewBoardModel(issues, m.theme)
+	m.board.MoveDown()
+	m.focused = focusBoard
+	want := m.board.SelectedIssue()
+	if want == nil {
+		t.Fatalf("board fixture has no selection")
+	}
+	if got := m.focusedIssueForSessions(); got == nil || got.ID != want.ID {
+		t.Fatalf("board selection: got %+v want %s", got, want.ID)
+	}
+	m.isBoardView = true
+	updated, lookup := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+	got := completeCassLookup(t, asModelPtr(t, updated), lookup)
+	if !strings.Contains(got.statusMsg, "cass not available") {
+		t.Fatalf("V from the board should reach the session lookup and report the missing cass, status=%q", got.statusMsg)
+	}
+
+	// History: the selected bead row (fixture from history_test.go).
+	m.historyView = NewHistoryModel(createTestHistoryReport(), m.theme)
+	m.focused = focusHistory
+	id := m.historyView.SelectedBeadID()
+	if id == "" {
+		t.Fatalf("history fixture has no selection")
+	}
+	m.issues = append(m.issues, model.Issue{ID: id, Title: "from history", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask})
+	if got := m.focusedIssueForSessions(); got == nil || got.ID != id {
+		t.Fatalf("history selection: got %+v want %s", got, id)
+	}
+
+	// Tree: the selected node.
+	m.focused = focusTree
+	if want := m.tree.SelectedIssue(); want != nil {
+		if got := m.focusedIssueForSessions(); got == nil || got.ID != want.ID {
+			t.Fatalf("tree selection: got %+v want %s", got, want.ID)
+		}
 	}
 }

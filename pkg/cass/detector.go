@@ -1,5 +1,4 @@
-// Package cass provides detection and health checking for the cass search tool.
-// Cass is an external binary for semantic code search that may or may not be installed.
+// Package cass integrates the Coding Agent Session Search CLI.
 package cass
 
 import (
@@ -17,7 +16,8 @@ const (
 	StatusUnknown Status = iota
 	// StatusNotInstalled indicates cass binary is not found in PATH or is not executable.
 	StatusNotInstalled
-	// StatusNeedsIndex indicates cass is installed but needs indexing before use.
+	// StatusNeedsIndex indicates archive health needs attention. Existing search
+	// data may still be usable while stale or rebuilding.
 	StatusNeedsIndex
 	// StatusHealthy indicates cass is installed, indexed, and ready for searches.
 	StatusHealthy

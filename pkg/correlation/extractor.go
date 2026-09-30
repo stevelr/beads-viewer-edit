@@ -15,15 +15,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	json "github.com/goccy/go-json"
 )
 
 // ExtractOptions controls which commits and beads to extract events from
 type ExtractOptions struct {
-	Since  *time.Time // Only commits after this time (nil = no limit)
-	Until  *time.Time // Only commits before this time (nil = no limit)
-	Limit  int        // Max commits to process (0 = no limit)
-	BeadID string     // Filter to single bead ID (empty = all beads)
+	Revision string     // Resolved commit to walk from (empty = HEAD); excludes descendants by ancestry
+	Since    *time.Time // Only commits after this time (nil = no limit)
+	Until    *time.Time // Only commits before this time (nil = no limit)
+	Limit    int        // Max commits to process (0 = no limit)
+	BeadID   string     // Filter to single bead ID (empty = all beads)
 }
 
 // Extractor extracts bead lifecycle events from git history
@@ -84,9 +86,10 @@ type commitInfo struct {
 
 // beadSnapshot represents a bead's state at a point in time
 type beadSnapshot struct {
-	ID     string
-	Status string
-	Title  string
+	ID           string
+	Status       string
+	Title        string
+	Dependencies []HistoricalDependency
 }
 
 // snapshotBlobSizeThreshold is the followed-file blob size (in bytes) at or above
@@ -227,6 +230,9 @@ func (e *Extractor) buildGitLogArgs(opts ExtractOptions) []string {
 	}
 	if opts.Limit > 0 {
 		args = insertBefore(args, "--", fmt.Sprintf("-n%d", opts.Limit))
+	}
+	if opts.Revision != "" {
+		args = insertBefore(args, "--", opts.Revision)
 	}
 
 	// Optimization: If filtering by BeadID, tell git to only show commits
@@ -381,6 +387,7 @@ func (e *Extractor) parseDiff(diffData []byte, info commitInfo, filterBeadID str
 	oldBeads := make(map[string]beadSnapshot)
 	newBeads := make(map[string]beadSnapshot)
 	seenBeads := make(map[string]bool)
+	complete := true
 
 	scanner := bufio.NewScanner(bytes.NewReader(diffData))
 	// Increase buffer for large diffs
@@ -410,6 +417,8 @@ func (e *Extractor) parseDiff(diffData []byte, info commitInfo, filterBeadID str
 					oldBeads[snap.ID] = snap
 					seenBeads[snap.ID] = true
 				}
+			} else {
+				complete = false
 			}
 			continue
 		}
@@ -422,9 +431,14 @@ func (e *Extractor) parseDiff(diffData []byte, info commitInfo, filterBeadID str
 					newBeads[snap.ID] = snap
 					seenBeads[snap.ID] = true
 				}
+			} else {
+				complete = false
 			}
 			continue
 		}
+	}
+	if scanner.Err() != nil {
+		complete = false
 	}
 
 	// Generate events by comparing old and new states. Iterate the affected bead
@@ -445,12 +459,19 @@ func (e *Extractor) parseDiff(diffData []byte, info commitInfo, filterBeadID str
 		newSnap, hasNew := newBeads[beadID]
 
 		event := BeadEvent{
-			BeadID:      beadID,
-			Timestamp:   info.Timestamp,
-			CommitSHA:   info.SHA,
-			CommitMsg:   info.Message,
-			Author:      info.Author,
-			AuthorEmail: info.AuthorEmail,
+			BeadID:             beadID,
+			Timestamp:          info.Timestamp,
+			CommitSHA:          info.SHA,
+			CommitMsg:          info.Message,
+			Author:             info.Author,
+			AuthorEmail:        info.AuthorEmail,
+			TransitionObserved: complete,
+		}
+		if hadOld {
+			event.Before = oldSnap.historicalState()
+		}
+		if hasNew {
+			event.After = newSnap.historicalState()
 		}
 
 		if !hadOld && hasNew {
@@ -468,7 +489,10 @@ func (e *Extractor) parseDiff(diffData []byte, info commitInfo, filterBeadID str
 				events = append(events, event)
 			}
 		}
-		// Note: We don't track deletions (hadOld && !hasNew) as they're not in our EventType
+		if hadOld && !hasNew {
+			event.EventType = EventDeleted
+			events = append(events, event)
+		}
 	}
 
 	return events
@@ -489,9 +513,10 @@ func isIgnorableDiffMetadataLine(line string) bool {
 // parseBeadJSON extracts minimal bead info from a JSON line
 func parseBeadJSON(jsonStr string) (beadSnapshot, bool) {
 	var partial struct {
-		ID     string `json:"id"`
-		Status string `json:"status"`
-		Title  string `json:"title"`
+		ID           string                 `json:"id"`
+		Status       string                 `json:"status"`
+		Title        string                 `json:"title"`
+		Dependencies []HistoricalDependency `json:"dependencies"`
 	}
 
 	if err := json.Unmarshal([]byte(jsonStr), &partial); err != nil {
@@ -501,12 +526,31 @@ func parseBeadJSON(jsonStr string) (beadSnapshot, bool) {
 	if partial.ID == "" {
 		return beadSnapshot{}, false
 	}
+	// Canonical empty values survive the optional JSON field's cache round trip.
+	if len(partial.Dependencies) == 0 {
+		partial.Dependencies = nil
+	}
 
 	return beadSnapshot{
-		ID:     partial.ID,
-		Status: partial.Status,
-		Title:  partial.Title,
+		ID:           partial.ID,
+		Status:       partial.Status,
+		Title:        partial.Title,
+		Dependencies: partial.Dependencies,
 	}, true
+}
+
+func (s beadSnapshot) historicalState() *HistoricalIssueState {
+	return &HistoricalIssueState{ID: s.ID, Status: s.Status, Title: s.Title, Dependencies: s.Dependencies}
+}
+
+func (d *HistoricalDependency) UnmarshalJSON(data []byte) error {
+	var dependency model.Dependency
+	if err := json.Unmarshal(data, &dependency); err != nil {
+		return err
+	}
+	d.DependsOnID = dependency.DependsOnID
+	d.Type = string(dependency.Type)
+	return nil
 }
 
 // determineStatusEvent determines the appropriate event type for a status transition

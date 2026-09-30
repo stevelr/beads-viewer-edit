@@ -65,32 +65,27 @@ func TestProbeNilSlices(t *testing.T) {
 }
 
 // Length mismatch / corrupt cache: more Commits than CommitBeadIDs (shorter).
+// The decoder now rejects mismatched parallel arrays outright (an error, never
+// a panic); cache readers treat the decode error as a miss and recompute.
 func TestProbeShorterBeadIDs(t *testing.T) {
 	raw := `{"events":null,"commits":[{"sha":"a"},{"sha":"b"},{"sha":"c"}],"commit_bead_ids":["x"]}`
 	var back historyArtifact
-	if err := json.Unmarshal([]byte(raw), &back); err != nil {
-		t.Fatal(err)
+	err := json.Unmarshal([]byte(raw), &back)
+	if err == nil {
+		t.Fatal("expected corrupt artifact (shorter commit_bead_ids) to be rejected")
 	}
-	if len(back.Commits) != 3 {
-		t.Fatalf("want 3 commits got %d", len(back.Commits))
-	}
-	if back.Commits[0].BeadID != "x" || back.Commits[1].BeadID != "" || back.Commits[2].BeadID != "" {
-		t.Errorf("unexpected beadids: %q %q %q", back.Commits[0].BeadID, back.Commits[1].BeadID, back.Commits[2].BeadID)
-	}
-	t.Log("shorter CommitBeadIDs handled without panic")
+	t.Logf("shorter CommitBeadIDs rejected without panic: %v", err)
 }
 
-// LONGER CommitBeadIDs than commits (corrupt): must not panic.
+// LONGER CommitBeadIDs than commits (corrupt): must be rejected, not panic.
 func TestProbeLongerBeadIDs(t *testing.T) {
 	raw := `{"commits":[{"sha":"a"}],"commit_bead_ids":["x","y","z"]}`
 	var back historyArtifact
-	if err := json.Unmarshal([]byte(raw), &back); err != nil {
-		t.Fatal(err)
+	err := json.Unmarshal([]byte(raw), &back)
+	if err == nil {
+		t.Fatal("expected corrupt artifact (longer commit_bead_ids) to be rejected")
 	}
-	if len(back.Commits) != 1 || back.Commits[0].BeadID != "x" {
-		t.Errorf("unexpected: %+v", back.Commits)
-	}
-	t.Log("longer CommitBeadIDs handled without panic")
+	t.Logf("longer CommitBeadIDs rejected without panic: %v", err)
 }
 
 func contains(s, sub string) bool {

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -46,6 +47,16 @@ type UpdateCompleteMsg struct {
 	RequireRoot bool
 }
 
+type updateTickMsg struct {
+	startedAt time.Time
+}
+
+func updateTickCmd(startedAt time.Time) tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+		return updateTickMsg{startedAt: startedAt}
+	})
+}
+
 // UpdateModal displays the update confirmation and progress.
 type UpdateModal struct {
 	currentVersion string
@@ -77,8 +88,18 @@ func NewUpdateModal(newVersion, releaseURL string, theme Theme) UpdateModal {
 	}
 }
 
+func validateConfirmedRelease(release *updater.Release, expectedVersion string) error {
+	if release == nil {
+		return fmt.Errorf("release metadata is nil")
+	}
+	if strings.TrimSpace(release.TagName) != strings.TrimSpace(expectedVersion) {
+		return fmt.Errorf("latest release changed from %s to %s; reopen the update dialog to review it", expectedVersion, release.TagName)
+	}
+	return nil
+}
+
 // PerformUpdateCmd returns a command that performs the update in the background.
-func PerformUpdateCmd() tea.Cmd {
+func PerformUpdateCmd(expectedVersion string) tea.Cmd {
 	return func() tea.Msg {
 		release, err := updater.GetLatestRelease()
 		if err != nil {
@@ -87,8 +108,14 @@ func PerformUpdateCmd() tea.Cmd {
 				Message: fmt.Sprintf("Failed to fetch release info: %v", err),
 			}
 		}
+		if err := validateConfirmedRelease(release, expectedVersion); err != nil {
+			return UpdateCompleteMsg{
+				Success: false,
+				Message: err.Error(),
+			}
+		}
 
-		result, err := updater.PerformUpdate(release, true) // Skip confirm since TUI already confirmed
+		result, err := updater.PerformUpdate(release, io.Discard)
 		if err != nil {
 			msg := fmt.Sprintf("Update failed: %v", err)
 			requireRoot := false
@@ -132,7 +159,7 @@ func (m UpdateModal) Update(msg tea.Msg) (UpdateModal, tea.Cmd) {
 					// User confirmed update
 					m.state = UpdateStateDownloading
 					m.startTime = time.Now()
-					return m, PerformUpdateCmd()
+					return m, tea.Batch(PerformUpdateCmd(m.newVersion), updateTickCmd(m.startTime))
 				}
 				// Cancel - will be handled by parent
 				return m, nil
@@ -140,7 +167,7 @@ func (m UpdateModal) Update(msg tea.Msg) (UpdateModal, tea.Cmd) {
 				// Quick confirm
 				m.state = UpdateStateDownloading
 				m.startTime = time.Now()
-				return m, PerformUpdateCmd()
+				return m, tea.Batch(PerformUpdateCmd(m.newVersion), updateTickCmd(m.startTime))
 			case "n", "N":
 				// Quick cancel - will be handled by parent
 				return m, nil
@@ -153,6 +180,11 @@ func (m UpdateModal) Update(msg tea.Msg) (UpdateModal, tea.Cmd) {
 				// Will be handled by parent to close modal
 				return m, nil
 			}
+		}
+
+	case updateTickMsg:
+		if m.IsInProgress() && msg.startedAt == m.startTime {
+			return m, updateTickCmd(m.startTime)
 		}
 
 	case UpdateProgressMsg:
@@ -268,11 +300,16 @@ func (m UpdateModal) View() string {
 		b.WriteString(headerStyle.Render("Updating..."))
 		b.WriteString("\n\n")
 		b.WriteString(m.renderSpinner())
-		b.WriteString(" Downloading ")
+		// PerformUpdateCmd currently reports completion atomically, so this state
+		// spans the download, verification, extraction, and installation steps.
+		// Do not claim the updater is still downloading after it has moved on.
+		b.WriteString(" Applying ")
 		b.WriteString(newVersionStyle.Render(m.newVersion))
 		b.WriteString("...\n\n")
-		b.WriteString(m.renderProgressBar())
-		b.WriteString("\n\n")
+		if m.progress.TotalBytes > 0 {
+			b.WriteString(m.renderProgressBar())
+			b.WriteString("\n\n")
+		}
 		elapsed := time.Since(m.startTime).Round(time.Second)
 		b.WriteString(subtextStyle.Render(fmt.Sprintf("Elapsed: %s", elapsed)))
 
@@ -323,17 +360,19 @@ func (m UpdateModal) renderSpinner() string {
 
 // renderProgressBar renders a progress bar for downloads
 func (m UpdateModal) renderProgressBar() string {
-	if m.progress.TotalBytes == 0 {
+	if m.progress.TotalBytes <= 0 {
 		// Indeterminate progress
 		return "[                    ]"
 	}
 
 	percent := float64(m.progress.BytesDownloaded) / float64(m.progress.TotalBytes)
+	if percent < 0 {
+		percent = 0
+	} else if percent > 1 {
+		percent = 1
+	}
 	width := 20
 	filled := int(percent * float64(width))
-	if filled > width {
-		filled = width
-	}
 
 	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
 	return fmt.Sprintf("[%s] %.0f%%", bar, percent*100)

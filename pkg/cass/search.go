@@ -38,10 +38,11 @@ type SearchResult struct {
 	LineNumber int       `json:"line_number"` // Line in session
 	Agent      string    `json:"agent"`       // "claude", "cursor", etc.
 	Title      string    `json:"title"`       // Conversation title
-	Score      float64   `json:"score"`       // Relevance score (0-1)
+	Score      float64   `json:"score"`       // Producer's relevance score (not normalized)
 	Snippet    string    `json:"snippet"`     // Content preview
 	Timestamp  time.Time `json:"timestamp"`   // When the message occurred
 	MatchType  string    `json:"match_type"`  // "exact", "prefix", "fuzzy"
+	Workspace  string    `json:"workspace"`   // Project path; distinct from the session file
 }
 
 // SearchMeta contains metadata about the search operation.
@@ -102,14 +103,13 @@ func NewSearcherWithOptions(detector *Detector, opts ...SearcherOption) *Searche
 // It returns an empty response (not error) on any failure - errors are logged internally.
 // This method is safe for concurrent use.
 func (s *Searcher) Search(ctx context.Context, opts SearchOptions) SearchResponse {
-	// Check if cass is healthy before attempting search
-	if s.detector.Status() != StatusHealthy {
-		// Optionally perform a fresh check
-		if s.detector.Check() != StatusHealthy {
-			return SearchResponse{
-				Results: []SearchResult{},
-				Meta:    SearchMeta{Error: "cass not available"},
-			}
+	// Archive health is advisory: a stale or rebuilding index may still serve
+	// searches. Keep the warning, but let the bounded search establish usability.
+	status := s.detector.Check()
+	if status != StatusHealthy && status != StatusNeedsIndex {
+		return SearchResponse{
+			Results: []SearchResult{},
+			Meta:    SearchMeta{Error: "cass not available"},
 		}
 	}
 
@@ -158,7 +158,7 @@ func (s *Searcher) Search(ctx context.Context, opts SearchOptions) SearchRespons
 
 // buildArgs constructs command line arguments for cass search.
 func (s *Searcher) buildArgs(opts SearchOptions) []string {
-	args := []string{"search", opts.Query, "--robot"}
+	args := []string{"search", opts.Query, "--robot", "--robot-format", "json"}
 
 	// Limit
 	limit := opts.Limit
@@ -170,9 +170,9 @@ func (s *Searcher) buildArgs(opts SearchOptions) []string {
 	// Fields
 	fields := opts.Fields
 	if fields == "" {
-		fields = "minimal"
+		fields = "source_path,line_number,agent,title,score,content,created_at,match_type,workspace"
 	}
-	args = append(args, "--fields", fields)
+	args = append(args, "--fields", fields, "--max-content-length", "4000")
 
 	// Days filter
 	if opts.Days > 0 {
@@ -190,32 +190,45 @@ func (s *Searcher) buildArgs(opts SearchOptions) []string {
 // parseResponse parses cass JSON output into a SearchResponse.
 // It handles malformed JSON gracefully by returning empty results.
 func (s *Searcher) parseResponse(output []byte, elapsedMs int) SearchResponse {
-	var resp SearchResponse
-	resp.Meta.ElapsedMs = elapsedMs
-
-	if len(output) == 0 {
-		resp.Results = []SearchResult{}
+	resp := SearchResponse{Results: []SearchResult{}, Meta: SearchMeta{ElapsedMs: elapsedMs}}
+	// Keep the external protocol separate from the normalized UI/cache types.
+	var wire struct {
+		Hits []struct {
+			SourcePath string  `json:"source_path"`
+			LineNumber int     `json:"line_number"`
+			Agent      string  `json:"agent"`
+			Title      string  `json:"title"`
+			Score      float64 `json:"score"`
+			Content    string  `json:"content"`
+			CreatedAt  *int64  `json:"created_at"`
+			MatchType  string  `json:"match_type"`
+			Workspace  string  `json:"workspace"`
+		} `json:"hits"`
+		TotalMatches int  `json:"total_matches"`
+		HitsClamped  bool `json:"hits_clamped"`
+		Budget       struct {
+			TimedOut bool `json:"timed_out"`
+		} `json:"budget"`
+	}
+	if err := json.Unmarshal(output, &wire); err != nil || wire.Hits == nil {
+		resp.Meta.Error = "failed to parse cass hits"
 		return resp
 	}
-
-	// Try to parse as a complete response
-	if err := json.Unmarshal(output, &resp); err != nil {
-		// Try to extract just results array
-		var resultsOnly struct {
-			Results []SearchResult `json:"results"`
-		}
-		if err := json.Unmarshal(output, &resultsOnly); err != nil {
-			// Could not parse anything useful
-			resp.Results = []SearchResult{}
-			resp.Meta.Error = "failed to parse response"
-			return resp
-		}
-		resp.Results = resultsOnly.Results
+	resp.Meta.Total = wire.TotalMatches
+	resp.Meta.Truncated = wire.HitsClamped || wire.TotalMatches > len(wire.Hits) || wire.Budget.TimedOut
+	if wire.Budget.TimedOut {
+		resp.Meta.Error = "cass search budget exhausted"
 	}
-
-	// Ensure Results is never nil
-	if resp.Results == nil {
-		resp.Results = []SearchResult{}
+	for _, hit := range wire.Hits {
+		var timestamp time.Time
+		if hit.CreatedAt != nil {
+			timestamp = time.UnixMilli(*hit.CreatedAt).UTC()
+		}
+		resp.Results = append(resp.Results, SearchResult{
+			SourcePath: hit.SourcePath, LineNumber: hit.LineNumber, Agent: hit.Agent,
+			Title: hit.Title, Score: hit.Score, Snippet: hit.Content,
+			Timestamp: timestamp, MatchType: hit.MatchType, Workspace: hit.Workspace,
+		})
 	}
 
 	return resp

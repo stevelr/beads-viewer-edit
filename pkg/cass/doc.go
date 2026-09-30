@@ -1,8 +1,8 @@
-// Package cass provides integration with the cass semantic code search tool.
+// Package cass provides integration with Coding Agent Session Search.
 //
-// Cass (https://github.com/cass-lang/cass) is an external binary that provides
-// semantic code search capabilities. This package handles detection and health
-// checking to determine if cass is available before attempting integration.
+// Cass (https://github.com/Dicklesworthstone/coding_agent_session_search) searches
+// archived coding-agent conversations. This package detects cass and adapts its
+// bounded JSON search responses into session previews and correlation inputs.
 //
 // # Detection Flow
 //
@@ -16,9 +16,12 @@
 // Based on the exit code from "cass health":
 //
 //	Exit 0: StatusHealthy - ready to search
-//	Exit 1: StatusNeedsIndex - needs indexing before use
+//	Exit 1: StatusNeedsIndex - archive health needs attention; try bounded search
 //	Exit 3: StatusNeedsIndex - index missing or corrupt
 //	Other:  StatusNotInstalled - treat as unavailable
+//
+// A stale or rebuilding archive can remain searchable. Searches may run in
+// StatusNeedsIndex without changing that cached health status to Healthy.
 //
 // # Caching
 //

@@ -5,18 +5,24 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
-// writeBeads writes the given JSONL content to .beads/beads.jsonl under dir.
+// writeBeads creates current-br JSONL and metadata. Without a real database it
+// remains an unbound snapshot; live tracker proofs initialize br separately.
 func writeBeads(t *testing.T, dir, content string) {
 	t.Helper()
 	beadsDir := filepath.Join(dir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
 		t.Fatalf("mkdir beads: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(content), 0o644); err != nil {
 		t.Fatalf("write beads: %v", err)
+	}
+	metadata := []byte("{\"database\":\"beads.db\",\"jsonl_export\":\"issues.jsonl\"}\n")
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0o644); err != nil {
+		t.Fatalf("write beads metadata: %v", err)
 	}
 }
 
@@ -264,7 +270,8 @@ func TestRobotTriageBriefContract(t *testing.T) {
 func TestRobotTriageByTrackContract(t *testing.T) {
 	bv := buildBvBinary(t)
 	env := t.TempDir()
-	// Two independent tracks: A->A2 and B->B2.
+	// Two independent components produce two execution layers: ready A/B in
+	// track-A, blocked A2/B2 in track-B. There is no verified tracker database.
 	writeBeads(t, env, `{"id":"A","title":"Track A root","status":"open","priority":1,"issue_type":"task","labels":["api"]}
 {"id":"A2","title":"Track A blocked","status":"open","priority":2,"issue_type":"task","labels":["api"],"dependencies":[{"issue_id":"A2","depends_on_id":"A","type":"blocks"}]}
 {"id":"B","title":"Track B root","status":"open","priority":1,"issue_type":"task","labels":["web"]}
@@ -278,7 +285,10 @@ func TestRobotTriageByTrackContract(t *testing.T) {
 				TopPick *struct {
 					ID string `json:"id"`
 				} `json:"top_pick"`
-				ClaimCommand string `json:"claim_command"`
+				ClaimCommand    string `json:"claim_command"`
+				Recommendations []struct {
+					ID string `json:"id"`
+				} `json:"recommendations"`
 			} `json:"recommendations_by_track"`
 		} `json:"triage"`
 	}
@@ -287,8 +297,8 @@ func TestRobotTriageByTrackContract(t *testing.T) {
 	if payload.DataHash == "" {
 		t.Fatalf("triage-by-track missing data_hash")
 	}
-	if len(payload.Triage.RecommendationsByTrack) < 2 {
-		t.Fatalf("expected >=2 track groups, got %d", len(payload.Triage.RecommendationsByTrack))
+	if len(payload.Triage.RecommendationsByTrack) != 2 {
+		t.Fatalf("expected exactly 2 execution layers, got %d", len(payload.Triage.RecommendationsByTrack))
 	}
 	byID := make(map[string]struct {
 		topID string
@@ -297,6 +307,15 @@ func TestRobotTriageByTrackContract(t *testing.T) {
 	for _, g := range payload.Triage.RecommendationsByTrack {
 		if g.TrackID == "" {
 			t.Fatalf("track group missing track_id")
+		}
+		ids := make([]string, len(g.Recommendations))
+		for i, rec := range g.Recommendations {
+			ids[i] = rec.ID
+		}
+		slices.Sort(ids)
+		want := map[string][]string{"track-A": {"A", "B"}, "track-B": {"A2", "B2"}}[g.TrackID]
+		if !slices.Equal(ids, want) || want == nil {
+			t.Fatalf("execution layer %q contains %v, want %v", g.TrackID, ids, want)
 		}
 		topID := ""
 		if g.TopPick != nil {
@@ -312,11 +331,11 @@ func TestRobotTriageByTrackContract(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing track group %q", "track-A")
 	}
-	if rootTrack.topID == "" {
-		t.Fatalf("track group %q missing top_pick.id", "track-A")
+	if rootTrack.topID != "A" && rootTrack.topID != "B" {
+		t.Fatalf("ready layer top pick %q must be A or B", rootTrack.topID)
 	}
-	if rootTrack.claim == "" {
-		t.Fatalf("track group %q missing claim_command", "track-A")
+	if rootTrack.claim != "" {
+		t.Fatalf("unbound track %q exposed an unverified claim: %q", "track-A", rootTrack.claim)
 	}
 
 	blockedTrack, ok := byID["track-B"]
@@ -381,11 +400,12 @@ func TestRobotTriageByLabelContract(t *testing.T) {
 		if !ok {
 			t.Fatalf("missing label group %q", want)
 		}
-		if g.topID == "" {
-			t.Fatalf("label group %q missing top_pick.id", want)
+		wantID := map[string]string{"api": "API-1", "web": "WEB-1"}[want]
+		if g.topID != wantID {
+			t.Fatalf("label group %q top pick = %q, want ready issue %q", want, g.topID, wantID)
 		}
-		if g.claim == "" {
-			t.Fatalf("label group %q missing claim_command", want)
+		if g.claim != "" {
+			t.Fatalf("unbound label group %q exposed an unverified claim: %q", want, g.claim)
 		}
 	}
 }
@@ -520,20 +540,32 @@ func TestRobotNextContractNoActionable(t *testing.T) {
 func TestRobotNextContractActionable(t *testing.T) {
 	bv := buildBvBinary(t)
 	env := t.TempDir()
-	// A is actionable and should be picked; B is blocked by A.
+	// A is graph-ready and should be picked; B is blocked by A. This JSONL
+	// fixture has no live tracker, so A must be a diagnostic candidate.
 	writeBeads(t, env, `{"id":"A","title":"Unblocker","status":"open","priority":1,"issue_type":"task"}
 {"id":"B","title":"Blocked","status":"open","priority":2,"issue_type":"task","dependencies":[{"issue_id":"B","depends_on_id":"A","type":"blocks"}]}`)
 
 	var payload struct {
-		GeneratedAt string   `json:"generated_at"`
-		DataHash    string   `json:"data_hash"`
-		ID          string   `json:"id"`
-		Title       string   `json:"title"`
-		Score       float64  `json:"score"`
-		Reasons     []string `json:"reasons"`
-		Unblocks    int      `json:"unblocks"`
-		ClaimCmd    string   `json:"claim_command"`
-		ShowCmd     string   `json:"show_command"`
+		GeneratedAt string `json:"generated_at"`
+		DataHash    string `json:"data_hash"`
+		Actionable  bool   `json:"actionable"`
+		ID          string `json:"id"`
+		ClaimCmd    string `json:"claim_command"`
+		ShowCmd     string `json:"show_command"`
+		Diagnostic  *struct {
+			ID       string   `json:"id"`
+			Title    string   `json:"title"`
+			Score    float64  `json:"score"`
+			Reasons  []string `json:"reasons"`
+			Unblocks int      `json:"unblocks"`
+		} `json:"diagnostic_top_pick"`
+		Authority struct {
+			ClaimSafe bool `json:"claim_safe"`
+		} `json:"source_authority"`
+		Actions struct {
+			Claim any `json:"claim"`
+			Show  any `json:"show"`
+		} `json:"actions"`
 	}
 	runRobotJSON(t, bv, env, "--robot-next", &payload)
 
@@ -543,23 +575,23 @@ func TestRobotNextContractActionable(t *testing.T) {
 	if payload.DataHash == "" {
 		t.Fatalf("robot-next missing data_hash")
 	}
-	if payload.ID != "A" {
-		t.Fatalf("expected robot-next to pick A, got %q", payload.ID)
+	if payload.Diagnostic == nil || payload.Diagnostic.ID != "A" {
+		t.Fatalf("expected robot-next to retain diagnostic candidate A: %+v", payload)
 	}
-	if payload.Title == "" {
+	if payload.Diagnostic.Title != "Unblocker" {
 		t.Fatalf("robot-next missing title")
 	}
-	if payload.Score == 0 {
+	if payload.Diagnostic.Score == 0 {
 		t.Fatalf("robot-next missing score")
 	}
-	if len(payload.Reasons) == 0 {
+	if len(payload.Diagnostic.Reasons) == 0 {
 		t.Fatalf("robot-next missing reasons")
 	}
-	if payload.ClaimCmd != "br update A --status=in_progress" {
-		t.Fatalf("unexpected claim_command: %q", payload.ClaimCmd)
+	if payload.Diagnostic.Unblocks != 1 || !payload.Authority.ClaimSafe {
+		t.Fatalf("complete fixture lost graph readiness or its unblocking effect: %+v", payload)
 	}
-	if payload.ShowCmd != "br show A" {
-		t.Fatalf("unexpected show_command: %q", payload.ShowCmd)
+	if payload.Actionable || payload.ID != "" || payload.ClaimCmd != "" || payload.ShowCmd != "" || payload.Actions.Claim != nil || payload.Actions.Show != nil {
+		t.Fatalf("metadata-free fixture invented a live tracker route: %+v", payload)
 	}
 }
 

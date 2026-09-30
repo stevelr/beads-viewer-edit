@@ -41,8 +41,9 @@ test-results/
 # Nested beads state
 pkg/ui/.beads/
 
-# Large benchmark test data (generated)
-tests/testdata/benchmark/
+# Generated benchmark data, except the frozen release-gate input
+tests/testdata/benchmark/*
+!tests/testdata/benchmark/medium.jsonl
 *.prof
 
 # E2E test logs
@@ -73,3 +74,14 @@ target-*/
 .wrangler/
 # br doctor per-run artifacts
 .doctor/
+
+# Release gate run logs (scripts/release_gate.sh)
+tests/artifacts/release_gate_*.log
+
+# Benchmark run outputs (scripts/benchmark.sh compare rewrites them on every gate run)
+benchmarks/current.txt
+benchmarks/compare.txt
+benchmarks/reference.txt
+
+# Remote compilation helper cache (AGENTS.md says it is ignored; it was not)
+.rch-go/

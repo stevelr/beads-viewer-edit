@@ -11,7 +11,261 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+// extractCausalHistory follows one first-parent history, retaining the full
+// source while evaluating each target state. It deliberately does not apply a
+// target -G filter: an unchanged target can become unblocked by another record.
+// Only two parsed snapshots are resident; the artifact keeps compact target
+// observations, not every issue in every commit.
+func (e *Extractor) extractCausalHistory(target string, opts ExtractOptions) (*CausalHistory, error) {
+	args := []string{"log", "--first-parent", "--diff-merges=first-parent", "--raw", "--no-abbrev", "--follow", "--format=" + gitLogHeaderFormat + "%x00%cI"}
+	args = appendHistoryFilters(args, opts)
+	args = append(args, "--", e.primaryBeadsFile())
+	cmd := gitCommand(e.ctx, withNoColorGit(args)...)
+	cmd.Dir = e.repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("causal git log: %w: %s", err, exitErr.Stderr)
+		}
+		return nil, fmt.Errorf("causal git log: %w", err)
+	}
+	var commits []snapshotCommit
+	var committed []time.Time
+	locs := commitPattern.FindAllIndex(out, -1)
+	for i, loc := range locs {
+		end := len(out)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		chunk := out[loc[0]:end]
+		nl := bytes.IndexByte(chunk, '\n')
+		if nl < 0 {
+			return nil, fmt.Errorf("incomplete causal commit header")
+		}
+		last := bytes.LastIndexByte(chunk[:nl], 0)
+		if last < 0 {
+			return nil, fmt.Errorf("missing causal committer timestamp")
+		}
+		info, err := parseCommitInfo(string(chunk[:last]))
+		if err != nil {
+			return nil, err
+		}
+		date, err := time.Parse(time.RFC3339, string(chunk[last+1:nl]))
+		if err != nil {
+			return nil, fmt.Errorf("causal committer timestamp: %w", err)
+		}
+		c := snapshotCommit{info: info}
+		if parseRawDiffLines(chunk[nl+1:], &c) {
+			commits = append(commits, c)
+			committed = append(committed, date)
+		}
+	}
+	result := &CausalHistory{BeadID: target, Observations: []CausalObservation{}}
+	if opts.Revision != "" {
+		// The revision may not change the beads file. Its own clocks, rather
+		// than the last file change or today's clock, bound an ongoing wait.
+		cmd := gitCommand(e.ctx, "show", "-s", "--format=%aI%x00%cI", opts.Revision)
+		cmd.Dir = e.repoPath
+		out, err := cmd.Output()
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				return nil, fmt.Errorf("causal reference commit: %w: %s", err, exitErr.Stderr)
+			}
+			return nil, fmt.Errorf("causal reference commit: %w", err)
+		}
+		parts := strings.Split(strings.TrimSpace(string(out)), "\x00")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("incomplete causal reference timestamps")
+		}
+		authored, err := time.Parse(time.RFC3339, parts[0])
+		if err != nil {
+			return nil, fmt.Errorf("causal reference author timestamp: %w", err)
+		}
+		committed, err := time.Parse(time.RFC3339, parts[1])
+		if err != nil {
+			return nil, fmt.Errorf("causal reference committer timestamp: %w", err)
+		}
+		result.Revision = opts.Revision
+		result.ReferenceTime = &authored
+		result.ReferenceCommittedAt = &committed
+	}
+	if opts.Until != nil {
+		until := *opts.Until
+		result.Until = &until
+	}
+	reader, err := e.newBlobReader()
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	read := func(sha string) (map[string]beadSnapshot, bool, error) {
+		if sha == "" {
+			return map[string]beadSnapshot{}, true, nil
+		}
+		data, err := reader.read(sha)
+		if err != nil {
+			return nil, false, err
+		}
+		if data == nil {
+			return nil, false, nil
+		}
+		records := make(map[string]beadSnapshot)
+		valid := true
+		for _, line := range bytes.Split(data, []byte{'\n'}) {
+			if len(bytes.TrimSpace(line)) == 0 {
+				continue
+			}
+			record, ok := parseBeadJSON(string(line))
+			if !ok {
+				valid = false
+				continue
+			}
+			if _, exists := records[record.ID]; exists {
+				valid = false
+			}
+			records[record.ID] = record
+		}
+		return records, valid, nil
+	}
+	var previous map[string]beadSnapshot
+	var previousSHA string
+	var previousValid bool
+	for i := len(commits) - 1; i >= 0; i-- {
+		c := commits[i]
+		before, validBefore := previous, previousValid
+		if before == nil || previousSHA != c.oldSHA {
+			before, validBefore, err = read(c.oldSHA)
+			if err != nil {
+				return nil, fmt.Errorf("reading causal parent %s: %w", c.info.SHA, err)
+			}
+		}
+		after, validAfter, err := read(c.newSHA)
+		if err != nil {
+			return nil, fmt.Errorf("reading causal commit %s: %w", c.info.SHA, err)
+		}
+		oldState, oldRelevant := causalSnapshotState(before, validBefore, target)
+		newState, newRelevant := causalSnapshotState(after, validAfter, target)
+		for id := range newRelevant {
+			oldRelevant[id] = true
+		}
+		ids := make([]string, 0, len(oldRelevant))
+		for id := range oldRelevant {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		obs := CausalObservation{CommitSHA: c.info.SHA, Timestamp: c.info.Timestamp, CommittedAt: committed[i], Before: oldState, After: newState, Changes: []BeadEvent{}}
+		for _, id := range ids {
+			old, hadOld := before[id]
+			current, hasNew := after[id]
+			if hadOld == hasNew && equalHistoricalRecord(old, current) {
+				continue
+			}
+			event := BeadEvent{BeadID: id, CommitSHA: c.info.SHA, Timestamp: c.info.Timestamp, CommitMsg: c.info.Message, Author: c.info.Author, AuthorEmail: c.info.AuthorEmail, EventType: EventModified, TransitionObserved: validBefore && validAfter}
+			if hadOld {
+				event.Before = old.historicalState()
+			}
+			if hasNew {
+				event.After = current.historicalState()
+			}
+			switch {
+			case !hadOld:
+				event.EventType = EventCreated
+			case !hasNew:
+				event.EventType = EventDeleted
+			case old.Status != current.Status:
+				event.EventType = determineStatusEvent(old.Status, current.Status)
+			}
+			obs.Changes = append(obs.Changes, event)
+		}
+		result.Observations = append(result.Observations, obs)
+		previous, previousValid, previousSHA = after, validAfter, c.newSHA
+	}
+	return result, nil
+}
+
+func equalHistoricalRecord(a, b beadSnapshot) bool {
+	if a.ID != b.ID || a.Title != b.Title || a.Status != b.Status || len(a.Dependencies) != len(b.Dependencies) {
+		return false
+	}
+	for i := range a.Dependencies {
+		if a.Dependencies[i] != b.Dependencies[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func causalSnapshotState(records map[string]beadSnapshot, valid bool, target string) (CausalState, map[string]bool) {
+	state := CausalState{Known: valid, DependencyState: model.DependenciesUnknown, Blockers: []string{}}
+	relevant := map[string]bool{target: true}
+	issues := make([]model.Issue, 0, len(records))
+	for _, record := range records {
+		status := normalizeLifecycleStatus(record.Status)
+		if !model.Status(status).IsValid() {
+			state.Known = false
+		}
+		issue := model.Issue{ID: record.ID, Status: model.Status(status)}
+		for _, dep := range record.Dependencies {
+			if (dep.Type != "" && !model.DependencyType(dep.Type).IsValid()) || dep.DependsOnID == "" {
+				state.Known = false
+			}
+			issue.Dependencies = append(issue.Dependencies, &model.Dependency{DependsOnID: dep.DependsOnID, Type: model.DependencyType(dep.Type)})
+		}
+		issues = append(issues, issue)
+	}
+	if record, ok := records[target]; ok {
+		state.Issue = record.historicalState()
+		state.DependencyState = model.NewReadinessIndex(issues).DependencyState(target)
+	}
+	blockers := make(map[string]bool)
+	visited := make(map[string]bool)
+	var visit func(string)
+	visit = func(id string) {
+		if visited[id] {
+			return
+		}
+		visited[id] = true
+		record, ok := records[id]
+		if !ok || isClosedLifecycleStatus(normalizeLifecycleStatus(record.Status)) {
+			return
+		}
+		for _, dep := range record.Dependencies {
+			t := model.DependencyType(dep.Type)
+			if !t.IsBlocking() && t != model.DepParentChild {
+				continue
+			}
+			relevant[dep.DependsOnID] = true
+			other, exists := records[dep.DependsOnID]
+			if !exists {
+				blockers[dep.DependsOnID] = true
+				continue
+			}
+			if isClosedLifecycleStatus(normalizeLifecycleStatus(other.Status)) {
+				continue
+			}
+			if t.IsBlocking() {
+				blockers[dep.DependsOnID] = true
+			} else {
+				visit(dep.DependsOnID)
+			}
+		}
+	}
+	visit(target)
+	for id := range blockers {
+		state.Blockers = append(state.Blockers, id)
+	}
+	sort.Strings(state.Blockers)
+	if !state.Known {
+		state.Reason = "malformed, duplicate, or invalid historical records"
+	} else if state.Issue != nil && state.DependencyState == model.DependenciesUnknown {
+		state.Reason = "missing dependency or unresolved parent cycle"
+	}
+	return state, relevant
+}
 
 // blobsReadCounter counts the total number of blob object ids passed to
 // readBlobs across the process. It exists solely so tests can prove the
@@ -257,8 +511,8 @@ func (e *Extractor) snapshotCommits(opts ExtractOptions) ([]snapshotCommit, erro
 	return parseSnapshotLog(out)
 }
 
-// appendHistoryFilters appends --since/--until/-n filters (the same ones the
-// legacy buildGitLogArgs honored) before the pathspec separator.
+// appendHistoryFilters appends the time/count filters and resolved revision
+// before the pathspec separator. A revision bounds ancestry, not author dates.
 func appendHistoryFilters(args []string, opts ExtractOptions) []string {
 	if opts.Since != nil {
 		args = append(args, "--since="+opts.Since.Format(time.RFC3339))
@@ -268,6 +522,9 @@ func appendHistoryFilters(args []string, opts ExtractOptions) []string {
 	}
 	if opts.Limit > 0 {
 		args = append(args, fmt.Sprintf("-n%d", opts.Limit))
+	}
+	if opts.Revision != "" {
+		args = append(args, opts.Revision)
 	}
 	return args
 }

@@ -1,3 +1,6 @@
+> **Status (2026-09-02): historical analysis, 2026-01**
+> Numbers and open items reflect January 2026. Current measurements: `tests/artifacts/perf/analysis_bench.md`, `tests/artifacts/perf/pages_load.json`, `tests/artifacts/perf/toon_vs_json.md`; the regression baseline is tracker item H6.
+
 # Performance Analysis Round 2: Deep Inefficiency Audit
 
 ## Executive Summary

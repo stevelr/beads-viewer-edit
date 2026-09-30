@@ -1,6 +1,8 @@
 package watcher
 
 import (
+	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"sync"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	_ "modernc.org/sqlite"
 )
 
 func TestDebouncer_CoalescesRapidTriggers(t *testing.T) {
@@ -106,6 +109,143 @@ func TestWatcher_DetectsFileChange(t *testing.T) {
 
 	if !wasChanged {
 		t.Error("expected change to be detected")
+	}
+}
+
+func TestWatcher_SQLiteWALCommits(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		file string
+		poll bool
+	}{
+		{"fsnotify", "selected.sqlite3", false},
+		{"polling", "selected.SQLITE", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BV_FORCE_POLL", "")
+			t.Setenv("BV_FORCE_POLLING", "")
+			path := filepath.Join(t.TempDir(), tc.file)
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			db.SetMaxOpenConns(1)
+			if _, err := db.Exec(`CREATE TABLE issues (title TEXT);
+				INSERT INTO issues VALUES ('before');
+				PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;`); err != nil {
+				t.Fatal(err)
+			}
+			var journalMode string
+			if err := db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil || journalMode != "wal" {
+				t.Fatalf("SQLite journal mode=%q, want wal: %v", journalMode, err)
+			}
+			if _, err := os.Stat(path + "-wal"); !os.IsNotExist(err) {
+				t.Fatalf("expected WAL to be created by the first watched commit: %v", err)
+			}
+			errors := make(chan error, 10)
+			w, err := NewWatcher(path, WithForcePoll(tc.poll), WithPollInterval(20*time.Millisecond),
+				WithDebounceDuration(10*time.Millisecond), WithOnError(func(err error) { errors <- err }))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer w.Stop()
+			t.Logf("polling=%v", w.IsPolling())
+			if w.IsPolling() != tc.poll {
+				t.Fatalf("watcher backend polling=%v, want %v", w.IsPolling(), tc.poll)
+			}
+			// Similar sibling names must not refresh this selected database.
+			for _, sibling := range []string{path + ".other-wal", path + "-wal.other"} {
+				if err := os.WriteFile(sibling, []byte("unrelated"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			select {
+			case <-w.Changed():
+				t.Fatal("unrelated sidecar triggered a refresh")
+			case <-time.After(100 * time.Millisecond):
+			}
+			before, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, title := range []string{"after", "again"} {
+				if _, err := db.Exec("UPDATE issues SET title=?", title); err != nil {
+					t.Fatal(err)
+				}
+				if wal, err := os.Stat(path + "-wal"); err != nil || wal.Size() == 0 {
+					t.Fatalf("committed update %q did not create a nonempty WAL: %v", title, err)
+				}
+				after, err := os.Stat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !before.ModTime().Equal(after.ModTime()) || before.Size() != after.Size() {
+					t.Fatal("commit changed main database; test must exercise WAL-only updates")
+				}
+				select {
+				case <-w.Changed():
+				case err := <-errors:
+					t.Fatalf("watch error: %v", err)
+				case <-time.After(3 * time.Second):
+					t.Fatalf("missed committed WAL update %q with writer still open", title)
+				}
+			}
+			// Closing the last SQLite connection checkpoints and removes its WAL.
+			// That is a content change, not removal of the selected database.
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(path + "-wal"); !os.IsNotExist(err) {
+				t.Fatalf("SQLite did not remove WAL after checkpoint: %v", err)
+			}
+			select {
+			case <-w.Changed():
+			case err := <-errors:
+				t.Fatalf("checkpoint was reported as a database error: %v", err)
+			case <-time.After(3 * time.Second):
+				t.Fatal("checkpoint did not notify")
+			}
+			select {
+			case err := <-errors:
+				t.Fatalf("checkpoint reported an error: %v", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
+	}
+}
+
+func TestWatcher_JSONLIgnoresWALSidecar(t *testing.T) {
+	for _, poll := range []bool{false, true} {
+		path := filepath.Join(t.TempDir(), "issues.jsonl")
+		if err := os.WriteFile(path, []byte("{}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		w, err := NewWatcher(path, WithForcePoll(poll), WithPollInterval(20*time.Millisecond), WithDebounceDuration(10*time.Millisecond))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if w.IsPolling() != poll {
+			w.Stop()
+			t.Fatalf("JSONL watcher backend polling=%v, want %v", w.IsPolling(), poll)
+		}
+		if err := os.WriteFile(path+"-wal", []byte("unrelated"), 0o644); err != nil {
+			w.Stop()
+			t.Fatal(err)
+		}
+		select {
+		case <-w.Changed():
+			w.Stop()
+			t.Fatalf("JSONL watcher treated a sibling as SQLite WAL (polling=%v)", poll)
+		case <-time.After(100 * time.Millisecond):
+		}
+		w.Stop()
 	}
 }
 
@@ -415,18 +555,83 @@ func TestWatcher_FsnotifyCreateRefreshesRemovedState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.recordStat(info.ModTime(), info.Size())
-	if !w.recordMissing() {
+	w.mu.Lock()
+	w.started = true
+	w.runGeneration++
+	runGeneration := w.runGeneration
+	w.mu.Unlock()
+	defer func() {
+		w.mu.Lock()
+		w.started = false
+		w.mu.Unlock()
+	}()
+
+	if _, active := w.recordStat(runGeneration, info.ModTime(), info.Size()); !active {
+		t.Fatal("test run should be active")
+	}
+	if hadFile, active := w.recordMissing(runGeneration); !active || !hadFile {
 		t.Fatal("initial removal should report that the file existed")
 	}
 
 	if err := os.WriteFile(tmpFile, []byte("recreated"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	w.handleFsnotifyFileEvent(fsnotify.Create)
+	w.handleFsnotifyFileEvent(runGeneration, fsnotify.Create)
 
-	if !w.recordMissing() {
+	if hadFile, active := w.recordMissing(runGeneration); !active || !hadFile {
 		t.Fatal("recreated file should be tracked as present before the next removal")
+	}
+}
+
+func TestWatcher_FsnotifyRunUsesCapturedChannels(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "test.jsonl")
+	if err := os.WriteFile(tmpFile, []byte("initial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := NewWatcher(tmpFile, WithDebounceDuration(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.debouncer.Cancel()
+
+	// Establish an active generation without publishing an fsWatcher through
+	// the owner. The loop must use only the channels captured by Start; reading
+	// w.fsWatcher after launch would make it return early here.
+	w.mu.Lock()
+	w.started = true
+	w.runGeneration++
+	runGeneration := w.runGeneration
+	w.fsWatcher = nil
+	w.mu.Unlock()
+	defer func() {
+		w.mu.Lock()
+		w.started = false
+		w.mu.Unlock()
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan fsnotify.Event, 1)
+	errors := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.watchFsnotify(ctx, runGeneration, events, errors)
+	}()
+
+	events <- fsnotify.Event{Name: tmpFile, Op: fsnotify.Write}
+	select {
+	case <-w.Changed():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("fsnotify loop ignored the channels captured for its run")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("fsnotify loop did not stop after cancellation")
 	}
 }
 
@@ -468,6 +673,55 @@ func TestWatcher_StartStop(t *testing.T) {
 
 	// Double stop should be safe
 	w.Stop()
+}
+
+func TestWatcher_DoneFollowsRunLifecycle(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "test.jsonl")
+	if err := os.WriteFile(tmpFile, []byte("initial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := NewWatcher(tmpFile, WithForcePoll(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-w.Done():
+	default:
+		t.Fatal("Done should be closed before the watcher starts")
+	}
+
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	firstRunDone := w.Done()
+	select {
+	case <-firstRunDone:
+		t.Fatal("Done closed while the watcher was running")
+	default:
+	}
+
+	w.Stop()
+	select {
+	case <-firstRunDone:
+	default:
+		t.Fatal("Done remained open after Stop")
+	}
+
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+	secondRunDone := w.Done()
+	if secondRunDone == firstRunDone {
+		t.Fatal("restart reused the previous run's Done channel")
+	}
+	select {
+	case <-secondRunDone:
+		t.Fatal("restarted watcher exposed a closed Done channel")
+	default:
+	}
 }
 
 func TestWatcher_RestartPollingUsesPerRunContext(t *testing.T) {
@@ -515,6 +769,100 @@ func TestWatcher_RestartPollingUsesPerRunContext(t *testing.T) {
 			t.Fatal("timeout waiting for change after watcher restart")
 		case <-time.After(5 * time.Millisecond):
 		}
+	}
+}
+
+func TestWatcher_RestartRejectsQueuedAndLatePriorRunChanges(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "test.jsonl")
+	if err := os.WriteFile(tmpFile, []byte("initial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var callbacks atomic.Int32
+	w, err := NewWatcher(tmpFile,
+		WithForcePoll(true),
+		WithPollInterval(time.Hour),
+		WithDebounceDuration(5*time.Millisecond),
+		WithOnChange(func() { callbacks.Add(1) }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	w.mu.RLock()
+	firstRun := w.runGeneration
+	w.mu.RUnlock()
+
+	// Queue an event with no consumer. Stop must remove it before the next run.
+	w.notifyChange(firstRun)
+	w.Stop()
+
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+	w.mu.RLock()
+	secondRun := w.runGeneration
+	baselineMtime := w.lastMtime
+	baselineSize := w.lastSize
+	w.mu.RUnlock()
+	if secondRun == firstRun {
+		t.Fatal("restart did not advance watcher generation")
+	}
+
+	select {
+	case <-w.Changed():
+		t.Fatal("restarted watcher received an event queued by the prior run")
+	default:
+	}
+
+	// A stale producer must not touch the shared debouncer after restart. If it
+	// did, it would cancel the active generation's pending timer.
+	w.scheduleChange(secondRun)
+	w.scheduleChange(firstRun)
+	select {
+	case <-w.Changed():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("stale producer canceled the active generation's debounce timer")
+	}
+	if got := callbacks.Load(); got != 2 {
+		t.Fatalf("debounced active producer callback count=%d, want 2", got)
+	}
+
+	// A producer that was delayed across Stop/Start cannot mutate the new
+	// baseline, invoke callbacks, or publish on the shared change channel.
+	if changed, active := w.recordStat(firstRun, baselineMtime.Add(time.Hour), baselineSize+1); changed || active {
+		t.Fatalf("stale recordStat returned changed=%v active=%v", changed, active)
+	}
+	w.notifyChange(firstRun)
+	w.mu.RLock()
+	gotMtime := w.lastMtime
+	gotSize := w.lastSize
+	w.mu.RUnlock()
+	if !gotMtime.Equal(baselineMtime) || gotSize != baselineSize {
+		t.Fatal("stale producer changed the restarted watcher's file baseline")
+	}
+	if got := callbacks.Load(); got != 2 {
+		t.Fatalf("stale producer invoked callback; callback count=%d", got)
+	}
+	select {
+	case <-w.Changed():
+		t.Fatal("stale producer published into the restarted run")
+	default:
+	}
+
+	// The active generation still publishes normally.
+	w.notifyChange(secondRun)
+	select {
+	case <-w.Changed():
+	default:
+		t.Fatal("active watcher generation failed to publish")
+	}
+	if got := callbacks.Load(); got != 3 {
+		t.Fatalf("active producer callback count=%d, want 3", got)
 	}
 }
 

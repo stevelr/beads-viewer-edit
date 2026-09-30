@@ -67,18 +67,19 @@ Iterates without copying, caller controls termination:
 // Iterator - no copy, early termination possible
 func (s *GraphStats) PageRankAll(fn func(id string, score float64) bool) {
     s.mu.RLock()
-    defer s.mu.RUnlock()
-    if s.pageRank == nil {
+    values := s.pageRank
+    s.mu.RUnlock()
+    if values == nil {
         return
     }
-    for id, score := range s.pageRank {
+    for id, score := range values {
         if !fn(id, score) {
             return
         }
     }
 }
 
-// Usage - find top 3
+// Usage - process the first 3 qualifying entries, in unspecified map order
 count := 0
 stats.PageRankAll(func(id string, score float64) bool {
     if score > threshold {
@@ -142,10 +143,10 @@ func (s *GraphStats) PageRank() map[string]float64
 
 All accessors are thread-safe:
 - `*Value()` methods use `RLock` for the single lookup
-- `*All()` methods hold `RLock` during iteration (callback must not block)
+- `*All()` methods capture the published metric map under `RLock`, then release the lock before iteration and callbacks
 - Legacy map copy methods use `RLock` during copy
 
-**Important:** The `*All()` callback executes while holding the read lock. Keep callbacks fast and non-blocking.
+Phase 2 builds metric maps off-lock and publishes them under the mutex. Those maps remain immutable after publication, so a captured map can be read after releasing the lock. Callbacks may call other accessors without holding this read lock; a slow callback delays its caller, but does not hold up metric publication. Iteration order is unspecified: stopping after three entries does not select the three highest scores. Use a copied map or collected values when sorting is required.
 
 ## Performance
 

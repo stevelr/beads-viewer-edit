@@ -9,6 +9,11 @@ import (
 	"testing"
 )
 
+const (
+	testSHA256DigestA = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testSHA256DigestB = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+)
+
 func TestRelease_FindPlatformAsset(t *testing.T) {
 	rel := &Release{TagName: "v1.2.3"}
 	target := stableAssetName()
@@ -63,24 +68,26 @@ func TestRelease_FindPlatformAssetWithChecksumFallsBackToCheckedLegacyName(t *te
 	}
 }
 
-func TestRelease_FindPlatformAssetWithChecksumPrefersCheckedStableName(t *testing.T) {
+func TestRelease_FindPlatformAssetWithChecksumPrefersCheckedVersionedName(t *testing.T) {
+	// Since #195 releases ship bv_<version>_<os>_<arch>; when a release still
+	// carries the old unversioned archive as well, the versioned one wins.
 	rel := &Release{TagName: "v1.2.3"}
-	stableTarget := stableAssetName()
-	legacyTarget := getAssetName(rel.TagName)
+	unversioned := stableAssetName()
+	versioned := getAssetName(rel.TagName)
 	rel.Assets = []Asset{
-		{Name: legacyTarget, BrowserDownloadURL: "http://example.com/legacy"},
-		{Name: stableTarget, BrowserDownloadURL: "http://example.com/stable"},
+		{Name: unversioned, BrowserDownloadURL: "http://example.com/unversioned"},
+		{Name: versioned, BrowserDownloadURL: "http://example.com/versioned"},
 	}
 
 	asset := rel.findPlatformAssetWithChecksum(map[string]string{
-		stableTarget: "hash",
-		legacyTarget: "hash",
+		unversioned: "hash",
+		versioned:   "hash",
 	})
 	if asset == nil {
-		t.Fatalf("expected checked stable asset %q", stableTarget)
+		t.Fatalf("expected checked versioned asset %q", versioned)
 	}
-	if asset.Name != stableTarget {
-		t.Fatalf("expected %q, got %q", stableTarget, asset.Name)
+	if asset.Name != versioned {
+		t.Fatalf("expected %q, got %q", versioned, asset.Name)
 	}
 }
 
@@ -94,6 +101,187 @@ func TestRelease_FindChecksumAsset(t *testing.T) {
 	asset := rel.FindChecksumAsset()
 	if asset == nil || asset.Name != "checksums.txt" {
 		t.Fatalf("expected checksums.txt asset, got %#v", asset)
+	}
+}
+
+func TestValidateReleaseForUpdate(t *testing.T) {
+	newRelease := func() *Release {
+		return &Release{
+			TagName: "v99.0.0",
+			HTMLURL: "https://github.com/stevelr/beads-viewer-edit/releases/tag/v99.0.0",
+			Assets: []Asset{
+				{
+					Name:               stableAssetName(),
+					BrowserDownloadURL: "https://github.com/stevelr/beads-viewer-edit/releases/download/v99.0.0/" + stableAssetName(),
+					Size:               1024,
+					Digest:             testSHA256DigestA,
+					State:              "uploaded",
+				},
+				{
+					Name:               "checksums.txt",
+					BrowserDownloadURL: "https://github.com/stevelr/beads-viewer-edit/releases/download/v99.0.0/checksums.txt",
+					Size:               256,
+					Digest:             testSHA256DigestB,
+					State:              "uploaded",
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Release)
+	}{
+		{"draft", func(release *Release) { release.Draft = true }},
+		{"GitHub prerelease", func(release *Release) { release.Prerelease = true }},
+		{"prerelease tag", func(release *Release) { release.TagName = "v99.0.0-rc.1" }},
+		{"partial tag", func(release *Release) { release.TagName = "v99.0" }},
+		{"malformed tag", func(release *Release) { release.TagName = "v99.0.0.1" }},
+		{"non-GitHub release page", func(release *Release) { release.HTMLURL = "https://example.com/release" }},
+		{"wrong release repository", func(release *Release) { release.HTMLURL = "https://github.com/other/repo/releases/tag/v99.0.0" }},
+		{"wrong release tag path", func(release *Release) {
+			release.HTMLURL = "https://github.com/stevelr/beads-viewer-edit/releases/tag/v98.0.0"
+		}},
+		{"missing platform asset", func(release *Release) { release.Assets = release.Assets[1:] }},
+		{"zero-sized platform asset", func(release *Release) { release.Assets[0].Size = 0 }},
+		{"platform asset still uploading", func(release *Release) { release.Assets[0].State = "new" }},
+		{"non-HTTPS platform asset", func(release *Release) { release.Assets[0].BrowserDownloadURL = "http://github.com/file" }},
+		{"wrong platform repository", func(release *Release) {
+			release.Assets[0].BrowserDownloadURL = "https://github.com/other/repo/releases/download/v99.0.0/" + stableAssetName()
+		}},
+		{"wrong platform tag path", func(release *Release) {
+			release.Assets[0].BrowserDownloadURL = "https://github.com/stevelr/beads-viewer-edit/releases/download/v98.0.0/" + stableAssetName()
+		}},
+		{"missing platform digest", func(release *Release) { release.Assets[0].Digest = "" }},
+		{"malformed platform digest", func(release *Release) { release.Assets[0].Digest = "sha256:not-a-hash" }},
+		{"missing checksum asset", func(release *Release) { release.Assets = release.Assets[:1] }},
+		{"empty checksum asset", func(release *Release) { release.Assets[1].Size = 0 }},
+		{"oversized checksum asset", func(release *Release) { release.Assets[1].Size = maxChecksumManifestBytes + 1 }},
+		{"wrong checksum tag path", func(release *Release) {
+			release.Assets[1].BrowserDownloadURL = "https://github.com/stevelr/beads-viewer-edit/releases/download/v98.0.0/checksums.txt"
+		}},
+		{"missing checksum digest", func(release *Release) { release.Assets[1].Digest = "" }},
+	}
+
+	if err := ValidateReleaseForUpdate(newRelease()); err != nil {
+		t.Fatalf("valid release rejected: %v", err)
+	}
+	if err := ValidateReleaseForUpdate(nil); err == nil {
+		t.Fatal("nil release accepted")
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			release := newRelease()
+			tt.mutate(release)
+			if err := ValidateReleaseForUpdate(release); err == nil {
+				t.Fatal("invalid release accepted")
+			}
+		})
+	}
+}
+
+func TestValidateReleaseIdentityRejectsTagWhitespace(t *testing.T) {
+	release := &Release{
+		TagName: " v99.0.0 ",
+		HTMLURL: "https://github.com/stevelr/beads-viewer-edit/releases/tag/%20v99.0.0%20",
+	}
+	if err := validateReleaseIdentity(release); err == nil {
+		t.Fatal("release tag with surrounding whitespace was accepted")
+	}
+}
+
+func TestReleaseFindersHandleNilReceiver(t *testing.T) {
+	var release *Release
+	if release.FindPlatformAsset() != nil {
+		t.Fatal("nil release returned a platform asset")
+	}
+	if release.FindChecksumAsset() != nil {
+		t.Fatal("nil release returned a checksum asset")
+	}
+}
+
+func TestPerformUpdateRejectsNilRelease(t *testing.T) {
+	if _, err := PerformUpdate(nil, nil); err == nil {
+		t.Fatal("PerformUpdate accepted nil release metadata")
+	}
+}
+
+func TestCheckedPlatformAssetRequiresDigestAgreement(t *testing.T) {
+	assetName := stableAssetName()
+	release := &Release{
+		TagName: "v99.0.0",
+		Assets: []Asset{
+			{
+				Name:               assetName,
+				BrowserDownloadURL: "https://github.com/stevelr/beads-viewer-edit/releases/download/v99.0.0/" + assetName,
+				Size:               1024,
+				Digest:             testSHA256DigestA,
+				State:              "uploaded",
+			},
+		},
+	}
+	wantDigest := testSHA256DigestA[len("sha256:"):]
+	asset, digest, err := checkedPlatformAsset(release, map[string]string{assetName: wantDigest})
+	if err != nil {
+		t.Fatalf("matching digests rejected: %v", err)
+	}
+	if asset == nil || asset.Name != assetName || digest != wantDigest {
+		t.Fatalf("unexpected checked asset: asset=%#v digest=%q", asset, digest)
+	}
+	if _, _, err := checkedPlatformAsset(release, map[string]string{assetName: testSHA256DigestB[len("sha256:"):]}); err == nil {
+		t.Fatal("disagreement between checksums.txt and API digest accepted")
+	}
+	if _, _, err := checkedPlatformAsset(release, nil); err == nil {
+		t.Fatal("missing checksum entry accepted")
+	}
+}
+
+func TestCheckBinaryDirectoryWritablePreservesExistingProbeLikeFile(t *testing.T) {
+	dir := t.TempDir()
+	sentinelPath := filepath.Join(dir, ".bv-update-test")
+	want := []byte("do not truncate")
+	if err := os.WriteFile(sentinelPath, want, 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	if err := checkBinaryDirectoryWritable(dir); err != nil {
+		t.Fatalf("writable directory rejected: %v", err)
+	}
+	got, err := os.ReadFile(sentinelPath)
+	if err != nil {
+		t.Fatalf("read sentinel: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("sentinel changed: got %q want %q", got, want)
+	}
+}
+
+func TestParseBinaryVersionOutput(t *testing.T) {
+	version, err := parseBinaryVersionOutput([]byte("bv v1.2.3\n"))
+	if err != nil {
+		t.Fatalf("valid version output rejected: %v", err)
+	}
+	if version != "v1.2.3" {
+		t.Fatalf("version = %q, want v1.2.3", version)
+	}
+	for _, output := range []string{"", "v1.2.3", "bv latest", "bv v1.2.3 extra"} {
+		if _, err := parseBinaryVersionOutput([]byte(output)); err == nil {
+			t.Errorf("invalid version output %q accepted", output)
+		}
+	}
+}
+
+func TestLimitedOutputBufferCapsData(t *testing.T) {
+	var buffer limitedOutputBuffer
+	data := make([]byte, maxBinaryVersionOutputBytes+1)
+	written, err := buffer.Write(data)
+	if err != nil {
+		t.Fatalf("limited buffer write: %v", err)
+	}
+	if written != len(data) {
+		t.Fatalf("Write reported %d bytes, want %d", written, len(data))
+	}
+	if !buffer.truncated || buffer.Len() != maxBinaryVersionOutputBytes {
+		t.Fatalf("buffer state: truncated=%v len=%d", buffer.truncated, buffer.Len())
 	}
 }
 
@@ -194,6 +382,16 @@ func TestParseChecksums_RejectsDuplicateFilename(t *testing.T) {
 
 	if _, err := parseChecksums(path); err == nil {
 		t.Fatalf("expected duplicate checksum entry error")
+	}
+}
+
+func TestParseChecksums_RejectsOversizedManifest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checksums.txt")
+	if err := os.WriteFile(path, make([]byte, maxChecksumManifestBytes+1), 0o644); err != nil {
+		t.Fatalf("write oversized checksums: %v", err)
+	}
+	if _, err := parseChecksums(path); err == nil {
+		t.Fatal("oversized checksum manifest accepted")
 	}
 }
 

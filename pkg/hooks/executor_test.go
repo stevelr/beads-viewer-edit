@@ -361,6 +361,85 @@ func TestExecutorCustomEnvExpansion(t *testing.T) {
 	}
 }
 
+func TestExecutorScrubsCredentialEnvVars(t *testing.T) {
+	// Credential-looking vars must NOT reach hook subprocesses by default,
+	// since hooks come from project-controlled .bv/hooks.yaml.
+	os.Setenv("BV_TEST_GITHUB_TOKEN", "supersecret")
+	os.Setenv("BV_TEST_AWS_SECRET_THING", "alsosecret")
+	defer os.Unsetenv("BV_TEST_GITHUB_TOKEN")
+	defer os.Unsetenv("BV_TEST_AWS_SECRET_THING")
+
+	config := &Config{
+		Hooks: HooksByPhase{
+			PreExport: []Hook{
+				{
+					Name:    "scrub-test",
+					Command: "echo [$BV_TEST_GITHUB_TOKEN][$BV_TEST_AWS_SECRET_THING]",
+					Timeout: 5 * time.Second,
+					OnError: "fail",
+				},
+			},
+		},
+	}
+
+	executor := NewExecutor(config, ExportContext{ExportPath: "/tmp/t.md", ExportFormat: "markdown", IssueCount: 1, Timestamp: time.Now()})
+	if err := executor.RunPreExport(); err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+
+	got := executor.Results()[0].Stdout
+	if got != "[][]" {
+		t.Errorf("expected credential env vars to be scrubbed, got %q", got)
+	}
+}
+
+func TestExecutorExplicitCredentialRegrant(t *testing.T) {
+	// A hook can explicitly re-grant a scrubbed credential via its env map.
+	os.Setenv("BV_TEST_REGRANT_TOKEN", "granted")
+	defer os.Unsetenv("BV_TEST_REGRANT_TOKEN")
+
+	config := &Config{
+		Hooks: HooksByPhase{
+			PreExport: []Hook{
+				{
+					Name:    "regrant-test",
+					Command: "echo $HOOK_TOKEN",
+					Timeout: 5 * time.Second,
+					OnError: "fail",
+					Env: map[string]string{
+						"HOOK_TOKEN": "${BV_TEST_REGRANT_TOKEN}",
+					},
+				},
+			},
+		},
+	}
+
+	executor := NewExecutor(config, ExportContext{ExportPath: "/tmp/t.md", ExportFormat: "markdown", IssueCount: 1, Timestamp: time.Now()})
+	if err := executor.RunPreExport(); err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+
+	got := executor.Results()[0].Stdout
+	if got != "granted" {
+		t.Errorf("expected explicit re-grant to expand, got %q", got)
+	}
+}
+
+func TestIsSensitiveEnvKey(t *testing.T) {
+	sensitive := []string{"GITHUB_TOKEN", "GH_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "SSH_AUTH_SOCK", "NPM_API_KEY", "my_password", "DB_Passwd", "GCP_CREDENTIALS_JSON", "SOME_PRIVATE_KEY", "OPENAI_APIKEY"}
+	for _, k := range sensitive {
+		if !isSensitiveEnvKey(k) {
+			t.Errorf("expected %q to be sensitive", k)
+		}
+	}
+	benign := []string{"HOME", "PATH", "GIT_AUTHOR_NAME", "TERM", "LANG", "BV_EXPORT_PATH"}
+	for _, k := range benign {
+		if isSensitiveEnvKey(k) {
+			t.Errorf("expected %q to be benign", k)
+		}
+	}
+}
+
 func TestExecutorSummary(t *testing.T) {
 	config := &Config{
 		Hooks: HooksByPhase{

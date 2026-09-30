@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -38,9 +40,10 @@ type semanticHybridConfig struct {
 }
 
 type semanticScoreCache struct {
-	term   string
-	scores map[string]SemanticScore
+	byTerm map[string]map[string]SemanticScore
 }
+
+const semanticCacheMaxTerms = 20
 
 type metricsCacheHolder struct {
 	cache search.MetricsCache
@@ -54,6 +57,7 @@ type SemanticScore struct {
 }
 
 type SemanticSearch struct {
+	cacheMu      sync.Mutex
 	snapshot     atomic.Value // semanticSearchSnapshot
 	cache        atomic.Value // *semanticResultCache
 	scores       atomic.Value // *semanticScoreCache
@@ -65,7 +69,7 @@ func NewSemanticSearch() *SemanticSearch {
 	s := &SemanticSearch{}
 	s.snapshot.Store(semanticSearchSnapshot{})
 	s.cache.Store(&semanticResultCache{results: make(map[string][]list.Rank)})
-	s.scores.Store(&semanticScoreCache{scores: make(map[string]SemanticScore)})
+	s.scores.Store(&semanticScoreCache{byTerm: make(map[string]map[string]SemanticScore)})
 	s.metricsCache.Store(&metricsCacheHolder{})
 	defaultWeights, err := search.GetPreset(search.PresetDefault)
 	if err != nil {
@@ -100,32 +104,79 @@ func (s *SemanticSearch) GetLastQueryTime() time.Time {
 func (s *SemanticSearch) getScores() *semanticScoreCache {
 	v := s.scores.Load()
 	if v == nil {
-		return &semanticScoreCache{scores: make(map[string]SemanticScore)}
+		return &semanticScoreCache{byTerm: make(map[string]map[string]SemanticScore)}
 	}
 	return v.(*semanticScoreCache)
 }
 
-// SetScores stores the latest scores for a given term.
-func (s *SemanticSearch) SetScores(term string, scores map[string]SemanticScore) {
-	if scores == nil {
-		s.scores.Store(&semanticScoreCache{term: term, scores: make(map[string]SemanticScore)})
+// prepareSemanticCacheTermLocked applies one distinct-term boundary to both
+// rank and score caches. SetScores and SetCachedResults are intentionally
+// separate API calls, so evicting only the cache touched first can leave the
+// two views out of sync at the capacity boundary.
+func (s *SemanticSearch) prepareSemanticCacheTermLocked(term string) {
+	scores := s.getScores()
+	results := s.getCache()
+	if _, ok := scores.byTerm[term]; ok {
 		return
 	}
-	s.scores.Store(&semanticScoreCache{term: term, scores: scores})
+	if _, ok := results.results[term]; ok {
+		return
+	}
+
+	distinctTerms := len(scores.byTerm)
+	for cachedTerm := range results.results {
+		if _, ok := scores.byTerm[cachedTerm]; !ok {
+			distinctTerms++
+		}
+	}
+	if distinctTerms < semanticCacheMaxTerms {
+		return
+	}
+
+	s.scores.Store(&semanticScoreCache{byTerm: make(map[string]map[string]SemanticScore)})
+	s.cache.Store(&semanticResultCache{
+		results:     make(map[string][]list.Rank),
+		pendingTerm: results.pendingTerm,
+		lastQuery:   results.lastQuery,
+	})
+}
+
+// SetScores stores the latest scores for a given term.
+func (s *SemanticSearch) SetScores(term string, scores map[string]SemanticScore) {
+	if strings.TrimSpace(term) == "" {
+		return
+	}
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+
+	s.prepareSemanticCacheTermLocked(term)
+	current := s.getScores()
+	byTerm := make(map[string]map[string]SemanticScore, len(current.byTerm)+1)
+	for cachedTerm, cachedScores := range current.byTerm {
+		byTerm[cachedTerm] = cachedScores
+	}
+	if scores == nil {
+		scores = make(map[string]SemanticScore)
+	}
+	byTerm[term] = scores
+	s.scores.Store(&semanticScoreCache{byTerm: byTerm})
 }
 
 // Scores returns scores for a specific term if available.
 func (s *SemanticSearch) Scores(term string) (map[string]SemanticScore, bool) {
 	cache := s.getScores()
-	if cache.term != term || cache.scores == nil {
+	scores, ok := cache.byTerm[term]
+	if !ok || scores == nil {
 		return nil, false
 	}
-	return cache.scores, true
+	return scores, true
 }
 
 // ClearScores clears cached scores.
 func (s *SemanticSearch) ClearScores() {
-	s.scores.Store(&semanticScoreCache{scores: make(map[string]SemanticScore)})
+	s.cacheMu.Lock()
+	s.scores.Store(&semanticScoreCache{byTerm: make(map[string]map[string]SemanticScore)})
+	s.cacheMu.Unlock()
 }
 
 func (s *SemanticSearch) getHybridConfig() semanticHybridConfig {
@@ -148,6 +199,7 @@ func (s *SemanticSearch) SetHybridConfig(enabled bool, preset search.PresetName)
 		Preset:  preset,
 		Weights: weights.Normalize(),
 	})
+	s.ResetCache()
 }
 
 func (s *SemanticSearch) getMetricsCache() search.MetricsCache {
@@ -162,16 +214,25 @@ func (s *SemanticSearch) getMetricsCache() search.MetricsCache {
 // SetMetricsCache sets the metrics cache used for hybrid scoring.
 func (s *SemanticSearch) SetMetricsCache(cache search.MetricsCache) {
 	s.metricsCache.Store(&metricsCacheHolder{cache: cache})
+	s.ResetCache()
 }
 
 // ResetCache clears cached semantic results and scores.
 func (s *SemanticSearch) ResetCache() {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
 	s.cache.Store(&semanticResultCache{results: make(map[string][]list.Rank)})
-	s.ClearScores()
+	s.scores.Store(&semanticScoreCache{byTerm: make(map[string]map[string]SemanticScore)})
 }
 
 // SetCachedResults stores semantic filter results and clears pending state if matching
 func (s *SemanticSearch) SetCachedResults(term string, results []list.Rank) {
+	if strings.TrimSpace(term) == "" {
+		return
+	}
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.prepareSemanticCacheTermLocked(term)
 	c := s.getCache()
 
 	// Only clear pending if this is the term that was pending
@@ -190,17 +251,14 @@ func (s *SemanticSearch) SetCachedResults(term string, results []list.Rank) {
 	for k, v := range c.results {
 		newCache.results[k] = v
 	}
-	// Limit cache size to prevent memory bloat
-	if len(newCache.results) > 20 {
-		// Clear old entries (simple approach: clear all)
-		newCache.results = make(map[string][]list.Rank)
-	}
 	newCache.results[term] = results
 	s.cache.Store(newCache)
 }
 
 // ClearPending clears the pending term (e.g., when user stops filtering)
 func (s *SemanticSearch) ClearPending() {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
 	c := s.getCache()
 	if c.pendingTerm == "" {
 		return
@@ -211,6 +269,29 @@ func (s *SemanticSearch) ClearPending() {
 		lastQuery:   c.lastQuery,
 	}
 	s.cache.Store(newCache)
+}
+
+// MarkPending records the current query as awaiting semantic computation.
+func (s *SemanticSearch) MarkPending(term string) {
+	if term == "" {
+		s.ClearPending()
+		return
+	}
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	c := s.getCache()
+	newCache := &semanticResultCache{
+		results:     c.results,
+		pendingTerm: term,
+		lastQuery:   time.Now(),
+	}
+	s.cache.Store(newCache)
+}
+
+func (s *SemanticSearch) HasCachedResults(term string) bool {
+	c := s.getCache()
+	_, ok := c.results[term]
+	return ok
 }
 
 func (s *SemanticSearch) Snapshot() semanticSearchSnapshot {
@@ -227,6 +308,7 @@ func (s *SemanticSearch) SetIndex(idx *search.VectorIndex, embedder search.Embed
 	snap.Embedder = embedder
 	snap.Ready = idx != nil && embedder != nil
 	s.snapshot.Store(snap)
+	s.ResetCache()
 }
 
 func (s *SemanticSearch) SetIDs(ids []string) {
@@ -235,6 +317,7 @@ func (s *SemanticSearch) SetIDs(ids []string) {
 	copy(cp, ids)
 	snap.IDs = cp
 	s.snapshot.Store(snap)
+	s.ResetCache()
 }
 
 func (s *SemanticSearch) SetDocs(docs map[string]string) {
@@ -242,6 +325,7 @@ func (s *SemanticSearch) SetDocs(docs map[string]string) {
 	if docs == nil {
 		snap.Docs = nil
 		s.snapshot.Store(snap)
+		s.ResetCache()
 		return
 	}
 	cp := make(map[string]string, len(docs))
@@ -250,6 +334,25 @@ func (s *SemanticSearch) SetDocs(docs map[string]string) {
 	}
 	snap.Docs = cp
 	s.snapshot.Store(snap)
+	s.ResetCache()
+}
+
+// SetDocuments installs copied IDs and documents in one atomic snapshot so an
+// in-flight search cannot observe new IDs paired with old documents (or vice
+// versa).
+func (s *SemanticSearch) SetDocuments(ids []string, docs map[string]string) {
+	snap := s.Snapshot()
+	snap.IDs = append([]string(nil), ids...)
+	if docs == nil {
+		snap.Docs = nil
+	} else {
+		snap.Docs = make(map[string]string, len(docs))
+		for id, doc := range docs {
+			snap.Docs[id] = doc
+		}
+	}
+	s.snapshot.Store(snap)
+	s.ResetCache()
 }
 
 // setSnapshotDocuments installs immutable document metadata prepared by a
@@ -260,15 +363,20 @@ func (s *SemanticSearch) setSnapshotDocuments(ids []string, docs map[string]stri
 	snap.IDs = ids
 	snap.Docs = docs
 	s.snapshot.Store(snap)
+	s.ResetCache()
 }
 
 // Filter implements list.FilterFunc, returning ranks sorted by semantic similarity.
 // This is non-blocking: returns cached results or fuzzy fallback immediately,
 // and marks the term as pending for async computation.
 func (s *SemanticSearch) Filter(term string, targets []string) []list.Rank {
-	if term == "" {
+	if strings.TrimSpace(term) == "" {
 		// Preserve existing sort order when the user hasn't entered a query yet.
-		return list.DefaultFilter(term, targets)
+		ranks := make([]list.Rank, len(targets))
+		for i := range ranks {
+			ranks[i].Index = i
+		}
+		return ranks
 	}
 
 	snap := s.Snapshot()
@@ -281,6 +389,8 @@ func (s *SemanticSearch) Filter(term string, targets []string) []list.Rank {
 	}
 
 	// Check cache first - return immediately if we have cached results
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
 	c := s.getCache()
 	if cached, ok := c.results[term]; ok {
 		return cached
@@ -300,19 +410,34 @@ func (s *SemanticSearch) Filter(term string, targets []string) []list.Rank {
 }
 
 // ComputeSemanticResults computes semantic similarity results synchronously.
-// This should be called from an async tea.Cmd, not from Filter.
+// Direct callers retain the historical behavior of installing the computed
+// scores. Async commands use computeSemanticResults directly so the event loop
+// can generation-fence both ranks and scores before installing either.
 func (s *SemanticSearch) ComputeSemanticResults(term string) []list.Rank {
+	results, scores, _ := s.computeSemanticResults(term)
+	if scores != nil {
+		s.SetScores(term, scores)
+	}
+	return results
+}
+
+// computeSemanticResults computes ranks and their score details without
+// mutating SemanticSearch. This keeps stale async commands observational only.
+func (s *SemanticSearch) computeSemanticResults(term string) ([]list.Rank, map[string]SemanticScore, error) {
 	snap := s.Snapshot()
 	if !snap.Ready || snap.Index == nil || snap.Embedder == nil {
-		return nil
+		return nil, nil, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	vecs, err := snap.Embedder.Embed(ctx, []string{term})
-	if err != nil || len(vecs) != 1 {
-		return nil
+	if err != nil {
+		return nil, nil, fmt.Errorf("embed semantic query: %w", err)
+	}
+	if len(vecs) != 1 {
+		return nil, nil, fmt.Errorf("embed semantic query: got %d vectors, want 1", len(vecs))
 	}
 	q := vecs[0]
 
@@ -425,50 +550,96 @@ func (s *SemanticSearch) ComputeSemanticResults(term string) []list.Rank {
 	for _, it := range scoredItems {
 		out = append(out, list.Rank{Index: it.index})
 	}
-	s.SetScores(term, scoreMap)
-	return out
+	return out, scoreMap, nil
 }
 
 // SemanticIndexReadyMsg is emitted when the semantic index build/update completes.
 type SemanticIndexReadyMsg struct {
-	Embedder  search.Embedder
-	Index     *search.VectorIndex
-	IndexPath string
-	Loaded    bool
-	Stats     search.IndexSyncStats
-	Error     error
+	DataGeneration  uint64
+	BuildGeneration uint64
+	Embedder        search.Embedder
+	Index           *search.VectorIndex
+	IndexPath       string
+	Loaded          bool
+	NeedsSave       bool
+	Stats           search.IndexSyncStats
+	Error           error
+}
+
+type semanticIndexSaveRequest struct {
+	DataGeneration  uint64
+	BuildGeneration uint64
+	Index           *search.VectorIndex
+	IndexPath       string
+}
+
+type semanticIndexSaveDoneMsg struct {
+	DataGeneration  uint64
+	BuildGeneration uint64
+	IndexPath       string
+	Error           error
+}
+
+type semanticIndexSaveFunc func(*search.VectorIndex, string) error
+
+func saveSemanticIndex(idx *search.VectorIndex, path string) error {
+	return idx.Save(path)
+}
+
+func saveSemanticIndexCmd(request semanticIndexSaveRequest, save semanticIndexSaveFunc) tea.Cmd {
+	if request.Index == nil || request.IndexPath == "" || save == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		return semanticIndexSaveDoneMsg{
+			DataGeneration:  request.DataGeneration,
+			BuildGeneration: request.BuildGeneration,
+			IndexPath:       request.IndexPath,
+			Error:           save(request.Index, request.IndexPath),
+		}
+	}
 }
 
 // SemanticFilterResultMsg is emitted when async semantic filter results are ready.
 type SemanticFilterResultMsg struct {
-	Term    string
-	Results []list.Rank
+	DataGeneration  uint64
+	QueryGeneration uint64
+	Term            string
+	Results         []list.Rank
+	Scores          map[string]SemanticScore
+	Error           error
 }
 
 // HybridMetricsReadyMsg is emitted when hybrid metrics are ready for scoring.
 type HybridMetricsReadyMsg struct {
-	Cache search.MetricsCache
-	Error error
+	DataGeneration  uint64
+	BuildGeneration uint64
+	Cache           search.MetricsCache
+	Error           error
 }
 
 // ComputeSemanticFilterCmd computes semantic filter results asynchronously.
-func ComputeSemanticFilterCmd(s *SemanticSearch, term string) tea.Cmd {
+func ComputeSemanticFilterCmd(s *SemanticSearch, term string, dataGen, queryGen uint64) tea.Cmd {
 	return func() tea.Msg {
-		results := s.ComputeSemanticResults(term)
+		results, scores, err := s.computeSemanticResults(term)
 		return SemanticFilterResultMsg{
-			Term:    term,
-			Results: results,
+			DataGeneration:  dataGen,
+			QueryGeneration: queryGen,
+			Term:            term,
+			Results:         results,
+			Scores:          scores,
+			Error:           err,
 		}
 	}
 }
 
 // BuildHybridMetricsCmd computes metrics for hybrid scoring asynchronously.
-func BuildHybridMetricsCmd(issues []model.Issue) tea.Cmd {
+func BuildHybridMetricsCmd(issues []model.Issue, dataGen, buildGen uint64) tea.Cmd {
 	return func() tea.Msg {
 		loader := search.NewAnalyzerMetricsLoader(issues).WithCache(analysis.GetGlobalCache())
 		metrics, err := loader.LoadMetrics()
 		if err != nil {
-			return HybridMetricsReadyMsg{Error: err}
+			return HybridMetricsReadyMsg{DataGeneration: dataGen, BuildGeneration: buildGen, Error: err}
 		}
 
 		maxBlocker := 0
@@ -482,28 +653,28 @@ func BuildHybridMetricsCmd(issues []model.Issue) tea.Cmd {
 			metrics:    metrics,
 			maxBlocker: maxBlocker,
 		}
-		return HybridMetricsReadyMsg{Cache: cache}
+		return HybridMetricsReadyMsg{DataGeneration: dataGen, BuildGeneration: buildGen, Cache: cache}
 	}
 }
 
 // BuildSemanticIndexCmd builds or updates the semantic index for the given issues.
-func BuildSemanticIndexCmd(issues []model.Issue) tea.Cmd {
+func BuildSemanticIndexCmd(issues []model.Issue, dataGen, buildGen uint64) tea.Cmd {
 	return func() tea.Msg {
 		cfg := search.EmbeddingConfigFromEnv()
 		embedder, err := search.NewEmbedderFromConfig(cfg)
 		if err != nil {
-			return SemanticIndexReadyMsg{Error: err}
+			return SemanticIndexReadyMsg{DataGeneration: dataGen, BuildGeneration: buildGen, Error: err}
 		}
 
 		projectDir, err := os.Getwd()
 		if err != nil {
-			return SemanticIndexReadyMsg{Error: err}
+			return SemanticIndexReadyMsg{DataGeneration: dataGen, BuildGeneration: buildGen, Error: err}
 		}
 
 		indexPath := search.DefaultIndexPath(projectDir, cfg)
 		idx, loaded, err := search.LoadOrNewVectorIndex(indexPath, embedder.Dim())
 		if err != nil {
-			return SemanticIndexReadyMsg{Error: err}
+			return SemanticIndexReadyMsg{DataGeneration: dataGen, BuildGeneration: buildGen, Error: err}
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -512,20 +683,18 @@ func BuildSemanticIndexCmd(issues []model.Issue) tea.Cmd {
 		docs := search.DocumentsFromIssues(issues)
 		stats, err := search.SyncVectorIndex(ctx, idx, embedder, docs, 64)
 		if err != nil {
-			return SemanticIndexReadyMsg{Error: err}
-		}
-		if !loaded || stats.Changed() {
-			if err := idx.Save(indexPath); err != nil {
-				return SemanticIndexReadyMsg{Error: fmt.Errorf("save semantic index: %w", err)}
-			}
+			return SemanticIndexReadyMsg{DataGeneration: dataGen, BuildGeneration: buildGen, Error: err}
 		}
 
 		return SemanticIndexReadyMsg{
-			Embedder:  embedder,
-			Index:     idx,
-			IndexPath: indexPath,
-			Loaded:    loaded,
-			Stats:     stats,
+			DataGeneration:  dataGen,
+			BuildGeneration: buildGen,
+			Embedder:        embedder,
+			Index:           idx,
+			IndexPath:       indexPath,
+			Loaded:          loaded,
+			NeedsSave:       !loaded || stats.Changed(),
+			Stats:           stats,
 		}
 	}
 }

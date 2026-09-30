@@ -6,6 +6,13 @@ import (
 	"time"
 )
 
+func TestXFetchShouldRefresh_AtExpiry(t *testing.T) {
+	expiresAt := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	if !ShouldRefresh(expiresAt, time.Second, 1, expiresAt) {
+		t.Fatal("an entry at its expiry must refresh")
+	}
+}
+
 func TestXFetchShouldRefresh_ZeroDuration(t *testing.T) {
 	now := time.Now()
 	lastCompute := now.Add(-time.Second)
@@ -45,123 +52,118 @@ func TestXFetchShouldRefresh_InvalidBeta(t *testing.T) {
 }
 
 func TestXFetchShouldRefresh_Deterministic(t *testing.T) {
-	// With a fixed "now" far in the future, should always refresh
-	lastCompute := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	// An expired entry always refreshes, independently of the random draw.
+	expiresAt := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 	computeDuration := time.Hour
 	farFuture := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	// Run multiple times - all should trigger refresh since now >> lastCompute + duration
-	refreshCount := 0
 	for i := 0; i < 100; i++ {
-		if ShouldRefresh(lastCompute, computeDuration, 1.0, farFuture) {
-			refreshCount++
+		if !ShouldRefresh(expiresAt, computeDuration, 1.0, farFuture) {
+			t.Fatal("expired entry did not refresh")
 		}
-	}
-
-	// All should refresh since we're 10 years past the compute time
-	if refreshCount < 95 {
-		t.Errorf("expected nearly all refreshes for far future time, got %d/100", refreshCount)
 	}
 }
 
 func TestXFetchShouldRefresh_NeverRefreshImmediately(t *testing.T) {
-	// Immediately after compute, should almost never refresh
+	// With one day remaining and a 1ns compute duration, none of the random
+	// draws representable by Float64 can bridge the gap to expiry.
 	now := time.Now()
-	lastCompute := now
-	computeDuration := time.Hour
+	expiresAt := now.Add(24 * time.Hour)
+	computeDuration := time.Nanosecond
 
 	// Run multiple times
-	refreshCount := 0
 	for i := 0; i < 100; i++ {
-		if ShouldRefresh(lastCompute, computeDuration, 1.0, now) {
-			refreshCount++
+		if ShouldRefresh(expiresAt, computeDuration, 1.0, now) {
+			t.Fatal("fresh entry refreshed despite its distant expiry")
 		}
-	}
-
-	// Almost none should refresh immediately (random chance is very low)
-	// The threshold is duration * beta * -ln(rand), which is always positive
-	// So now must be > lastCompute + positive_threshold, which is impossible when now == lastCompute
-	if refreshCount > 10 {
-		t.Errorf("expected almost no immediate refreshes, got %d/100", refreshCount)
 	}
 }
 
 func TestXFetchShouldRefresh_ProbabilisticDistribution(t *testing.T) {
-	// Test that refresh probability increases as time passes
-	// At time = lastCompute + computeDuration, probability should be around 63% (1 - 1/e)
-	// because P(refresh) = P(-ln(rand) < 1) = P(rand > 1/e) = 1 - 1/e ≈ 0.632
-
+	// One computation-duration before expiry, the exponential survival
+	// probability is 1/e. Uniform midpoint quantiles make this reproducible.
 	computeDuration := time.Hour
-	lastCompute := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
-
-	// Test at t = lastCompute + computeDuration (elapsed = 1.0 * duration)
-	testTime := lastCompute.Add(computeDuration)
+	expiresAt := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	testTime := expiresAt.Add(-computeDuration)
 
 	const samples = 1000
 	refreshCount := 0
 	for i := 0; i < samples; i++ {
-		if ShouldRefresh(lastCompute, computeDuration, 1.0, testTime) {
+		uniform := (float64(i) + 0.5) / samples
+		if shouldRefresh(expiresAt, computeDuration, 1.0, testTime, uniform) {
 			refreshCount++
 		}
 	}
 
-	// Expected: ~63.2% (1 - 1/e)
-	// With 1000 samples, we expect 632 ± ~30 (3 standard deviations)
-	// Using wider bounds for test stability: 550-720
-	expectedCenter := 0.632 * float64(samples)
-	tolerance := 0.1 * float64(samples) // 10% tolerance
-
-	if math.Abs(float64(refreshCount)-expectedCenter) > tolerance {
-		t.Errorf("at t=duration, expected ~%.0f refreshes (1-1/e), got %d", expectedCenter, refreshCount)
+	if refreshCount != 368 {
+		t.Errorf("one duration before expiry: expected 368/1000 quantiles (1/e), got %d", refreshCount)
 	}
 }
 
 func TestXFetchShouldRefresh_BetaScaling(t *testing.T) {
-	// Higher beta should mean less aggressive refresh (higher threshold)
+	// Higher beta stretches the early-refresh window toward earlier times.
 	computeDuration := time.Hour
-	lastCompute := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
-	testTime := lastCompute.Add(computeDuration)
+	expiresAt := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	testTime := expiresAt.Add(-computeDuration)
 
 	const samples = 500
 
-	// Beta = 0.5 (more aggressive)
+	// Beta = 0.5: survival probability exp(-2).
 	refreshLowBeta := 0
 	for i := 0; i < samples; i++ {
-		if ShouldRefresh(lastCompute, computeDuration, 0.5, testTime) {
+		if shouldRefresh(expiresAt, computeDuration, 0.5, testTime, (float64(i)+0.5)/samples) {
 			refreshLowBeta++
 		}
 	}
 
-	// Beta = 2.0 (less aggressive)
+	// Beta = 2.0: survival probability exp(-0.5).
 	refreshHighBeta := 0
 	for i := 0; i < samples; i++ {
-		if ShouldRefresh(lastCompute, computeDuration, 2.0, testTime) {
+		if shouldRefresh(expiresAt, computeDuration, 2.0, testTime, (float64(i)+0.5)/samples) {
 			refreshHighBeta++
 		}
 	}
 
-	// Lower beta should produce more refreshes
-	if refreshHighBeta >= refreshLowBeta {
-		t.Errorf("expected lower beta to produce more refreshes: beta=0.5 got %d, beta=2.0 got %d",
+	if refreshLowBeta != 68 || refreshHighBeta != 303 {
+		t.Errorf("expected beta=0.5 to refresh 68/500 and beta=2 to refresh 303/500: got %d and %d",
 			refreshLowBeta, refreshHighBeta)
 	}
 }
 
 func TestShouldRefreshWithDefault(t *testing.T) {
-	// Just verify the wrapper works
-	// Use a time far in the past to guarantee refresh
 	oldTime := time.Now().Add(-365 * 24 * time.Hour)
 	computeDuration := time.Minute
-
-	// Should almost certainly refresh
-	refreshCount := 0
 	for i := 0; i < 10; i++ {
-		if ShouldRefreshWithDefault(oldTime, computeDuration) {
-			refreshCount++
+		if !ShouldRefreshWithDefault(oldTime, computeDuration) {
+			t.Fatal("expired cache did not refresh through the default wrapper")
 		}
 	}
+}
 
-	if refreshCount < 8 {
-		t.Errorf("expected most calls to refresh for old cache, got %d/10", refreshCount)
+func TestXFetchShouldRefresh_Boundaries(t *testing.T) {
+	expiry := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	for _, tt := range []struct {
+		name     string
+		before   time.Duration
+		duration time.Duration
+		beta     float64
+		uniform  float64
+		want     bool
+	}{
+		{"at expiry with zero gap", 0, time.Second, 1, 1, true},
+		{"before expiry with zero gap", time.Nanosecond, time.Second, 1, 1, false},
+		{"after expiry", -time.Nanosecond, time.Second, 1, 1, true},
+		{"before early window", 2 * time.Second, time.Second, 1, 0.5, false},
+		{"inside early window", time.Second / 2, time.Second, 1, 0.5, true},
+		{"duration stretches window", 2 * time.Second, 4 * time.Second, 1, 0.5, true},
+		{"huge scale", time.Hour, time.Duration(math.MaxInt64), math.MaxFloat64, 0.5, true},
+		{"huge scale zero gap", time.Nanosecond, time.Duration(math.MaxInt64), math.MaxFloat64, 1, false},
+		{"tiny scale", time.Nanosecond, time.Nanosecond, math.SmallestNonzeroFloat64, 0.5, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldRefresh(expiry, tt.duration, tt.beta, expiry.Add(-tt.before), tt.uniform); got != tt.want {
+				t.Errorf("refresh=%v, want %v", got, tt.want)
+			}
+		})
 	}
 }

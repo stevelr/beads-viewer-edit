@@ -3,19 +3,105 @@ package loader_test
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // =============================================================================
 // FindJSONLPath Tests
 // =============================================================================
+
+func TestIssueOriginsRejectUnknownTrackerBackend(t *testing.T) {
+	dir := t.TempDir()
+	for name, data := range map[string]string{
+		"metadata.json": `{"backend":"unknown-tracker","database":"beads.db","jsonl_export":"issues.jsonl"}`,
+		"beads.db":      "not a supported tracker",
+		"issues.jsonl":  "",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	issues := []model.Issue{{ID: "local-1", Title: "Readable analysis"}}
+	loader.AttachIssueOrigins(issues, filepath.Join(dir, "issues.jsonl"), true)
+	actions := issues[0].Actions(true)
+	if actions.Show != nil || actions.Claim != nil || !strings.Contains(actions.UnavailableReason, "unsupported tracker backend") {
+		t.Fatalf("unknown backend borrowed br authority: %+v", actions)
+	}
+}
+
+func TestIssueOriginsStyledTrackerCapabilities(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("controlled tracker help fixture uses a POSIX executable")
+	}
+	for _, tc := range []struct {
+		name      string
+		flags     string
+		wantRoute bool
+		wantClaim bool
+	}{
+		{"supported", "--db --json --no-auto-import --no-auto-flush --claim", true, true},
+		{"no claim", "--db --json --no-auto-import --no-auto-flush", true, false},
+		{"missing database", "--json --no-auto-import --no-auto-flush --claim", false, false},
+		{"missing json", "--db --no-auto-import --no-auto-flush --claim", false, false},
+		{"missing import control", "--db --json --no-auto-flush --claim", false, false},
+		{"missing flush control", "--db --json --no-auto-import --claim", false, false},
+		{"different flag token", "--db-other --json --no-auto-import --no-auto-flush --claim", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			beadsDir := filepath.Join(root, ".beads")
+			if err := os.Mkdir(beadsDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for name, data := range map[string]string{
+				"metadata.json": `{"backend":"sqlite","database":"beads.db","jsonl_export":"issues.jsonl"}`,
+				"beads.db":      "capability-routing fixture; no tracker commands execute against this file",
+				"issues.jsonl":  "",
+			} {
+				if err := os.WriteFile(filepath.Join(beadsDir, name), []byte(data), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The fixture only implements help. Real installed tracker routes are
+			// exercised separately by TestRobotActionRoutesLiveTrackers.
+			help := "#!/bin/sh\n[ \"$1\" = update ] && [ \"$2\" = --help ] && [ \"$#\" = 2 ] || exit 17\n"
+			for _, flag := range strings.Fields(tc.flags) {
+				help += "printf '\\033[1m" + flag + "\\033[0m <VALUE>\\n'\n"
+			}
+			executable := filepath.Join(root, "br")
+			if err := os.WriteFile(executable, []byte(help), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", root)
+			issues := []model.Issue{{ID: "local-1", Title: "Readable analysis"}}
+			loader.AttachIssueOrigins(issues, filepath.Join(beadsDir, "issues.jsonl"), true)
+			actions := issues[0].Actions(true)
+			if tc.wantRoute {
+				if actions.Show == nil || (actions.Claim != nil) != tc.wantClaim || actions.WorkingDirectory != root {
+					t.Fatalf("styled supported flags lost exact source route: %+v", actions)
+				}
+				database := filepath.Join(beadsDir, "beads.db")
+				wantArgv := []string{"env", "BEADS_DIR=" + beadsDir, "BEADS_DB=" + database, "BD_DB=" + database,
+					executable, "--db", database, "--no-auto-import", "--no-auto-flush", "show", "--json", "--", "local-1"}
+				if !reflect.DeepEqual(actions.Show.Argv, wantArgv) {
+					t.Fatalf("styled help changed exact inspection route: got %q, want %q", actions.Show.Argv, wantArgv)
+				}
+			} else if actions.Show != nil || actions.Claim != nil || !strings.Contains(actions.UnavailableReason, "required explicit database route") {
+				t.Fatalf("absent exact capability gained a source route: %+v", actions)
+			}
+		})
+	}
+}
 
 func TestFindJSONLPath_NonExistentDirectory(t *testing.T) {
 	_, err := loader.FindJSONLPath("/nonexistent/path/to/beads")
@@ -132,7 +218,7 @@ func TestFindJSONLPath_SkipsBackupFiles(t *testing.T) {
 	// Create backup and regular files
 	os.WriteFile(filepath.Join(dir, "beads.jsonl.backup"), []byte(`{"id":"1"}`), 0644)
 	os.WriteFile(filepath.Join(dir, "beads.backup.jsonl"), []byte(`{"id":"2"}`), 0644)
-	os.WriteFile(filepath.Join(dir, "other.jsonl"), []byte(`{"id":"3"}`), 0644)
+	os.WriteFile(filepath.Join(dir, "issues.jsonl"), []byte(`{"id":"3"}`), 0644)
 
 	path, err := loader.FindJSONLPath(dir)
 	if err != nil {
@@ -148,7 +234,7 @@ func TestFindJSONLPath_SkipsMergeArtifacts(t *testing.T) {
 	// Create merge artifacts and regular files
 	os.WriteFile(filepath.Join(dir, "beads.orig.jsonl"), []byte(`{"id":"1"}`), 0644)
 	os.WriteFile(filepath.Join(dir, "beads.merge.jsonl"), []byte(`{"id":"2"}`), 0644)
-	os.WriteFile(filepath.Join(dir, "other.jsonl"), []byte(`{"id":"3"}`), 0644)
+	os.WriteFile(filepath.Join(dir, "issues.jsonl"), []byte(`{"id":"3"}`), 0644)
 
 	path, err := loader.FindJSONLPath(dir)
 	if err != nil {
@@ -497,6 +583,42 @@ func TestParseIssuesWithOptionsPooled_IssueFilter_SkipsClosed(t *testing.T) {
 	loader.ReturnIssuePtrsToPool(result.PoolRefs)
 }
 
+func TestLoadIssuesFromFile_AllSkippedReturnsNilOnSerialAndParallelPaths(t *testing.T) {
+	memoryLine := `{"_type":"memory","value":"` + strings.Repeat("x", 8*1024) + `"}` + "\n"
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{name: "serial", content: `{"_type":"memory","value":"small"}` + "\n"},
+		{name: "parallel", content: strings.Repeat(memoryLine, 600)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "issues.jsonl")
+			if err := os.WriteFile(path, []byte(tc.content), 0o644); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+
+			issues, err := loader.LoadIssuesFromFile(path)
+			if err != nil {
+				t.Fatalf("LoadIssuesFromFile: %v", err)
+			}
+			if issues != nil {
+				t.Fatalf("plain all-skipped result=%#v, want nil", issues)
+			}
+
+			pooled, err := loader.LoadIssuesFromFilePooled(path)
+			if err != nil {
+				t.Fatalf("LoadIssuesFromFilePooled: %v", err)
+			}
+			if pooled.Issues != nil || pooled.PoolRefs != nil {
+				t.Fatalf("pooled all-skipped result issues=%#v refs=%#v, want both nil", pooled.Issues, pooled.PoolRefs)
+			}
+		})
+	}
+}
+
 // Regression test for issue #145: bd export emits memories, sprints,
 // and other non-issue records into the same JSONL stream, tagged with
 // `_type`. The loader must skip them silently rather than try to parse
@@ -609,6 +731,69 @@ func TestLoadIssuesFromFileWithOptionsPooled_ReturnsPoolRefs(t *testing.T) {
 	}
 }
 
+func TestParseIssuesWithOptions_RejectsDuplicateIDsDeterministically(t *testing.T) {
+	input := strings.Join([]string{
+		`{"id":"same","title":"first","status":"open","priority":1,"issue_type":"task"}`,
+		`{"id":"other","title":"other","status":"open","priority":2,"issue_type":"task"}`,
+		`{"id":"same","title":"second","status":"closed","priority":3,"issue_type":"bug"}`,
+	}, "\n")
+
+	var warnings []string
+	warningCount := 0
+	stats := loader.ParseStats{}
+	issues, err := loader.ParseIssuesWithOptions(strings.NewReader(input), loader.ParseOptions{
+		Stats:          &stats,
+		WarningCount:   &warningCount,
+		WarningHandler: func(message string) { warnings = append(warnings, message) },
+	})
+	if err != nil {
+		t.Fatalf("ParseIssuesWithOptions failed: %v", err)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("issues=%d, want 2 unique IDs", len(issues))
+	}
+	if issues[0].ID != "same" || issues[0].Title != "first" || issues[1].ID != "other" {
+		t.Fatalf("duplicate handling changed order or did not keep first record: %#v", issues)
+	}
+	if stats.Valid != 2 || stats.Errors != 1 {
+		t.Fatalf("stats=%+v, want Valid=2 Errors=1", stats)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], `duplicate issue ID "same"`) {
+		t.Fatalf("warnings=%q, want one duplicate-ID warning", warnings)
+	}
+	if warningCount != 1 {
+		t.Fatalf("warning count=%d, want 1", warningCount)
+	}
+}
+
+func TestParseIssuesWithOptionsPooled_RejectsDuplicateAndKeepsRefsAligned(t *testing.T) {
+	input := strings.Join([]string{
+		`{"id":"same","title":"first","status":"open","priority":1,"issue_type":"task","labels":["first"]}`,
+		`{"id":"same","title":"second","status":"open","priority":2,"issue_type":"bug","labels":["second"]}`,
+		`{"id":"other","title":"other","status":"open","priority":3,"issue_type":"task","labels":["other"]}`,
+	}, "\n")
+
+	pooled, err := loader.ParseIssuesWithOptionsPooled(strings.NewReader(input), loader.ParseOptions{
+		WarningHandler: func(string) {},
+	})
+	if err != nil {
+		t.Fatalf("ParseIssuesWithOptionsPooled failed: %v", err)
+	}
+	defer loader.ReturnIssuePtrsToPool(pooled.PoolRefs)
+
+	if len(pooled.Issues) != 2 || len(pooled.PoolRefs) != 2 {
+		t.Fatalf("issues=%d refs=%d, want two aligned unique records", len(pooled.Issues), len(pooled.PoolRefs))
+	}
+	for i := range pooled.Issues {
+		if pooled.PoolRefs[i] == nil || pooled.PoolRefs[i].ID != pooled.Issues[i].ID {
+			t.Fatalf("pool ref %d is not aligned with issue: issue=%#v ref=%#v", i, pooled.Issues[i], pooled.PoolRefs[i])
+		}
+	}
+	if pooled.Issues[0].Title != "first" || pooled.Issues[1].ID != "other" {
+		t.Fatalf("unexpected surviving issues: %#v", pooled.Issues)
+	}
+}
+
 type errAfterRead struct {
 	data []byte
 	read bool
@@ -660,7 +845,7 @@ func TestFindJSONLPath_SkipsDeletionsJSONL(t *testing.T) {
 	dir := t.TempDir()
 	// Create deletions.jsonl and another file
 	os.WriteFile(filepath.Join(dir, "deletions.jsonl"), []byte(`{"id":"1"}`), 0644)
-	os.WriteFile(filepath.Join(dir, "other.jsonl"), []byte(`{"id":"2"}`), 0644)
+	os.WriteFile(filepath.Join(dir, "issues.jsonl"), []byte(`{"id":"2"}`), 0644)
 
 	path, err := loader.FindJSONLPath(dir)
 	if err != nil {
@@ -671,7 +856,7 @@ func TestFindJSONLPath_SkipsDeletionsJSONL(t *testing.T) {
 	}
 }
 
-func TestFindJSONLPath_SkipsEmptyPreferredFiles(t *testing.T) {
+func TestFindJSONLPath_PreservesEmptyPreferredFiles(t *testing.T) {
 	dir := t.TempDir()
 	// Create empty beads.jsonl and non-empty other.jsonl
 	os.WriteFile(filepath.Join(dir, "beads.jsonl"), []byte{}, 0644)
@@ -681,48 +866,59 @@ func TestFindJSONLPath_SkipsEmptyPreferredFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	if filepath.Base(path) == "beads.jsonl" {
-		t.Error("Should skip empty beads.jsonl and use non-empty file")
+	if filepath.Base(path) != "beads.jsonl" {
+		t.Errorf("Empty authoritative export must win over unrelated issue-shaped files, got %s", path)
+	}
+	for _, name := range []string{"issues.jsonl", "beads.jsonl"} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "beads.base.jsonl"), []byte(`{"id":"stale"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		path, err := loader.FindJSONLPath(dir)
+		if err != nil || filepath.Base(path) != name {
+			t.Fatalf("empty %s lost to base: path=%s err=%v", name, path, err)
+		}
 	}
 }
 
-func TestFindJSONLPath_ReturnsEmptyFileAsLastResort(t *testing.T) {
-	dir := t.TempDir()
-	// Create only empty files
-	os.WriteFile(filepath.Join(dir, "empty.jsonl"), []byte{}, 0644)
-
-	path, err := loader.FindJSONLPath(dir)
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	if path == "" {
-		t.Error("Should return empty file as last resort")
+func TestFindJSONLPath_RejectsSidecarOnlyDirectory(t *testing.T) {
+	for _, content := range []string{"", `{"id":"stale","title":"snapshot","status":"open"}`} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "sync_base.jsonl"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if path, err := loader.FindJSONLPath(dir); err == nil {
+			t.Fatalf("implicit discovery accepted a sidecar: %s", path)
+		}
 	}
 }
 
 func TestFindJSONLPath_IgnoresDirectories(t *testing.T) {
 	dir := t.TempDir()
 	// Create a directory with .jsonl name and a regular file
-	os.MkdirAll(filepath.Join(dir, "fake.jsonl"), 0755)
-	os.WriteFile(filepath.Join(dir, "real.jsonl"), []byte(`{"id":"1"}`), 0644)
+	os.MkdirAll(filepath.Join(dir, "issues.jsonl"), 0755)
+	os.WriteFile(filepath.Join(dir, "beads.jsonl"), []byte(`{"id":"1"}`), 0644)
 
 	path, err := loader.FindJSONLPath(dir)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	if filepath.Base(path) != "real.jsonl" {
-		t.Errorf("Expected real.jsonl, got: %s", path)
+	if filepath.Base(path) != "beads.jsonl" {
+		t.Errorf("Expected beads.jsonl, got: %s", path)
 	}
 }
 
 func TestFindJSONLPath_FollowsSymlink(t *testing.T) {
 	dir := t.TempDir()
-	target := filepath.Join(dir, "beads.jsonl")
+	target := filepath.Join(dir, "custom.jsonl")
 	if err := os.WriteFile(target, []byte(`{"id":"link-1"}`), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	link := filepath.Join(dir, "beads.link.jsonl")
+	link := filepath.Join(dir, "issues.jsonl")
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("symlinks not supported on this filesystem: %v", err)
 	}
@@ -731,8 +927,8 @@ func TestFindJSONLPath_FollowsSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	if path != target {
-		t.Errorf("Expected to resolve symlink to %s, got %s", target, path)
+	if path != link {
+		t.Errorf("Expected canonical symlink %s, got %s", link, path)
 	}
 }
 
@@ -742,6 +938,11 @@ func TestFindJSONLPath_FollowsSymlink(t *testing.T) {
 
 func TestLoadIssues_NonExistentBeadsDir(t *testing.T) {
 	dir := t.TempDir()
+	// Keep this missing-tracker fixture independent of a repository-nested
+	// TMPDIR. Ancestor discovery is exercised by TestGetBeadsDir_FindsBeadsInGitRepo.
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(dir))
+	t.Setenv("BEADS_DB", "")
+	t.Setenv("BEADS_DIR", "")
 	// Don't create .beads directory
 	_, err := loader.LoadIssues(dir)
 	if err == nil {
@@ -847,12 +1048,22 @@ func TestLoadIssuesFromFile_WhitespaceOnly(t *testing.T) {
 	path := filepath.Join(dir, "whitespace.jsonl")
 	os.WriteFile(path, []byte("\n\n\n   \n\t\n"), 0644)
 
-	issues, err := loader.LoadIssuesFromFile(path)
+	var stats loader.ParseStats
+	warningCount := 0
+	var warnings []string
+	issues, err := loader.LoadIssuesFromFileWithOptions(path, loader.ParseOptions{
+		Stats:          &stats,
+		WarningCount:   &warningCount,
+		WarningHandler: func(message string) { warnings = append(warnings, message) },
+	})
 	if err != nil {
 		t.Fatalf("Whitespace-only file should not error: %v", err)
 	}
 	if len(issues) != 0 {
 		t.Errorf("Expected 0 issues from whitespace-only file, got %d", len(issues))
+	}
+	if stats != (loader.ParseStats{}) || warningCount != 0 || len(warnings) != 0 {
+		t.Fatalf("whitespace-only accounting = %+v, count %d, warnings %v; want all empty", stats, warningCount, warnings)
 	}
 }
 
@@ -969,6 +1180,13 @@ func TestLoadIssuesFromFile_PermissionDenied(t *testing.T) {
 	if err := os.Chmod(path, 0000); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		_ = os.Chmod(path, 0o600)
+	})
+	if readable, openErr := os.Open(path); openErr == nil {
+		_ = readable.Close()
+		t.Skip("permission bits do not make the fixture unreadable for this test user")
+	}
 
 	_, err := loader.LoadIssuesFromFile(path)
 	if err == nil {
@@ -976,6 +1194,47 @@ func TestLoadIssuesFromFile_PermissionDenied(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "failed to open issues file") {
 		t.Errorf("Unexpected error: %v", err)
+	}
+}
+
+func TestLoadIssuesFromFileRejectsNonRegularSource(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("/dev/null is a Unix device")
+	}
+	if _, err := os.Stat("/dev/null"); err != nil {
+		t.Skipf("/dev/null unavailable: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "issues.jsonl")
+	if err := os.Symlink("/dev/null", path); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		load func() error
+	}{
+		{
+			name: "plain",
+			load: func() error {
+				_, err := loader.LoadIssuesFromFileWithOptions(path, loader.ParseOptions{})
+				return err
+			},
+		},
+		{
+			name: "pooled",
+			load: func() error {
+				_, err := loader.LoadIssuesFromFileWithOptionsPooled(path, loader.ParseOptions{})
+				return err
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.load(); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+				t.Fatalf("load error = %v, want a regular-file rejection", err)
+			}
+		})
 	}
 }
 
@@ -1272,9 +1531,11 @@ func TestGetBeadsDir_EmptyRepoPath_UsesCwd(t *testing.T) {
 		}
 	}()
 
-	// Use a temp directory outside git to test pure cwd fallback behavior
-	// (within a git repo, GetBeadsDir now intelligently finds .beads in the repo root)
+	// Explicitly bound Git discovery: t.TempDir can be inside the checkout
+	// when a remote worker supplies TMPDIR. This test owns only the cwd fallback.
 	tmpDir := t.TempDir()
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(tmpDir))
+	t.Setenv("BEADS_DB", "")
 	oldCwd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Failed to get cwd: %v", err)
@@ -1342,35 +1603,41 @@ func TestGetBeadsDir_BeadsDBMissingSQLiteFileUsesParentDir(t *testing.T) {
 }
 
 func TestGetBeadsDir_FindsBeadsInGitRepo(t *testing.T) {
-	// Unset environment variable
-	oldVal := os.Getenv(loader.BeadsDirEnvVar)
-	os.Unsetenv(loader.BeadsDirEnvVar)
-	defer func() {
-		if oldVal != "" {
-			os.Setenv(loader.BeadsDirEnvVar, oldVal)
+	// Exercise real ancestor discovery against an owned repository. A result
+	// borrowed from the source checkout must never satisfy this assertion.
+	t.Setenv("BEADS_DB", "")
+	t.Setenv("BEADS_DIR", "")
+	root := t.TempDir()
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(root))
+	cmd := exec.Command("git", "init", "-b", "main", root)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	beadsDir := filepath.Join(root, ".beads")
+	if err := os.Mkdir(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(root, "services", "api")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, start := range []string{root, nested} {
+		result, err := loader.GetBeadsDir(start)
+		if err != nil {
+			t.Fatalf("GetBeadsDir(%q): %v", start, err)
 		}
-	}()
-
-	// When running from a subdirectory within a git repo that has .beads,
-	// GetBeadsDir should find .beads in the repo root (even via symlinks/worktrees)
-
-	result, err := loader.GetBeadsDir("")
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	// Verify the returned path exists and is a directory
-	info, err := os.Stat(result)
-	if err != nil {
-		t.Fatalf("Returned beads dir does not exist: %s, error: %v", result, err)
-	}
-	if !info.IsDir() {
-		t.Fatalf("Returned beads dir is not a directory: %s", result)
-	}
-
-	// Verify the path ends with .beads
-	if filepath.Base(result) != ".beads" {
-		t.Errorf("Returned path should end with .beads: got %s", result)
+		// Git resolves symlinks in its reported root (notably /var on macOS).
+		resolved, err := filepath.EvalSymlinks(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := filepath.EvalSymlinks(beadsDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resolved != want {
+			t.Fatalf("GetBeadsDir(%q) = %q, want owned ancestor %q", start, resolved, want)
+		}
 	}
 }
 
@@ -1414,6 +1681,119 @@ func TestGetBeadsDir_FollowsRedirect(t *testing.T) {
 	wantAbs, _ := filepath.Abs(target)
 	if result != wantAbs {
 		t.Errorf("redirect not followed: got %s, want %s", result, wantAbs)
+	}
+}
+
+func TestGetBeadsDirWithTraceFollowsEnvironmentDirectoryRedirects(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source", ".beads")
+	target := filepath.Join(root, "target", ".beads")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "redirect"), []byte("../../target/.beads\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, envName := range []string{loader.BeadsDirEnvVar, loader.BeadsDBEnvVar} {
+		t.Run(envName, func(t *testing.T) {
+			t.Setenv(loader.BeadsDBEnvVar, "")
+			t.Setenv(loader.BeadsDirEnvVar, "")
+			t.Setenv(envName, source)
+			got, trace, err := loader.GetBeadsDirWithTrace(filepath.Join(root, "ignored"))
+			if err != nil {
+				t.Fatalf("GetBeadsDirWithTrace: %v", err)
+			}
+			if got != target {
+				t.Fatalf("resolved directory = %s, want %s", got, target)
+			}
+			wantTrace := []string{filepath.Join(source, "redirect"), filepath.Join(target, "redirect")}
+			if len(trace) != len(wantTrace) {
+				t.Fatalf("trace = %v, want %v", trace, wantTrace)
+			}
+			for i := range wantTrace {
+				if trace[i] != wantTrace[i] {
+					t.Fatalf("trace[%d] = %s, want %s", i, trace[i], wantTrace[i])
+				}
+			}
+		})
+	}
+}
+
+func TestGetBeadsDirConcreteDatabaseFileDoesNotFollowParentRedirect(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source", ".beads")
+	target := filepath.Join(root, "target", ".beads")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "redirect"), []byte("../../target/.beads\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(source, "beads.db")
+	if err := os.WriteFile(database, []byte("database"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(loader.BeadsDBEnvVar, database)
+	t.Setenv(loader.BeadsDirEnvVar, "")
+
+	got, trace, err := loader.GetBeadsDirWithTrace(root)
+	if err != nil {
+		t.Fatalf("GetBeadsDirWithTrace: %v", err)
+	}
+	if got != source || len(trace) != 0 {
+		t.Fatalf("concrete database route = (%s, %v), want pinned parent %s with no redirect trace", got, trace, source)
+	}
+}
+
+func TestResolveBeadsDirRejectsRedirectDirectory(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "redirect"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loader.ResolveBeadsDirWithTrace(beadsDir); err == nil {
+		t.Fatal("directory at redirect path was treated as an absent redirect")
+	}
+}
+
+func TestResolveBeadsDirRejectsNonRegularRedirect(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("/dev/null is a Unix device")
+	}
+	if _, err := os.Stat("/dev/null"); err != nil {
+		t.Skipf("/dev/null unavailable: %v", err)
+	}
+
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/dev/null", filepath.Join(beadsDir, "redirect")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	if _, _, err := loader.ResolveBeadsDirWithTrace(beadsDir); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("non-regular redirect error = %v, want a regular-file rejection", err)
+	}
+}
+
+func TestResolveBeadsDirRejectsOversizedRedirect(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "redirect"), []byte(strings.Repeat("x", 4097)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := loader.ResolveBeadsDirWithTrace(beadsDir); err == nil || !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Fatalf("oversized redirect error = %v, want a size-limit rejection", err)
 	}
 }
 
@@ -1526,5 +1906,23 @@ func TestFindJSONLPath_BDWorkspaceAcceptsEmptyIssuesJSONL(t *testing.T) {
 	}
 	if got != issuesPath {
 		t.Fatalf("FindJSONLPath() = %q, want %q (empty export = legitimately empty project)", got, issuesPath)
+	}
+}
+
+// TestMetrics_LoaderParseRecorded (B5): every file load records a
+// loader.parse timing so --robot-metrics can show how long parsing took.
+func TestMetrics_LoaderParseRecorded(t *testing.T) {
+	metrics.SetEnabled(true)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "issues.jsonl")
+	if err := os.WriteFile(path, []byte(`{"id":"M-1","title":"one","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := metrics.LoaderParse.Count()
+	if _, err := loader.LoadIssuesFromFileWithOptions(path, loader.ParseOptions{}); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := metrics.LoaderParse.Count() - before; got != 1 {
+		t.Fatalf("loader.parse count advanced by %d, want 1", got)
 	}
 }

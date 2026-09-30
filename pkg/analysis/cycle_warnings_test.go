@@ -46,9 +46,52 @@ func TestDetectCycleWarnings_NoCycle(t *testing.T) {
 	}
 }
 
+func TestDetectCycleWarnings_SingleIssueSelfLoop(t *testing.T) {
+	issues := []model.Issue{{
+		ID:     "self",
+		Title:  "Self loop",
+		Status: model.StatusOpen,
+		Dependencies: []*model.Dependency{{
+			DependsOnID: "self",
+			Type:        model.DepBlocks,
+		}},
+	}}
+
+	config := DefaultCycleWarningConfig()
+	suggestions := DetectCycleWarnings(issues, config)
+	if len(suggestions) != 1 || !strings.Contains(suggestions[0].Summary, "Self-loop") {
+		t.Fatalf("self-loop suggestions=%v, want one self-loop warning", suggestions)
+	}
+
+	config.IncludeSelfLoops = false
+	if suggestions := DetectCycleWarnings(issues, config); len(suggestions) != 0 {
+		t.Fatalf("excluded self-loop produced %d suggestions", len(suggestions))
+	}
+}
+
+func TestDetectCycleWarnings_SkippedSelfLoopsDoNotConsumeLimit(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+		{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "C", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "D", Type: model.DepBlocks}}},
+		{ID: "D", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "C", Type: model.DepBlocks}}},
+	}
+	config := DefaultCycleWarningConfig()
+	config.MaxCycles = 1
+	config.IncludeSelfLoops = false
+
+	suggestions := DetectCycleWarnings(issues, config)
+	if len(suggestions) != 1 || !strings.Contains(suggestions[0].Summary, "Direct cycle") {
+		t.Fatalf("suggestions=%v, want the non-self direct cycle", suggestions)
+	}
+}
+
 func TestDetectCycleWarnings_SimpleCycle(t *testing.T) {
 	config := DefaultCycleWarningConfig()
 	issues := testutil.QuickCycle(3)
+	for i := range issues {
+		issues[i].Origin = suggestionTestOrigin(issues[i].ID)
+	}
 
 	suggestions := DetectCycleWarnings(issues, config)
 	if len(suggestions) == 0 {
@@ -64,8 +107,8 @@ func TestDetectCycleWarnings_SimpleCycle(t *testing.T) {
 		if sug.ActionCommand == "" {
 			t.Error("expected action command to be set")
 		}
-		if !strings.Contains(sug.ActionCommand, "br dep remove") {
-			t.Errorf("expected action to contain 'br dep remove', got %s", sug.ActionCommand)
+		if !strings.Contains(sug.ActionCommand, "'dep' 'remove'") {
+			t.Errorf("expected routed dependency removal, got %s", sug.ActionCommand)
 		}
 	}
 }

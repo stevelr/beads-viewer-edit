@@ -287,6 +287,47 @@ func saveSearchEnv() func() {
 	}
 }
 
+// A preset only affects hybrid ranking, so BV_SEARCH_PRESET alone must switch
+// the mode to hybrid instead of being silently ignored under the text default.
+func TestSearchConfigFromEnv_PresetImpliesHybrid(t *testing.T) {
+	restore := saveSearchEnv()
+	t.Cleanup(restore)
+	os.Unsetenv(EnvSearchMode)
+	os.Unsetenv(EnvSearchWeights)
+
+	os.Setenv(EnvSearchPreset, string(PresetImpactFirst))
+	cfg, err := SearchConfigFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Mode != SearchModeHybrid || cfg.Preset != PresetImpactFirst {
+		t.Fatalf("preset alone: mode=%q preset=%q, want hybrid/impact-first", cfg.Mode, cfg.Preset)
+	}
+
+	os.Setenv(EnvSearchPreset, string(PresetTextOnly))
+	cfg, err = SearchConfigFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Mode != SearchModeText {
+		t.Fatalf("text-only preset: mode=%q, want text", cfg.Mode)
+	}
+
+	// An explicit hybrid mode with a preset is unchanged.
+	os.Setenv(EnvSearchMode, string(SearchModeHybrid))
+	os.Setenv(EnvSearchPreset, string(PresetBugHunting))
+	cfg, err = SearchConfigFromEnv()
+	if err != nil || cfg.Mode != SearchModeHybrid || cfg.Preset != PresetBugHunting {
+		t.Fatalf("explicit hybrid + preset: cfg=%+v err=%v", cfg, err)
+	}
+
+	// An explicit text mode with a hybrid preset is a contradiction.
+	os.Setenv(EnvSearchMode, string(SearchModeText))
+	if _, err := SearchConfigFromEnv(); err == nil {
+		t.Fatal("BV_SEARCH_MODE=text with a hybrid preset must be rejected")
+	}
+}
+
 // =============================================================================
 // NewEmbedderFromConfig Tests
 // =============================================================================

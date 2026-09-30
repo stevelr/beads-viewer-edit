@@ -29,6 +29,37 @@ type NetworkEdge struct {
 	Details  []string        `json:"details"` // Sample commit SHAs or file paths
 }
 
+// networkEdgeKey is the lossless internal identity of a typed edge. Bead IDs
+// are opaque strings and may themselves contain punctuation such as ':', so
+// delimiter-joined keys cannot be parsed safely.
+type networkEdgeKey struct {
+	fromBead string
+	toBead   string
+	edgeType NetworkEdgeType
+}
+
+// networkPair is the identity of an unordered relationship between two beads.
+// Typed edges remain distinct in ImpactNetwork.Edges, while simple-graph
+// metrics (degree, density, and connectivity) count each pair only once.
+type networkPair struct {
+	first  string
+	second string
+}
+
+func makeNetworkEdgeKey(beadA, beadB string, edgeType NetworkEdgeType) networkEdgeKey {
+	if beadA > beadB {
+		beadA, beadB = beadB, beadA
+	}
+	return networkEdgeKey{fromBead: beadA, toBead: beadB, edgeType: edgeType}
+}
+
+func makeNetworkPair(beadA, beadB string) networkPair {
+	if beadA > beadB {
+		beadA, beadB = beadB, beadA
+	}
+	return networkPair{first: beadA, second: beadB}
+}
+
 // NetworkNode represents a bead in the impact network.
 type NetworkNode struct {
 	BeadID       string    `json:"bead_id"`
@@ -140,8 +171,15 @@ func (nb *NetworkBuilder) buildBeadMaps() {
 
 // Build constructs the full impact network.
 func (nb *NetworkBuilder) Build() *ImpactNetwork {
+	return nb.BuildAt(time.Now())
+}
+
+// BuildAt constructs the full impact network at a caller-owned reference
+// instant. The instant is metadata only; graph contents come from the report.
+// The zero instant is valid and is preserved.
+func (nb *NetworkBuilder) BuildAt(now time.Time) *ImpactNetwork {
 	network := &ImpactNetwork{
-		GeneratedAt: time.Now(),
+		GeneratedAt: now,
 		Nodes:       make(map[string]*NetworkNode),
 		Edges:       []NetworkEdge{},
 		Clusters:    []BeadCluster{},
@@ -172,16 +210,7 @@ func (nb *NetworkBuilder) Build() *ImpactNetwork {
 			FileCount:   len(nb.beadFiles[beadID]),
 		}
 
-		// Set last activity from milestones or commits
-		if history.Milestones.Closed != nil {
-			node.LastActivity = history.Milestones.Closed.Timestamp
-		} else if history.Milestones.Claimed != nil {
-			node.LastActivity = history.Milestones.Claimed.Timestamp
-		} else if history.Milestones.Created != nil {
-			node.LastActivity = history.Milestones.Created.Timestamp
-		} else if len(history.Commits) > 0 {
-			node.LastActivity = history.Commits[len(history.Commits)-1].Timestamp
-		}
+		node.LastActivity = latestHistoryActivity(history)
 
 		network.Nodes[beadID] = node
 	}
@@ -194,16 +223,17 @@ func (nb *NetworkBuilder) Build() *ImpactNetwork {
 
 	// Build edges from explicit blocking dependencies
 	nb.addDependencyEdges(network)
+	sort.Slice(network.Edges, func(i, j int) bool {
+		if network.Edges[i].FromBead != network.Edges[j].FromBead {
+			return network.Edges[i].FromBead < network.Edges[j].FromBead
+		}
+		if network.Edges[i].ToBead != network.Edges[j].ToBead {
+			return network.Edges[i].ToBead < network.Edges[j].ToBead
+		}
+		return network.Edges[i].EdgeType < network.Edges[j].EdgeType
+	})
 
-	// Update node degrees
-	for _, edge := range network.Edges {
-		if node, ok := network.Nodes[edge.FromBead]; ok {
-			node.Degree++
-		}
-		if node, ok := network.Nodes[edge.ToBead]; ok {
-			node.Degree++
-		}
-	}
+	nb.recomputeNodeDegrees(network)
 
 	// Detect clusters using connected components with edge weight threshold
 	nb.detectClusters(network)
@@ -212,6 +242,54 @@ func (nb *NetworkBuilder) Build() *ImpactNetwork {
 	nb.calculateStats(network)
 
 	return network
+}
+
+// recomputeNodeDegrees resets and recounts every node's Degree from the final
+// edge list. Each edge contributes one degree to both of its endpoints, so a
+// pair of beads linked by multiple edge types (shared commit, shared file,
+// dependency) counts once per edge — matching the historical inline
+// degree-update loop this method replaced.
+func (nb *NetworkBuilder) recomputeNodeDegrees(network *ImpactNetwork) {
+	if network == nil {
+		return
+	}
+	for _, node := range network.Nodes {
+		node.Degree = 0
+	}
+	for _, edge := range network.Edges {
+		if node, ok := network.Nodes[edge.FromBead]; ok {
+			node.Degree++
+		}
+		if node, ok := network.Nodes[edge.ToBead]; ok {
+			node.Degree++
+		}
+	}
+}
+
+func latestHistoryActivity(history BeadHistory) time.Time {
+	var latest time.Time
+	consider := func(timestamp time.Time) {
+		if timestamp.After(latest) {
+			latest = timestamp
+		}
+	}
+	for _, milestone := range []*BeadEvent{
+		history.Milestones.Created,
+		history.Milestones.Claimed,
+		history.Milestones.Closed,
+		history.Milestones.Reopened,
+	} {
+		if milestone != nil {
+			consider(milestone.Timestamp)
+		}
+	}
+	for _, event := range history.Events {
+		consider(event.Timestamp)
+	}
+	for _, commit := range history.Commits {
+		consider(commit.Timestamp)
+	}
+	return latest
 }
 
 // addSharedCommitEdges adds edges for beads that share commits.
@@ -223,58 +301,50 @@ func (nb *NetworkBuilder) addSharedCommitEdges(network *ImpactNetwork) {
 	}
 
 	// Track edges we've already added (to avoid duplicates)
-	edgeSet := make(map[string]bool)
-	edgeWeights := make(map[string]int)
-	edgeDetails := make(map[string][]string)
+	edgeSet := make(map[networkEdgeKey]struct{})
+	edgeWeights := make(map[networkEdgeKey]int)
+	edgeDetails := make(map[networkEdgeKey][]string)
 
 	for sha, beadIDs := range commitToBeads {
 		if len(beadIDs) < 2 {
 			continue
 		}
 
-		// Create edges between all pairs of beads
-		for i := 0; i < len(beadIDs); i++ {
-			for j := i + 1; j < len(beadIDs); j++ {
-				beadA, beadB := beadIDs[i], beadIDs[j]
-				// Ensure consistent ordering
-				if beadA > beadB {
-					beadA, beadB = beadB, beadA
-				}
-				key := beadA + ":" + beadB + ":commit"
+		// A malformed or hand-built CommitIndex may repeat a bead ID. Normalize
+		// each membership list so a commit contributes once per distinct pair.
+		uniqueBeads := uniqueSortedStrings(beadIDs)
+		for i := 0; i < len(uniqueBeads); i++ {
+			for j := i + 1; j < len(uniqueBeads); j++ {
+				key := makeNetworkEdgeKey(uniqueBeads[i], uniqueBeads[j], EdgeSharedCommit)
 
 				edgeWeights[key]++
-				if !edgeSet[key] {
-					edgeSet[key] = true
-				}
-				if len(edgeDetails[key]) < 5 { // Keep up to 5 sample SHAs
-					edgeDetails[key] = append(edgeDetails[key], shortSHA(sha))
-				}
+				edgeSet[key] = struct{}{}
+				edgeDetails[key] = append(edgeDetails[key], shortSHA(sha))
 			}
 		}
 	}
 
 	// Convert to edge list
-	for key := range edgeSet {
-		// Parse key back to beads
-		parts := splitEdgeKey(key)
-		if len(parts) >= 2 {
-			network.Edges = append(network.Edges, NetworkEdge{
-				FromBead: parts[0],
-				ToBead:   parts[1],
-				EdgeType: EdgeSharedCommit,
-				Weight:   edgeWeights[key],
-				Details:  edgeDetails[key],
-			})
-		}
+	for _, key := range sortedNetworkEdgeKeys(edgeSet) {
+		details := append([]string(nil), edgeDetails[key]...)
+		sort.Strings(details)
+		details = limitStrings(details, 5)
+		network.Edges = append(network.Edges, NetworkEdge{
+			FromBead: key.fromBead,
+			ToBead:   key.toBead,
+			EdgeType: key.edgeType,
+			Weight:   edgeWeights[key],
+			Details:  details,
+		})
 	}
 }
 
 // addSharedFileEdges adds edges for beads that touch the same files.
 func (nb *NetworkBuilder) addSharedFileEdges(network *ImpactNetwork) {
 	// Track edges we've already added (to avoid duplicates and combine with commit edges)
-	edgeSet := make(map[string]bool)
-	edgeWeights := make(map[string]int)
-	edgeDetails := make(map[string][]string)
+	edgeSet := make(map[networkEdgeKey]struct{})
+	edgeWeights := make(map[networkEdgeKey]int)
+	edgeDetails := make(map[networkEdgeKey][]string)
 
 	// For each file, find all beads that touched it
 	for filePath, refs := range nb.fileIndex.FileToBeads {
@@ -285,36 +355,30 @@ func (nb *NetworkBuilder) addSharedFileEdges(network *ImpactNetwork) {
 		// Create edges between all pairs of beads touching this file
 		for i := 0; i < len(refs); i++ {
 			for j := i + 1; j < len(refs); j++ {
-				beadA, beadB := refs[i].BeadID, refs[j].BeadID
-				// Ensure consistent ordering
-				if beadA > beadB {
-					beadA, beadB = beadB, beadA
+				if refs[i].BeadID == refs[j].BeadID {
+					continue
 				}
-				key := beadA + ":" + beadB + ":file"
+				key := makeNetworkEdgeKey(refs[i].BeadID, refs[j].BeadID, EdgeSharedFile)
 
 				edgeWeights[key]++
-				if !edgeSet[key] {
-					edgeSet[key] = true
-				}
-				if len(edgeDetails[key]) < 5 { // Keep up to 5 sample files
-					edgeDetails[key] = append(edgeDetails[key], filePath)
-				}
+				edgeSet[key] = struct{}{}
+				edgeDetails[key] = append(edgeDetails[key], filePath)
 			}
 		}
 	}
 
 	// Convert to edge list
-	for key := range edgeSet {
-		parts := splitEdgeKey(key)
-		if len(parts) >= 2 {
-			network.Edges = append(network.Edges, NetworkEdge{
-				FromBead: parts[0],
-				ToBead:   parts[1],
-				EdgeType: EdgeSharedFile,
-				Weight:   edgeWeights[key],
-				Details:  edgeDetails[key],
-			})
-		}
+	for _, key := range sortedNetworkEdgeKeys(edgeSet) {
+		details := append([]string(nil), edgeDetails[key]...)
+		sort.Strings(details)
+		details = limitStrings(details, 5)
+		network.Edges = append(network.Edges, NetworkEdge{
+			FromBead: key.fromBead,
+			ToBead:   key.toBead,
+			EdgeType: key.edgeType,
+			Weight:   edgeWeights[key],
+			Details:  details,
+		})
 	}
 }
 
@@ -324,9 +388,9 @@ func (nb *NetworkBuilder) addDependencyEdges(network *ImpactNetwork) {
 		return
 	}
 
-	edgeSet := make(map[string]bool)
-	edgeWeights := make(map[string]int)
-	edgeDetails := make(map[string][]string)
+	edgeSet := make(map[networkEdgeKey]struct{})
+	edgeWeights := make(map[networkEdgeKey]int)
+	edgeDetails := make(map[networkEdgeKey][]string)
 
 	for _, issue := range nb.issues {
 		fromID := issue.ID
@@ -348,47 +412,57 @@ func (nb *NetworkBuilder) addDependencyEdges(network *ImpactNetwork) {
 				continue
 			}
 
-			beadA, beadB := fromID, toID
-			if beadA > beadB {
-				beadA, beadB = beadB, beadA
-			}
-			key := beadA + ":" + beadB + ":dep"
+			key := makeNetworkEdgeKey(fromID, toID, EdgeDependency)
 
 			edgeWeights[key]++
-			edgeSet[key] = true
-			if len(edgeDetails[key]) < 5 {
-				edgeDetails[key] = append(edgeDetails[key], fromID+" -> "+toID)
-			}
+			edgeSet[key] = struct{}{}
+			edgeDetails[key] = append(edgeDetails[key], fromID+" -> "+toID)
 		}
 	}
 
-	for key := range edgeSet {
-		parts := splitEdgeKey(key)
-		if len(parts) >= 2 {
-			network.Edges = append(network.Edges, NetworkEdge{
-				FromBead: parts[0],
-				ToBead:   parts[1],
-				EdgeType: EdgeDependency,
-				Weight:   edgeWeights[key],
-				Details:  edgeDetails[key],
-			})
-		}
+	for _, key := range sortedNetworkEdgeKeys(edgeSet) {
+		details := append([]string(nil), edgeDetails[key]...)
+		sort.Strings(details)
+		details = limitStrings(details, 5)
+		network.Edges = append(network.Edges, NetworkEdge{
+			FromBead: key.fromBead,
+			ToBead:   key.toBead,
+			EdgeType: key.edgeType,
+			Weight:   edgeWeights[key],
+			Details:  details,
+		})
 	}
 }
 
-// splitEdgeKey parses "beadA:beadB:type" back to parts.
-func splitEdgeKey(key string) []string {
-	result := []string{}
-	start := 0
-	for i := 0; i < len(key); i++ {
-		if key[i] == ':' {
-			result = append(result, key[start:i])
-			start = i + 1
+func sortedNetworkEdgeKeys(edgeSet map[networkEdgeKey]struct{}) []networkEdgeKey {
+	keys := make([]networkEdgeKey, 0, len(edgeSet))
+	for key := range edgeSet {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].fromBead != keys[j].fromBead {
+			return keys[i].fromBead < keys[j].fromBead
+		}
+		if keys[i].toBead != keys[j].toBead {
+			return keys[i].toBead < keys[j].toBead
+		}
+		return keys[i].edgeType < keys[j].edgeType
+	})
+	return keys
+}
+
+func uniqueSortedStrings(values []string) []string {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if value != "" {
+			set[value] = struct{}{}
 		}
 	}
-	if start < len(key) {
-		result = append(result, key[start:])
+	result := make([]string, 0, len(set))
+	for value := range set {
+		result = append(result, value)
 	}
+	sort.Strings(result)
 	return result
 }
 
@@ -410,7 +484,15 @@ func (nb *NetworkBuilder) detectClusters(network *ImpactNetwork) {
 	visited := make(map[string]bool)
 	clusterID := 0
 
+	nodeIDs := make([]string, 0, len(network.Nodes))
 	for beadID := range network.Nodes {
+		nodeIDs = append(nodeIDs, beadID)
+	}
+	sort.Strings(nodeIDs)
+	for beadID := range adj {
+		sort.Strings(adj[beadID])
+	}
+	for _, beadID := range nodeIDs {
 		if visited[beadID] {
 			continue
 		}
@@ -442,6 +524,7 @@ func (nb *NetworkBuilder) detectClusters(network *ImpactNetwork) {
 
 		// Only create cluster if it has multiple beads
 		if len(component) >= 2 {
+			sort.Strings(component)
 			cluster := nb.buildCluster(clusterID, component, network)
 			network.Clusters = append(network.Clusters, cluster)
 
@@ -458,7 +541,10 @@ func (nb *NetworkBuilder) detectClusters(network *ImpactNetwork) {
 
 	// Sort clusters by size (largest first)
 	sort.Slice(network.Clusters, func(i, j int) bool {
-		return len(network.Clusters[i].BeadIDs) > len(network.Clusters[j].BeadIDs)
+		if len(network.Clusters[i].BeadIDs) != len(network.Clusters[j].BeadIDs) {
+			return len(network.Clusters[i].BeadIDs) > len(network.Clusters[j].BeadIDs)
+		}
+		return network.Clusters[i].BeadIDs[0] < network.Clusters[j].BeadIDs[0]
 	})
 
 	// Re-number cluster IDs after sorting
@@ -802,7 +888,10 @@ func (network *ImpactNetwork) ToResult(beadID string, depth int) *ImpactNetworkR
 		nodes = append(nodes, *node)
 	}
 	sort.Slice(nodes, func(i, j int) bool {
-		return nodes[i].Degree > nodes[j].Degree
+		if nodes[i].Degree != nodes[j].Degree {
+			return nodes[i].Degree > nodes[j].Degree
+		}
+		return nodes[i].BeadID < nodes[j].BeadID
 	})
 
 	nodeLimit := 10

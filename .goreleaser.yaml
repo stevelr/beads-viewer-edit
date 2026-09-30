@@ -1,6 +1,14 @@
 version: 2
 
 project_name: bv
+dist: /tmp/bv-dist
+before:
+  hooks:
+    - bash scripts/release_gate.sh verify-source
+# Packaging and publication are separate: release_gate.sh package seals the
+# final archive hashes before an explicitly authorized publication operation.
+release:
+  disable: true
 builds:
   - main: ./cmd/bv
     binary: bv
@@ -10,6 +18,12 @@ builds:
     # build on the runner links glibc dynamically.
     env:
       - CGO_ENABLED=0
+      - GOWORK=off
+    flags:
+      - -buildvcs=true
+    hooks:
+      post:
+        - bash scripts/release_gate.sh verify-binary "{{ .Path }}"
     ldflags:
       - -s -w
       - -X github.com/Dicklesworthstone/beads_viewer/pkg/version.version=v{{.Version}}
@@ -31,8 +45,12 @@ archives:
       - goos: windows
         formats:
           - zip
+    # Versioned names (#195): bv_<version>_<os>_<arch>.<ext>, so `gh release
+    # download` users can tell releases apart by file name. The updater and
+    # install.sh accept both this and the previous unversioned form.
     name_template: >-
       {{ .ProjectName }}_
+      {{- .Version }}_
       {{- .Os }}_
       {{- .Arch }}
 

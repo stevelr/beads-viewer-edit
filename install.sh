@@ -337,7 +337,7 @@ is_tty() {
 }
 
 ensure_go() {
-    local min_version="1.21"
+    local min_version="1.26"
     local go_version=""
 
     if command -v go >/dev/null 2>&1; then
@@ -455,18 +455,57 @@ try_binary_install() {
         return 1
     fi
 
+    # Verify the archive against the release's published checksums.txt
+    # (produced by goreleaser). Fail closed: no checksum, no install.
+    if [ -z "$asset_name" ]; then
+        asset_name="${download_url##*/}"
+    fi
+    local checksums_url="${download_url%/*}/checksums.txt"
+    local checksums_path="$tmp_dir/checksums.txt"
+    # Note: these paths exit (not return) so a verification failure can never
+    # silently fall back to the unverified build-from-main path.
+    if ! download_file "$checksums_url" "$checksums_path"; then
+        print_error "Could not download checksums.txt from the release; refusing unverified install"
+        exit 1
+    fi
+    local expected_sha actual_sha
+    expected_sha=$(awk -v n="$asset_name" '$2 == n || $2 == ("*" n) {print $1; exit}' "$checksums_path")
+    if [ -z "$expected_sha" ]; then
+        print_error "checksums.txt does not list $asset_name; refusing to install"
+        exit 1
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual_sha=$(sha256sum "$archive_path" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual_sha=$(shasum -a 256 "$archive_path" | awk '{print $1}')
+    else
+        print_error "No SHA-256 tool (sha256sum/shasum) available; refusing unverified install"
+        exit 1
+    fi
+    if [ "$expected_sha" != "$actual_sha" ]; then
+        print_error "SHA-256 mismatch for $asset_name: expected $expected_sha, got $actual_sha"
+        exit 1
+    fi
+    print_info "SHA-256 verified against release checksums.txt"
+
     # Extract the binary
     print_info "Extracting..."
 
     if [[ "$ext" == ".zip" ]]; then
         if command -v unzip >/dev/null 2>&1; then
-            unzip -q "$archive_path" -d "$tmp_dir"
+            if ! unzip -q "$archive_path" -d "$tmp_dir"; then
+                print_error "Release archive could not be extracted; existing installation was not changed"
+                exit 1
+            fi
         else
             print_warn "unzip not found"
             return 1
         fi
     else
-        tar -xzf "$archive_path" -C "$tmp_dir"
+        if ! tar -xzf "$archive_path" -C "$tmp_dir"; then
+            print_error "Release archive could not be extracted; existing installation was not changed"
+            exit 1
+        fi
     fi
 
     # Find the binary in extracted contents
@@ -483,11 +522,30 @@ try_binary_install() {
     fi
 
     if [ -z "$binary_path" ]; then
-        print_warn "Binary not found in archive"
-        return 1
+        print_error "Binary not found in release archive; existing installation was not changed"
+        exit 1
     fi
 
     chmod +x "$binary_path"
+
+    # A valid archive checksum does not prove it contains the requested release.
+    # Verify before replacing a working installation, and never fall back to a
+    # source build after an identity failure.
+    local reported reported_version
+    if ! reported=$("$binary_path" --version 2>&1); then
+        print_error "Downloaded binary could not report its version: $reported"
+        exit 1
+    fi
+    if [[ "$reported" =~ ^bv[[:space:]]+(v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]]; then
+        reported_version="${BASH_REMATCH[1]}"
+    else
+        print_error "Unexpected --version output from downloaded binary: $reported"
+        exit 1
+    fi
+    if [ "${reported_version#v}" != "${version#v}" ]; then
+        print_error "Downloaded binary reports $reported_version, expected $version; existing installation was not changed"
+        exit 1
+    fi
 
     # Install to destination
     ensure_install_dir "$INSTALL_DIR"
@@ -509,7 +567,7 @@ try_go_install() {
 
     local go_version
     if ! go_version=$(ensure_go); then
-        print_error "Go 1.21 or later is required for building from source."
+        print_error "Go 1.26 or later is required for building from source."
         exit 1
     fi
 

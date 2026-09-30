@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	json "github.com/goccy/go-json"
 )
 
@@ -52,7 +53,7 @@ import (
 // serialized-size ceiling so it cannot grow without bound.
 
 const (
-	perCommitEventCacheVersion     = 1
+	perCommitEventCacheVersion     = 2
 	perCommitEventCacheFileName    = "correlation_per_commit_event_cache.json"
 	perCommitEventCacheMaxAge      = 30 * 24 * time.Hour // commits are immutable; keep a month
 	perCommitEventCacheMaxCommits  = 4000                // bound the accumulating commit map
@@ -94,7 +95,7 @@ func perCommitEventCacheNamespace(primaryFile, beadID string) string {
 }
 
 func perCommitEventCachePath(create bool) (string, error) {
-	base := os.Getenv("BV_CACHE_DIR")
+	base := env.CacheDir.Get()
 	if base == "" {
 		dir, err := os.UserCacheDir()
 		if err != nil {
@@ -213,7 +214,7 @@ func pruneAndBoundPerCommitEntries(now time.Time, entries map[string]perCommitNa
 	var all []item
 	for ns, bucket := range entries {
 		for sha, e := range bucket.Commits {
-			if e.CreatedAt.IsZero() || now.Sub(e.CreatedAt) > perCommitEventCacheMaxAge {
+			if !cacheCreatedAtIsFresh(e.CreatedAt, now, perCommitEventCacheMaxAge) {
 				delete(bucket.Commits, sha)
 				continue
 			}
@@ -279,7 +280,7 @@ func loadPerCommitEvents(namespace string) map[string]perCommitEventEntry {
 	// Filter aged entries out of the returned view without rewriting the file.
 	out := make(map[string]perCommitEventEntry, len(bucket.Commits))
 	for sha, e := range bucket.Commits {
-		if e.CreatedAt.IsZero() || now.Sub(e.CreatedAt) > perCommitEventCacheMaxAge {
+		if !cacheCreatedAtIsFresh(e.CreatedAt, now, perCommitEventCacheMaxAge) {
 			continue
 		}
 		out[sha] = e

@@ -12,30 +12,39 @@ import (
 // Schema version for tracking migrations
 const SchemaVersion = 1
 
-// CreateSchema creates all tables, indexes, and triggers in the database.
+// CreateSchema creates all tables and indexes in one durable transaction.
 func CreateSchema(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin schema: %w", err)
+	}
+	defer tx.Rollback()
+
 	// Create tables in order of dependencies
-	if err := createCoreTables(db); err != nil {
+	if err := createCoreTables(tx); err != nil {
 		return fmt.Errorf("create core tables: %w", err)
 	}
 
-	if err := createMetricsTables(db); err != nil {
+	if err := createMetricsTables(tx); err != nil {
 		return fmt.Errorf("create metrics tables: %w", err)
 	}
 
-	if err := createIndexes(db); err != nil {
+	if err := createIndexes(tx); err != nil {
 		return fmt.Errorf("create indexes: %w", err)
 	}
 
-	if err := createMetaTable(db); err != nil {
+	if err := createMetaTable(tx); err != nil {
 		return fmt.Errorf("create meta table: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit schema: %w", err)
 	}
 
 	return nil
 }
 
 // createCoreTables creates the issues, dependencies, and comments tables.
-func createCoreTables(db *sql.DB) error {
+func createCoreTables(tx *sql.Tx) error {
 	// Issues table - core issue data
 	issuesSQL := `
 		CREATE TABLE IF NOT EXISTS issues (
@@ -55,7 +64,7 @@ func createCoreTables(db *sql.DB) error {
 			closed_at TEXT
 		)
 	`
-	if _, err := db.Exec(issuesSQL); err != nil {
+	if _, err := tx.Exec(issuesSQL); err != nil {
 		return fmt.Errorf("create issues table: %w", err)
 	}
 
@@ -70,7 +79,7 @@ func createCoreTables(db *sql.DB) error {
 			FOREIGN KEY (depends_on_id) REFERENCES issues(id)
 		)
 	`
-	if _, err := db.Exec(depsSQL); err != nil {
+	if _, err := tx.Exec(depsSQL); err != nil {
 		return fmt.Errorf("create dependencies table: %w", err)
 	}
 
@@ -86,7 +95,7 @@ func createCoreTables(db *sql.DB) error {
 			FOREIGN KEY (issue_id) REFERENCES issues(id)
 		)
 	`
-	if _, err := db.Exec(commentsSQL); err != nil {
+	if _, err := tx.Exec(commentsSQL); err != nil {
 		return fmt.Errorf("create comments table: %w", err)
 	}
 
@@ -94,7 +103,7 @@ func createCoreTables(db *sql.DB) error {
 }
 
 // createMetricsTables creates tables for computed graph metrics.
-func createMetricsTables(db *sql.DB) error {
+func createMetricsTables(tx *sql.Tx) error {
 	// Issue metrics - computed by bv analysis
 	metricsSQL := `
 		CREATE TABLE IF NOT EXISTS issue_metrics (
@@ -108,7 +117,7 @@ func createMetricsTables(db *sql.DB) error {
 			FOREIGN KEY (issue_id) REFERENCES issues(id)
 		)
 	`
-	if _, err := db.Exec(metricsSQL); err != nil {
+	if _, err := tx.Exec(metricsSQL); err != nil {
 		return fmt.Errorf("create issue_metrics table: %w", err)
 	}
 
@@ -124,7 +133,7 @@ func createMetricsTables(db *sql.DB) error {
 			FOREIGN KEY (issue_id) REFERENCES issues(id)
 		)
 	`
-	if _, err := db.Exec(triageSQL); err != nil {
+	if _, err := tx.Exec(triageSQL); err != nil {
 		return fmt.Errorf("create triage_recommendations table: %w", err)
 	}
 
@@ -132,7 +141,7 @@ func createMetricsTables(db *sql.DB) error {
 }
 
 // createIndexes creates performance indexes for common queries.
-func createIndexes(db *sql.DB) error {
+func createIndexes(tx *sql.Tx) error {
 	indexes := []string{
 		// Issues indexes
 		`CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status)`,
@@ -155,7 +164,7 @@ func createIndexes(db *sql.DB) error {
 	}
 
 	for _, sql := range indexes {
-		if _, err := db.Exec(sql); err != nil {
+		if _, err := tx.Exec(sql); err != nil {
 			return fmt.Errorf("create index: %w", err)
 		}
 	}
@@ -164,14 +173,14 @@ func createIndexes(db *sql.DB) error {
 }
 
 // createMetaTable creates the export metadata table.
-func createMetaTable(db *sql.DB) error {
+func createMetaTable(tx *sql.Tx) error {
 	metaSQL := `
 		CREATE TABLE IF NOT EXISTS export_meta (
 			key TEXT PRIMARY KEY,
 			value TEXT
 		)
 	`
-	if _, err := db.Exec(metaSQL); err != nil {
+	if _, err := tx.Exec(metaSQL); err != nil {
 		return fmt.Errorf("create export_meta table: %w", err)
 	}
 
@@ -181,6 +190,12 @@ func createMetaTable(db *sql.DB) error {
 // CreateFTSIndex creates the FTS5 full-text search virtual table.
 // This must be called after issues are inserted.
 func CreateFTSIndex(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin FTS index: %w", err)
+	}
+	defer tx.Rollback()
+
 	// Create FTS5 virtual table for full-text search
 	ftsSQL := `
 		CREATE VIRTUAL TABLE IF NOT EXISTS issues_fts USING fts5(
@@ -194,7 +209,7 @@ func CreateFTSIndex(db *sql.DB) error {
 			tokenize='porter unicode61'
 		)
 	`
-	if _, err := db.Exec(ftsSQL); err != nil {
+	if _, err := tx.Exec(ftsSQL); err != nil {
 		return fmt.Errorf("create FTS5 table: %w", err)
 	}
 
@@ -202,16 +217,27 @@ func CreateFTSIndex(db *sql.DB) error {
 	populateSQL := `
 		INSERT INTO issues_fts(issues_fts) VALUES('rebuild')
 	`
-	if _, err := db.Exec(populateSQL); err != nil {
+	if _, err := tx.Exec(populateSQL); err != nil {
 		return fmt.Errorf("populate FTS index: %w", err)
 	}
 
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit FTS index: %w", err)
+	}
 	return nil
 }
 
 // CreateMaterializedViews creates denormalized views for fast queries.
 // This must be called after all data is inserted.
 func CreateMaterializedViews(db *sql.DB) error {
+	// Publish the overview table and its indexes together, using one durable
+	// commit rather than syncing the database after every DDL statement.
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin materialized views: %w", err)
+	}
+	defer tx.Rollback()
+
 	// Issue overview materialized view - denormalized for fast list queries
 	overviewSQL := `
 		CREATE TABLE IF NOT EXISTS issue_overview_mv AS
@@ -230,6 +256,8 @@ func CreateMaterializedViews(db *sql.DB) error {
 			i.created_at,
 			i.updated_at,
 			i.closed_at,
+			'unknown' as dependency_state,
+			0 as is_actionable,
 			COALESCE(m.pagerank, 0) as pagerank,
 			COALESCE(m.betweenness, 0) as betweenness,
 			COALESCE(m.critical_path_depth, 0) as critical_path_depth,
@@ -253,7 +281,8 @@ func CreateMaterializedViews(db *sql.DB) error {
 					FROM dependencies d
 					JOIN issues i2 ON d.issue_id = i2.id
 					WHERE d.depends_on_id = i.id
-					  AND (d.type = 'blocks' OR d.type = '')
+					  AND d.type IN ('', 'blocks', 'conditional-blocks', 'waits-for')
+					  AND i.status NOT IN ('closed', 'tombstone')
 					  AND i2.status NOT IN ('closed', 'tombstone')
 					ORDER BY d.issue_id
 				)) as blocks_ids,
@@ -262,14 +291,15 @@ func CreateMaterializedViews(db *sql.DB) error {
 					FROM dependencies d
 					JOIN issues i2 ON d.depends_on_id = i2.id
 					WHERE d.issue_id = i.id
-					  AND (d.type = 'blocks' OR d.type = '')
+					  AND d.type IN ('', 'blocks', 'conditional-blocks', 'waits-for')
+					  AND i.status NOT IN ('closed', 'tombstone')
 					  AND i2.status NOT IN ('closed', 'tombstone')
 					ORDER BY d.depends_on_id
 				)) as blocked_by_ids
 			FROM issues i
 			LEFT JOIN issue_metrics m ON i.id = m.issue_id
 		`
-	if _, err := db.Exec(overviewSQL); err != nil {
+	if _, err := tx.Exec(overviewSQL); err != nil {
 		return fmt.Errorf("create issue_overview_mv: %w", err)
 	}
 
@@ -278,14 +308,18 @@ func CreateMaterializedViews(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_mv_status ON issue_overview_mv(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_mv_priority ON issue_overview_mv(priority)`,
 		`CREATE INDEX IF NOT EXISTS idx_mv_score ON issue_overview_mv(triage_score DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_mv_actionable ON issue_overview_mv(is_actionable)`,
 	}
 
 	for _, sql := range mvIndexes {
-		if _, err := db.Exec(sql); err != nil {
+		if _, err := tx.Exec(sql); err != nil {
 			return fmt.Errorf("create mv index: %w", err)
 		}
 	}
 
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit materialized views: %w", err)
+	}
 	return nil
 }
 

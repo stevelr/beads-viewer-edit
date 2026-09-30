@@ -1,6 +1,8 @@
 package loader
 
 import (
+	"bufio"
+	"io"
 	"sync"
 	"sync/atomic"
 
@@ -12,6 +14,37 @@ const (
 	defaultCommentsCap = 4
 	defaultLabelsCap   = 8
 )
+
+// Retain at most one idle default-sized read buffer (10 MiB). Concurrent
+// parsers own separate readers; surplus buffers become collectible on return.
+var parseReaderCache = make(chan *bufio.Reader, 1)
+
+// acquireParseReader preserves NewReaderSize's treatment of caller-owned
+// readers and custom capacities. The bool reports whether to return the reader.
+func acquireParseReader(source io.Reader, size int) (*bufio.Reader, bool) {
+	if reader, ok := source.(*bufio.Reader); ok && reader.Size() >= size {
+		return reader, false
+	}
+	if size != DefaultMaxBufferSize {
+		return bufio.NewReaderSize(source, size), false
+	}
+	select {
+	case reader := <-parseReaderCache:
+		reader.Reset(source)
+		return reader, true
+	default:
+		return bufio.NewReaderSize(source, size), true
+	}
+}
+
+func releaseParseReader(reader *bufio.Reader) {
+	// Do not retain the input file, byte slice or caller-owned reader in the cache.
+	reader.Reset(nil)
+	select {
+	case parseReaderCache <- reader:
+	default:
+	}
+}
 
 // IssuePool manages reusable Issue structs.
 // Only return issues when they are no longer referenced by any snapshot.

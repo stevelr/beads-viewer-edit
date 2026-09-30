@@ -16,6 +16,24 @@ func isClosedLikeStatus(status model.Status) bool {
 	return status == model.StatusClosed || status == model.StatusTombstone
 }
 
+// isActionableStatus is the single status gate behind every "ready work"
+// surface (GetActionableIssues / actionable_count, quick_wins, top_picks,
+// --robot-next, and the action hints on recommendations). It mirrors the
+// status rule `br ready` applies: only an issue whose status is exactly
+// "open" is ready work. Every parked status — blocked, deferred, draft,
+// pinned, hooked, review, and any custom status a project defines — is
+// excluded (issue #199), as are the closed-like statuses.
+//
+// The one deliberate difference from `br ready` is in_progress: `br ready`
+// hides it because it is already claimed, while bv keeps it in the actionable
+// set because it is live work (health counts, blockers_to_clear and the
+// "Continue work" recommendations all rely on that). The claimable surfaces
+// (top_picks / --robot-next / quick_wins) still exclude it via
+// isClaimableRecommendation, which additionally requires status == "open".
+func isActionableStatus(status model.Status) bool {
+	return status == model.StatusOpen || status == model.StatusInProgress
+}
+
 // TriageResult is the unified output for --robot-triage
 // Designed as a single entry point for AI agents to get everything they need
 type TriageResult struct {
@@ -46,7 +64,8 @@ type TriageMeta struct {
 	// correlation prologue used by --robot-triage (issue #166):
 	// "ok" (history report generated), "error" (generation failed),
 	// "timeout" (generation exceeded the configured budget and was
-	// cancelled; triage proceeded without history), or empty when history
+	// cancelled; triage proceeded without history), "skipped" (a pinned
+	// SOURCE_DATE_EPOCH requested reproducible output), or empty when history
 	// generation was not attempted (no git repo / no open issues / callers
 	// outside the robot-triage path).
 	HistoryStatus string `json:"history_status,omitempty"`
@@ -65,12 +84,15 @@ type QuickRef struct {
 	// OpenCount counts issues whose status is exactly "open"
 	// (== by_status["open"]; excludes in_progress/blocked/deferred).
 	OpenCount int `json:"open_count"`
-	// ActionableCount counts non-closed issues that are ready to work on
-	// (no open blocking dependencies).
+	// ActionableCount counts non-closed issues that are ready to work on:
+	// an actionable status (open or in_progress; see isActionableStatus),
+	// no open blocking dependencies, and no future defer_until. Parked
+	// statuses (blocked/deferred/draft/pinned/hooked/review/custom) are not
+	// counted, matching `br ready` (issue #199).
 	ActionableCount int `json:"actionable_count"`
 	// BlockedCount counts issues whose status is exactly "blocked"
-	// (== by_status["blocked"]). For dependency-blocked work regardless of
-	// status, see NotActionableCount.
+	// (== by_status["blocked"]). For the broader readiness complement, see
+	// NotActionableCount.
 	BlockedCount int `json:"blocked_count"`
 	// InProgressCount counts issues whose status is exactly "in_progress".
 	InProgressCount int `json:"in_progress_count"`
@@ -79,8 +101,8 @@ type QuickRef struct {
 	// semantics.
 	NotClosedCount int `json:"not_closed_count"`
 	// NotActionableCount counts non-closed issues that are NOT actionable
-	// (blocked by open dependencies, whatever their status). This carries
-	// the pre-#165 blocked_count semantics.
+	// (blocked by open dependencies, parked in a non-actionable status, or
+	// scheduler-deferred). This carries the pre-#165 blocked_count semantics.
 	NotActionableCount int       `json:"not_actionable_count"`
 	TopPicks           []TopPick `json:"top_picks"` // Top 3 recommended items
 }
@@ -110,6 +132,14 @@ type Recommendation struct {
 	Reasons     []string       `json:"reasons"`
 	UnblocksIDs []string       `json:"unblocks_ids,omitempty"`
 	BlockedBy   []string       `json:"blocked_by,omitempty"`
+	// Claimable is the machine-readable form of the top-pick gate (issue
+	// #199): true iff isClaimableRecommendation would surface this item as a
+	// robot pick (status open, unblocked, unassigned, not deferred, not an
+	// epic/parent container, no not-ready label). Consumers reading past
+	// top_picks (e.g. recommendations[3:10]) can filter on it instead of
+	// parsing the reasons text.
+	Claimable bool               `json:"claimable"`
+	Actions   model.IssueActions `json:"actions"`
 }
 
 // isDeferredAt reports whether the recommendation's defer_until is still
@@ -118,10 +148,13 @@ func (r Recommendation) isDeferredAt(now time.Time) bool {
 	return r.DeferUntil != nil && r.DeferUntil.After(now)
 }
 
-// QuickWin represents a low-effort, high-impact item
+// QuickWin represents a low-effort, high-impact item. Quick wins are things
+// to start now, so buildQuickWins only admits claimable items (issue #199);
+// Status is carried so consumers can verify that without a JSONL join.
 type QuickWin struct {
 	ID          string   `json:"id"`
 	Title       string   `json:"title"`
+	Status      string   `json:"status"`
 	Score       float64  `json:"score"`
 	Reason      string   `json:"reason"`
 	UnblocksIDs []string `json:"unblocks_ids,omitempty"`
@@ -149,8 +182,9 @@ type ProjectHealth struct {
 //
 // Count semantics (issue #165): Open and Blocked are STRICT status counts
 // (always equal to ByStatus["open"] / ByStatus["blocked"]). The pre-#165
-// aggregate values are preserved under the semantically accurate names
-// NotClosed and DependencyBlocked. Partition invariant:
+// aggregate values are preserved under NotClosed and the legacy JSON field
+// DependencyBlocked. Despite that field name, it is the complete non-actionable
+// complement, not only direct dependency blocking. Partition invariant:
 //
 //	not_closed == actionable + dependency_blocked
 type HealthCounts struct {
@@ -166,16 +200,16 @@ type HealthCounts struct {
 	// (== ByStatus["blocked"]). Before #165 this counted non-closed issues
 	// that were not actionable; that value is now DependencyBlocked.
 	Blocked int `json:"blocked"`
-	// Actionable counts non-closed issues with no open blocking
-	// dependencies (ready to work on now).
+	// Actionable counts non-closed issues with no active scheduler deferral,
+	// open blocking dependency, or blocked parent chain.
 	Actionable int `json:"actionable"`
 	// NotClosed counts every issue that is not closed-like (status is not
 	// "closed"/"tombstone"): open + in_progress + blocked + deferred + any
 	// other live status. Pre-#165 "open" semantics.
 	NotClosed int `json:"not_closed"`
 	// DependencyBlocked counts non-closed issues that are NOT actionable
-	// (blocked by open dependencies, whatever their status). Pre-#165
-	// "blocked" semantics.
+	// (including scheduler deferral, an open blocking dependency, or a blocked
+	// parent chain). The JSON name preserves the pre-#165 "blocked" aggregate.
 	DependencyBlocked int            `json:"dependency_blocked"`
 	ByStatus          map[string]int `json:"by_status"`
 	ByType            map[string]int `json:"by_type"`
@@ -344,10 +378,10 @@ type Alert struct {
 
 // CommandHelpers provides copy-paste commands for common actions
 type CommandHelpers struct {
-	ClaimTop      string `json:"claim_top"`      // CI=1 br update <id> --status in_progress --json
-	ShowTop       string `json:"show_top"`       // CI=1 br show <id> --json
-	ListReady     string `json:"list_ready"`     // CI=1 br ready --json
-	ListBlocked   string `json:"list_blocked"`   // CI=1 br blocked --json
+	ClaimTop      string `json:"claim_top"`      // Verified tracker route and original local ID
+	ShowTop       string `json:"show_top"`       // Read-only inspection of that same live route
+	ListReady     string `json:"list_ready"`     // Empty when no unique tracker route is established
+	ListBlocked   string `json:"list_blocked"`   // Empty when no unique tracker route is established
 	RefreshTriage string `json:"refresh_triage"` // bv --robot-triage
 }
 
@@ -358,11 +392,13 @@ func ComputeTriage(issues []model.Issue) TriageResult {
 
 // TriageOptions configures triage computation
 type TriageOptions struct {
-	TopN          int  // Number of recommendations (default 10)
-	QuickWinN     int  // Number of quick wins (default 5)
-	BlockerN      int  // Number of blockers to show (default 5)
-	WaitForPhase2 bool // Block until Phase 2 metrics ready
-	UseFastConfig bool // Use TriageConfig for faster Phase 2 (bv-t1js optimization)
+	Readiness     *model.ReadinessIndex // Authority before any root/label/repo/recipe scope
+	CandidateIDs  map[string]bool       // nil = all analysis issues; empty = no candidates
+	TopN          int                   // Number of recommendations (default 10)
+	QuickWinN     int                   // Number of quick wins (default 5)
+	BlockerN      int                   // Number of blockers to show (default 5)
+	WaitForPhase2 bool                  // Block until Phase 2 metrics ready
+	UseFastConfig bool                  // Use TriageConfig for faster Phase 2 (bv-t1js optimization)
 
 	// bv-87: Track/label-aware recommendation grouping for multi-agent coordination
 	GroupByTrack bool // Group recommendations by execution track (connected component)
@@ -373,6 +409,10 @@ type TriageOptions struct {
 
 	// History report for staleness analysis
 	History *correlation.HistoryReport
+
+	// Weights, when non-nil, replaces the default composite-score factor
+	// weights (see FeedbackData.Weights). nil means DefaultWeights.
+	Weights *Weights
 
 	// SeedDataHash, when non-empty, is a pre-computed ComputeDataHash(issues)
 	// the caller has already calculated for the same issue set. It is used to
@@ -403,7 +443,7 @@ type TrackRecommendationGroup struct {
 	Reason          string           `json:"reason"`                  // Why these are grouped (e.g., "Independent work stream")
 	Recommendations []Recommendation `json:"recommendations"`         // Recommendations in this track
 	TopPick         *TopPick         `json:"top_pick,omitempty"`      // Best item in this track
-	ClaimCommand    string           `json:"claim_command,omitempty"` // CI=1 br update <top_pick_id> --status in_progress --json
+	ClaimCommand    string           `json:"claim_command,omitempty"` // Bound top recommendation action, when available
 	TotalUnblocks   int              `json:"total_unblocks"`          // Sum of unblocks in this track
 }
 
@@ -412,7 +452,7 @@ type LabelRecommendationGroup struct {
 	Label           string           `json:"label"`
 	Recommendations []Recommendation `json:"recommendations"`         // Recommendations with this label
 	TopPick         *TopPick         `json:"top_pick,omitempty"`      // Best item with this label
-	ClaimCommand    string           `json:"claim_command,omitempty"` // CI=1 br update <top_pick_id> --status in_progress --json
+	ClaimCommand    string           `json:"claim_command,omitempty"` // Bound top recommendation action, when available
 	TotalUnblocks   int              `json:"total_unblocks"`          // Sum of unblocks for this label
 }
 
@@ -423,6 +463,9 @@ func ComputeTriageWithOptions(issues []model.Issue, opts TriageOptions) TriageRe
 
 // ComputeTriageWithOptionsAndTime generates triage with a deterministic clock (testing).
 func ComputeTriageWithOptionsAndTime(issues []model.Issue, opts TriageOptions, now time.Time) TriageResult {
+	if opts.Readiness == nil {
+		opts.Readiness = model.NewReadinessIndex(issues)
+	}
 	// bv-140: If a root issue is specified, filter to the subgraph rooted at that issue.
 	// "Rooted at" means the root itself plus all issues that transitively depend on it
 	// (descendants in the dependency DAG). This scopes triage to a specific epic.
@@ -432,9 +475,14 @@ func ComputeTriageWithOptionsAndTime(issues []model.Issue, opts TriageOptions, n
 
 	// Build analyzer and stats
 	analyzer := NewAnalyzer(issues)
+	analyzer.SetReadinessScope(opts.Readiness, opts.CandidateIDs)
 	// Time-gated readiness (defer_until) must use the same clock as the rest of
 	// this triage pass, so a pinned `now` yields deterministic output.
 	analyzer.SetNow(now)
+	// Feedback-adjusted (or otherwise configured) factor weights.
+	if opts.Weights != nil {
+		analyzer.SetWeights(*opts.Weights)
+	}
 	// Reuse a caller-supplied data hash when it still describes this exact issue
 	// set (i.e. no root-subgraph scoping happened above).
 	if opts.SeedDataHash != "" && opts.RootIssueID == "" {
@@ -563,7 +611,13 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	impactScores := analyzer.ComputeImpactScoresFromStats(stats, now)
 
 	// Compute counts (uses cached actionable issues)
-	counts := computeCountsWithContext(issues, triageCtx)
+	candidateIssues := make([]model.Issue, 0, len(issues))
+	for _, issue := range issues {
+		if analyzer.IsCandidate(issue.ID) {
+			candidateIssues = append(candidateIssues, issue)
+		}
+	}
+	counts := computeCountsWithContext(candidateIssues, triageCtx)
 
 	// Compute enhanced triage scores (bv-147)
 	triageScores := computeTriageScoresFromImpact(impactScores, triageCtx, DefaultTriageScoringOptions())
@@ -580,22 +634,47 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	// first, slice to opts.TopN for the user-visible recommendations
 	// list, and feed the *unsliced* set into buildTopPicks.
 	allRecommendations := buildRecommendationsFromTriageScores(triageScores, triageCtx, len(triageScores), now)
-	recommendations := allRecommendations
-	if len(recommendations) > opts.TopN {
-		recommendations = recommendations[:opts.TopN]
+	selectedRecommendations := allRecommendations[:0]
+	for _, rec := range allRecommendations {
+		if analyzer.IsCandidate(rec.ID) {
+			selectedRecommendations = append(selectedRecommendations, rec)
+		}
 	}
-
-	// Build quick wins
-	quickWins := buildQuickWins(impactScores, unblocksMap, opts.QuickWinN)
-
-	// Build blockers to clear (uses cached actionable issues)
-	blockersToClear := buildBlockersToClearWithContext(triageCtx, unblocksMap, opts.BlockerN)
+	allRecommendations = selectedRecommendations
 
 	// Parents with open children are excluded from claimable top picks (issue
 	// #17 parity): such a parent is a planning container, not directly claimable
 	// work, even when it passes the epic-type / blocker checks (e.g. a non-epic
 	// parent). The parent re-becomes claimable once its children are all closed.
 	parentsWithOpenChildren := analyzer.ParentsWithOpenChildren()
+
+	// Stamp the claimability verdict on every scored item once (issue #199) so
+	// recommendations carry it as a field and quick_wins can gate on the same
+	// predicate top_picks uses. allRecommendations covers the full scored set,
+	// so this map is complete for every impact score.
+	claimableIDs := make(map[string]bool, len(allRecommendations))
+	for i := range allRecommendations {
+		claimable := analyzer.Readiness().Claimable(allRecommendations[i].ID, now) && isClaimableRecommendation(allRecommendations[i], now, opts.NotReadyLabels, parentsWithOpenChildren)
+		allRecommendations[i].Claimable = claimable
+		if issue, ok := analyzer.issueMap[allRecommendations[i].ID]; ok {
+			allRecommendations[i].Actions = issue.Actions(claimable)
+		}
+		if claimable {
+			claimableIDs[allRecommendations[i].ID] = true
+		}
+	}
+
+	recommendations := allRecommendations
+	if len(recommendations) > opts.TopN {
+		recommendations = recommendations[:opts.TopN]
+	}
+
+	// Build quick wins from the claimable subset only: a deferred/draft/blocked
+	// bead must never be handed out as "start here" work (issue #199).
+	quickWins := buildQuickWins(impactScores, unblocksMap, opts.QuickWinN, claimableIDs)
+
+	// Build blockers to clear (uses cached actionable issues)
+	blockersToClear := buildBlockersToClearWithContext(triageCtx, unblocksMap, opts.BlockerN)
 
 	// Build top picks for quick ref. Pass the full set so blocked
 	// high-priority items don't crowd genuine actionable work out of
@@ -656,7 +735,7 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 			Velocity:  projectVelocity,
 			Staleness: staleness,
 		},
-		Commands: buildCommands(topID),
+		Commands: buildCommands(analyzer.issueMap[topID].Actions(topID != "")),
 	}
 }
 
@@ -720,7 +799,7 @@ func buildUnblocksMap(ctx *TriageContext) map[string][]string {
 
 	// We only care about blocking dependencies
 	for _, issue := range ctx.analyzer.issueMap {
-		if isClosedLikeStatus(issue.Status) {
+		if isClosedLikeStatus(issue.Status) || issue.IsDeferredAt(ctx.analyzer.Now()) {
 			continue
 		}
 
@@ -735,7 +814,11 @@ func buildUnblocksMap(ctx *TriageContext) map[string][]string {
 		// one issue will unblock this one.
 		if len(openBlockers) == 1 {
 			blockerID := openBlockers[0]
-			unblocksMap[blockerID] = append(unblocksMap[blockerID], issue.ID)
+			// One visible blocker is not proof of readiness: parked statuses,
+			// unresolved parent chains and output eligibility still apply.
+			if ctx.analyzer.isActionableAfterCompletions(issue.ID, map[string]bool{blockerID: true}) {
+				unblocksMap[blockerID] = append(unblocksMap[blockerID], issue.ID)
+			}
 		}
 	}
 
@@ -757,7 +840,7 @@ func computeCounts(issues []model.Issue, analyzer *Analyzer) HealthCounts {
 		ByPriority: make(map[int]int),
 	}
 
-	actionable := analyzer.GetActionableIssues()
+	actionable := analyzer.getActionableIssuesAfterCompletions(nil)
 	actionableSet := make(map[string]bool, len(actionable))
 	for _, a := range actionable {
 		actionableSet[a.ID] = true
@@ -837,7 +920,7 @@ func buildRecommendationsFromTriageScores(scores []TriageScore, ctx *TriageConte
 
 	recommendations := make([]Recommendation, 0, len(scores))
 	for _, score := range scores {
-		issue := analyzer.GetIssue(score.IssueID)
+		issue := analyzer.getIssue(score.IssueID)
 		if issue == nil {
 			continue
 		}
@@ -873,8 +956,12 @@ func buildRecommendationsFromTriageScores(scores []TriageScore, ctx *TriageConte
 	return recommendations
 }
 
-// buildQuickWins finds low-complexity, high-impact items
-func buildQuickWins(scores []ImpactScore, unblocksMap map[string][]string, limit int) []QuickWin {
+// buildQuickWins finds low-complexity, high-impact items among the claimable
+// set. claimable is the set of issue IDs that pass isClaimableRecommendation;
+// every other scored item is skipped (issue #199), so quick_wins never lists
+// parked (deferred/draft/blocked/...), dependency-blocked, assigned, or
+// scheduler-deferred work as something to start.
+func buildQuickWins(scores []ImpactScore, unblocksMap map[string][]string, limit int, claimable map[string]bool) []QuickWin {
 	// Quick wins: high score but likely simple (no deep dependency chains)
 	// Heuristic: items that unblock others but have low blocker ratio themselves
 
@@ -886,6 +973,9 @@ func buildQuickWins(scores []ImpactScore, unblocksMap map[string][]string, limit
 
 	candidates := make([]candidate, 0, len(scores))
 	for _, score := range scores {
+		if !claimable[score.IssueID] {
+			continue
+		}
 		unblocks := unblocksMap[score.IssueID]
 		// Quick win score formula: Balance Impact vs Effort
 		// 1. Unblocks Impact: Logarithmic scale to prevent domination by huge fan-outs
@@ -936,6 +1026,7 @@ func buildQuickWins(scores []ImpactScore, unblocksMap map[string][]string, limit
 		quickWins = append(quickWins, QuickWin{
 			ID:          c.score.IssueID,
 			Title:       c.score.Title,
+			Status:      c.score.Status,
 			Score:       c.quickWinScore,
 			Reason:      reason,
 			UnblocksIDs: c.unblocks,
@@ -954,7 +1045,7 @@ func buildBlockersToClear(analyzer *Analyzer, unblocksMap map[string][]string, l
 		unblocks []string
 	}
 
-	actionable := analyzer.GetActionableIssues()
+	actionable := analyzer.getActionableIssuesAfterCompletions(nil)
 	actionableSet := make(map[string]bool, len(actionable))
 	for _, a := range actionable {
 		actionableSet[a.ID] = true
@@ -965,7 +1056,7 @@ func buildBlockersToClear(analyzer *Analyzer, unblocksMap map[string][]string, l
 		if len(unblocks) == 0 {
 			continue
 		}
-		issue := analyzer.GetIssue(id)
+		issue := analyzer.getIssue(id)
 		if issue == nil || isClosedLikeStatus(issue.Status) {
 			continue
 		}
@@ -1015,10 +1106,10 @@ func buildBlockersToClearWithContext(ctx *TriageContext, unblocksMap map[string]
 
 	var blockers []blocker
 	for id, unblocks := range unblocksMap {
-		if len(unblocks) == 0 {
+		if len(unblocks) == 0 || !ctx.analyzer.IsCandidate(id) {
 			continue
 		}
-		issue := ctx.GetIssue(id)
+		issue := ctx.getIssue(id)
 		if issue == nil || isClosedLikeStatus(issue.Status) {
 			continue
 		}
@@ -1100,6 +1191,9 @@ func isClaimableRecommendation(rec Recommendation, now time.Time, notReadyLabels
 	if parentsWithOpenChildren[rec.ID] {
 		return false
 	}
+	if _, ok := quoteBeadsCommandID(rec.ID); !ok {
+		return false
+	}
 	return rec.Status == string(model.StatusOpen) &&
 		rec.Type != string(model.TypeEpic) &&
 		rec.Assignee == "" &&
@@ -1146,25 +1240,15 @@ func buildGraphHealth(stats *GraphStats) GraphHealth {
 }
 
 // buildCommands constructs helper commands, handling empty topID gracefully
-func buildCommands(topID string) CommandHelpers {
-	base := "CI=1 "
-	listReady := base + "br ready --json"
-	listBlocked := base + "br blocked --json"
-
-	claimTop := listReady + "  # No top pick available"
-	showTop := listReady + "  # No top pick available"
-	if topID != "" {
-		claimTop = fmt.Sprintf("%sbr update %s --status in_progress --json", base, topID)
-		showTop = fmt.Sprintf("%sbr show %s --json", base, topID)
+func buildCommands(actions model.IssueActions) CommandHelpers {
+	commands := CommandHelpers{RefreshTriage: "bv --robot-triage"}
+	if actions.Show != nil {
+		commands.ShowTop = actions.Show.Shell
 	}
-
-	return CommandHelpers{
-		ClaimTop:      claimTop,
-		ShowTop:       showTop,
-		ListReady:     listReady,
-		ListBlocked:   listBlocked,
-		RefreshTriage: "bv --robot-triage",
+	if actions.Claim != nil {
+		commands.ClaimTop = actions.Claim.Shell
 	}
+	return commands
 }
 
 // ============================================================================
@@ -1298,7 +1382,7 @@ func computeSingleTriageScore(base ImpactScore, unblocksMap map[string][]string,
 
 	// Calculate quick-win boost
 	// Quick wins are items with low blocker depth but high impact
-	if issue := analyzer.GetIssue(base.IssueID); issue == nil || issue.Status != model.StatusInProgress {
+	if issue := analyzer.getIssue(base.IssueID); issue == nil || issue.Status != model.StatusInProgress {
 		if blockerDepth <= opts.QuickWinMaxDepth && blockerDepth >= 0 {
 			// Lower depth = higher quick win potential
 			depthFactor := 1.0 - float64(blockerDepth)/float64(opts.QuickWinMaxDepth+1)
@@ -1398,6 +1482,9 @@ func maxOf(a, b int) int {
 
 // GetTopTriageScores returns the top N triage scores
 func GetTopTriageScores(issues []model.Issue, n int) []TriageScore {
+	if n <= 0 {
+		return nil
+	}
 	scores := ComputeTriageScores(issues)
 	if n > len(scores) {
 		n = len(scores)
@@ -1422,8 +1509,9 @@ type TriageReasonContext struct {
 	IsQuickWin      bool
 	BlockerDepth    int
 	// Now is the reference instant for time-gated readiness (defer_until).
-	// Zero means "use wall-clock time".
-	Now time.Time
+	// Set HasNow when zero itself is the intended instant.
+	Now    time.Time
+	HasNow bool
 }
 
 // TriageReasons contains all generated reasons for an issue
@@ -1437,7 +1525,7 @@ type TriageReasons struct {
 // These are emoji-prefixed, human-readable explanations that tell agents what to DO
 func GenerateTriageReasons(ctx TriageReasonContext) TriageReasons {
 	now := ctx.Now
-	if now.IsZero() {
+	if !ctx.HasNow && now.IsZero() {
 		now = time.Now()
 	}
 	// A future defer_until withholds the bead from claiming (issue #191). It is
@@ -1522,11 +1610,14 @@ func GenerateTriageReasons(ctx TriageReasonContext) TriageReasons {
 			primary = reason
 		}
 
-		// Update action hint unless in-progress (keep work/review guidance),
-		// critically stale, or scheduler-deferred (keep the wait guidance)
-		isInProgress := ctx.Issue != nil && ctx.Issue.Status == model.StatusInProgress
-		isCriticalStale := isInProgress && ctx.DaysSinceUpdate > 14
-		if !isInProgress && !isCriticalStale && !isFutureDeferred {
+		// Update action hint only when the bead is genuinely startable: not
+		// in-progress (keep work/review guidance), not scheduler-deferred (keep
+		// the wait guidance), and not parked in a non-open status such as
+		// blocked/deferred/draft (keep the "resolve"/"wait for status" guidance
+		// computed above; issue #199). An unknown record/status keeps the
+		// pre-existing behaviour of taking the quick-win hint.
+		hasNonOpenStatus := ctx.Issue != nil && ctx.Issue.Status != "" && ctx.Issue.Status != model.StatusOpen
+		if !hasNonOpenStatus && !isFutureDeferred {
 			actionHint = "Quick win - start here for fast progress"
 		}
 	}
@@ -1657,7 +1748,7 @@ func GenerateTriageReasonsForScore(score TriageScore, triageCtx *TriageContext) 
 func generateTriageReasonsForScoreAt(score TriageScore, triageCtx *TriageContext, now time.Time) TriageReasons {
 	analyzer := triageCtx.Analyzer()
 	unblocksMap := triageCtx.UnblocksMap()
-	issue := analyzer.GetIssue(score.IssueID)
+	issue := analyzer.getIssue(score.IssueID)
 
 	daysSinceUpdate := 0
 	if issue != nil && !issue.UpdatedAt.IsZero() {
@@ -1681,6 +1772,7 @@ func generateTriageReasonsForScoreAt(score TriageScore, triageCtx *TriageContext
 		IsQuickWin:      isQuickWin,
 		BlockerDepth:    triageCtx.BlockerDepth(score.IssueID), // cached
 		Now:             now,
+		HasNow:          true,
 	}
 
 	return GenerateTriageReasons(ctx)
@@ -1789,7 +1881,10 @@ func buildRecommendationsByTrack(recs []Recommendation, analyzer *Analyzer, unbl
 				Reasons:  rec.Reasons,
 				Unblocks: len(unblocksMap[rec.ID]),
 			}
-			group.ClaimCommand = fmt.Sprintf("CI=1 br update %s --status in_progress --json", rec.ID)
+			group.ClaimCommand = ""
+			if rec.Actions.Claim != nil {
+				group.ClaimCommand = rec.Actions.Claim.Shell
+			}
 		}
 	}
 
@@ -1849,7 +1944,10 @@ func buildRecommendationsByLabel(recs []Recommendation, unblocksMap map[string][
 				Reasons:  rec.Reasons,
 				Unblocks: len(unblocksMap[rec.ID]),
 			}
-			group.ClaimCommand = fmt.Sprintf("CI=1 br update %s --status in_progress --json", rec.ID)
+			group.ClaimCommand = ""
+			if rec.Actions.Claim != nil {
+				group.ClaimCommand = rec.Actions.Claim.Shell
+			}
 		}
 	}
 

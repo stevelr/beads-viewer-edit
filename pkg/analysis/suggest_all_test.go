@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"encoding/json"
 	"sort"
 	"strings"
 	"testing"
@@ -368,10 +369,11 @@ func TestGenerateAllSuggestions_NoDuplicateSuggestions(t *testing.T) {
 
 	set := GenerateAllSuggestions(issues, config, "dedup-hash")
 
-	// Check for duplicate suggestions (same target + type + suggested action)
+	// Semantic identity survives an unavailable mutation route. Distinct label
+	// recommendations must not collapse into one empty action command.
 	seen := make(map[string]bool)
 	for _, sug := range set.Suggestions {
-		key := sug.TargetBead + "|" + string(sug.Type) + "|" + sug.ActionCommand
+		key := sug.TargetBead + "|" + string(sug.Type) + "|" + sug.RelatedBead + "|" + sug.Summary
 		if seen[key] {
 			t.Errorf("duplicate suggestion found: %s", key)
 		}
@@ -523,6 +525,49 @@ func TestGenerateRobotSuggestOutput_UsageHints(t *testing.T) {
 	}
 	if !foundFlag {
 		t.Error("UsageHints should include CLI flag examples")
+	}
+}
+
+func TestGenerateRobotSuggestOutputAt_PinsNestedTimesAndBytes(t *testing.T) {
+	pinned := time.Date(2026, 8, 26, 12, 34, 56, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "DUP-3", Title: "Fix OAuth login failure", Status: model.StatusOpen},
+		{ID: "DUP-1", Title: "Fix OAuth login failure", Status: model.StatusOpen},
+		{ID: "DUP-2", Title: "Fix OAuth login failure", Status: model.StatusOpen},
+	}
+	config := DefaultSuggestAllConfig()
+	config.EnableDependencies = false
+	config.EnableLabels = false
+	config.EnableCycles = false
+	config.Duplicates.JaccardThreshold = 0.1
+
+	var want []byte
+	for run := 0; run < 25; run++ {
+		output := GenerateRobotSuggestOutputAt(issues, config, "pinned-hash", pinned)
+		if output.GeneratedAt != pinned.Format(time.RFC3339) {
+			t.Fatalf("outer generated_at = %q, want %q", output.GeneratedAt, pinned.Format(time.RFC3339))
+		}
+		if !output.Set.GeneratedAt.Equal(pinned) {
+			t.Fatalf("set generated_at = %v, want %v", output.Set.GeneratedAt, pinned)
+		}
+		if len(output.Set.Suggestions) == 0 {
+			t.Fatal("expected duplicate suggestions")
+		}
+		for _, suggestion := range output.Set.Suggestions {
+			if !suggestion.GeneratedAt.Equal(pinned) {
+				t.Fatalf("suggestion %s generated_at = %v, want %v", suggestion.TargetBead, suggestion.GeneratedAt, pinned)
+			}
+		}
+
+		got, err := json.Marshal(output)
+		if err != nil {
+			t.Fatalf("marshal output: %v", err)
+		}
+		if run == 0 {
+			want = got
+		} else if string(got) != string(want) {
+			t.Fatalf("run %d produced non-deterministic bytes\nwant: %s\n got: %s", run, want, got)
+		}
 	}
 }
 

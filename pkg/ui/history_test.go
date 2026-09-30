@@ -10,6 +10,19 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// makeHistoryReportCurrent installs a report on the model's history view and
+// marks it current for the model's active dataset. Key handling in the history
+// view is gated on historyReportIsCurrent(), so tests that drive history keys
+// through Model.Update must install a current report first (in production the
+// async HistoryLoadedMsg completion path does this).
+func makeHistoryReportCurrent(m *Model, report *correlation.HistoryReport) {
+	m.cancelHistoryLoad()
+	m.historyLoading = false
+	m.historyLoadFailed = false
+	m.historyView.SetReport(report)
+	m.historyReportDataGeneration = m.semanticDataGeneration
+}
+
 func createTestHistoryReport() *correlation.HistoryReport {
 	now := time.Now()
 
@@ -159,6 +172,171 @@ func TestHistoryModel_SetReport(t *testing.T) {
 
 	if len(h.histories) != 3 {
 		t.Errorf("histories count after SetReport = %d, want 3", len(h.histories))
+	}
+}
+
+func TestHistoryModel_SetReportPreservesVisibleFileTreeState(t *testing.T) {
+	h := NewHistoryModel(createTestHistoryReportWithFiles(), testTheme())
+	h.ToggleFileTree()
+	findVisible := func(path string) int {
+		for i, node := range h.flatFileList {
+			if node.Path == path {
+				return i
+			}
+		}
+		return -1
+	}
+
+	h.selectedFileIdx = findVisible("pkg")
+	if h.selectedFileIdx < 0 {
+		t.Fatal("pkg directory is not visible")
+	}
+	h.ToggleExpandFile()
+	h.selectedFileIdx = findVisible("pkg/auth")
+	if h.selectedFileIdx < 0 {
+		t.Fatal("pkg/auth directory is not visible after expanding pkg")
+	}
+	h.ToggleExpandFile()
+	h.selectedFileIdx = findVisible("pkg/auth/token.go")
+	if h.selectedFileIdx < 0 {
+		t.Fatal("token.go is not visible after expanding pkg/auth")
+	}
+
+	h.SetReport(createTestHistoryReportWithFiles())
+	selected := h.SelectedFileNode()
+	if selected == nil || selected.Path != "pkg/auth/token.go" {
+		t.Fatalf("selected file after refresh=%v, want pkg/auth/token.go", selected)
+	}
+	for _, path := range []string{"pkg", "pkg/auth"} {
+		idx := findVisible(path)
+		if idx < 0 || !h.flatFileList[idx].Expanded {
+			t.Fatalf("expanded directory %q was not preserved", path)
+		}
+	}
+}
+
+func TestHistoryModel_SetReportPreservesGitSelectionByIdentity(t *testing.T) {
+	h := NewHistoryModel(createTestHistoryReport(), testTheme())
+	h.ToggleViewMode()
+	commits := h.GetFilteredCommitList()
+	for i := range commits {
+		if commits[i].SHA == "abc123def456" {
+			h.selectedGitCommit = i
+			break
+		}
+	}
+	selected := h.SelectedGitCommit()
+	if selected == nil || selected.SHA != "abc123def456" || len(selected.BeadIDs) < 2 {
+		t.Fatalf("shared commit fixture is unavailable: %+v", selected)
+	}
+	h.selectedRelatedBead = 1
+	wantRelated := h.SelectedRelatedBeadID()
+
+	refreshed := createTestHistoryReport()
+	history := refreshed.Histories["bv-2"]
+	history.Commits = append(history.Commits, correlation.CorrelatedCommit{
+		SHA:       "newer-than-selection",
+		ShortSHA:  "newer",
+		Message:   "newer commit",
+		Timestamp: time.Now().Add(time.Hour),
+	})
+	refreshed.Histories["bv-2"] = history
+	h.SetReport(refreshed)
+
+	selected = h.SelectedGitCommit()
+	if selected == nil || selected.SHA != "abc123def456" {
+		t.Fatalf("selected commit after refresh=%+v, want abc123def456", selected)
+	}
+	if got := h.SelectedRelatedBeadID(); got != wantRelated {
+		t.Fatalf("selected related bead after refresh=%q, want %q", got, wantRelated)
+	}
+}
+
+func TestHistoryModel_SetReportPreservesBeadAndCommitSelectionByIdentity(t *testing.T) {
+	h := NewHistoryModel(createTestHistoryReport(), testTheme())
+	for i, beadID := range h.beadIDs {
+		if beadID == "bv-1" {
+			h.selectedBead = i
+			break
+		}
+	}
+	selectedHistory := h.SelectedHistory()
+	if selectedHistory == nil || selectedHistory.BeadID != "bv-1" || len(selectedHistory.Commits) < 2 {
+		t.Fatalf("multi-commit bead fixture is unavailable: %+v", selectedHistory)
+	}
+	h.selectedCommit = 1
+	wantSHA := h.SelectedCommit().SHA
+
+	refreshed := createTestHistoryReport()
+	history := refreshed.Histories["bv-1"]
+	history.Commits = append([]correlation.CorrelatedCommit{{
+		SHA:       "newer-than-selection",
+		ShortSHA:  "newer",
+		Message:   "newer commit",
+		Timestamp: time.Now().Add(time.Hour),
+	}}, history.Commits...)
+	refreshed.Histories["bv-1"] = history
+	h.SetReport(refreshed)
+
+	if got := h.SelectedBeadID(); got != "bv-1" {
+		t.Fatalf("selected bead after refresh=%q, want bv-1", got)
+	}
+	if selected := h.SelectedCommit(); selected == nil || selected.SHA != wantSHA {
+		t.Fatalf("selected bead commit after refresh=%+v, want SHA %s", selected, wantSHA)
+	}
+}
+
+func TestHistoryModel_SetReportClampsDerivedScrollOffsets(t *testing.T) {
+	report := createTestHistoryReport()
+	h := NewHistoryModel(report, DefaultTheme(nil))
+	h.SetSize(100, 20)
+	h.middleScrollOffset = 1_000
+	h.timelineScrollOffset = 1_000
+
+	refreshed := createTestHistoryReport()
+	for id, history := range refreshed.Histories {
+		if len(history.Commits) > 1 {
+			history.Commits = history.Commits[:1]
+			refreshed.Histories[id] = history
+		}
+	}
+	h.SetReport(refreshed)
+
+	if h.middleScrollOffset != 0 {
+		t.Fatalf("middleScrollOffset=%d after shorter report, want 0", h.middleScrollOffset)
+	}
+	if h.timelineScrollOffset != 0 {
+		t.Fatalf("timelineScrollOffset=%d after refreshed report, want 0", h.timelineScrollOffset)
+	}
+}
+
+func TestHistoryModel_SetReportRefreshesHiddenFileTree(t *testing.T) {
+	h := NewHistoryModel(createTestHistoryReportWithFiles(), testTheme())
+	h.ToggleFileTree()
+	h.ToggleFileTree()
+	if h.showFileTree || h.fileTree == nil {
+		t.Fatal("fixture did not leave a built but hidden file tree")
+	}
+
+	refreshed := createTestHistoryReportWithFiles()
+	for beadID, history := range refreshed.Histories {
+		for i := range history.Commits {
+			history.Commits[i].Files = []correlation.FileChange{{Path: "new/tree.go"}}
+		}
+		refreshed.Histories[beadID] = history
+	}
+	h.SetReport(refreshed)
+	h.ToggleFileTree()
+
+	visibleRoots := make(map[string]bool)
+	for _, node := range h.flatFileList {
+		visibleRoots[node.Path] = true
+	}
+	if !visibleRoots["new"] {
+		t.Fatalf("reopened file tree omitted refreshed root: %v", visibleRoots)
+	}
+	if visibleRoots["pkg"] {
+		t.Fatalf("reopened file tree retained stale root: %v", visibleRoots)
 	}
 }
 
@@ -856,6 +1034,26 @@ func TestHistoryModel_GetFilteredCommitList(t *testing.T) {
 	filtered := h.GetFilteredCommitList()
 	if len(filtered) != len(h.commitList) {
 		t.Errorf("GetFilteredCommitList() without filter should return full list")
+	}
+}
+
+func TestHistoryModel_GitSearchWithNoMatchesStaysEmpty(t *testing.T) {
+	report := createTestHistoryReport()
+	h := NewHistoryModel(report, testTheme())
+	h.ToggleViewMode()
+	if len(h.commitList) == 0 {
+		t.Fatal("fixture has no commits")
+	}
+
+	h.StartSearch()
+	h.searchInput.SetValue("definitely-no-such-history-entry")
+	h.applySearchFilter()
+
+	if h.filteredCommits == nil {
+		t.Fatal("active zero-result query used nil no-filter sentinel")
+	}
+	if got := h.GetFilteredCommitList(); len(got) != 0 {
+		t.Fatalf("zero-result query exposed %d unfiltered commits", len(got))
 	}
 }
 

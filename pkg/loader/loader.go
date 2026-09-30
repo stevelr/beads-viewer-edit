@@ -1,28 +1,175 @@
 package loader
 
 import (
-	"bufio"
 	"bytes"
+	"context"
 	stdjson "encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 	"unicode/utf8"
 
+	"github.com/charmbracelet/x/ansi"
 	json "github.com/goccy/go-json"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // beadsMetadata is the subset of .beads/metadata.json we care about.
 type beadsMetadata struct {
 	Backend     string `json:"backend"`
+	Database    string `json:"database"`
 	JSONLExport string `json:"jsonl_export"`
+}
+
+type trackerCapabilities struct {
+	Executable string
+	Claim      bool
+	Error      string
+}
+
+var trackerCapabilityCache sync.Map
+
+// installedTrackerCapabilities only runs help, never a command that opens or
+// changes a tracker. Include executable identity in the cache key so replacing
+// an installed version during a long-running TUI invalidates its capabilities.
+func installedTrackerCapabilities(tracker string) trackerCapabilities {
+	executable, err := exec.LookPath(tracker)
+	if err != nil {
+		return trackerCapabilities{Error: "tracker executable is unavailable: " + tracker}
+	}
+	executable, err = filepath.Abs(executable)
+	if err != nil {
+		return trackerCapabilities{Error: "cannot resolve tracker executable"}
+	}
+	info, err := os.Stat(executable)
+	if err != nil {
+		return trackerCapabilities{Error: "cannot inspect tracker executable"}
+	}
+	key := fmt.Sprintf("%s:%d:%d", executable, info.Size(), info.ModTime().UnixNano())
+	if cached, ok := trackerCapabilityCache.Load(key); ok {
+		return cached.(trackerCapabilities)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	help, err := exec.CommandContext(ctx, executable, "update", "--help").Output()
+	caps := trackerCapabilities{Executable: executable}
+	if err != nil {
+		caps.Error = "cannot establish installed tracker capabilities"
+	} else {
+		// Trackers may honor inherited forced-color settings even when help is
+		// piped. Styling must not change exact capability-token recognition.
+		fields := strings.Fields(ansi.Strip(string(help)))
+		has := func(flag string) bool {
+			for _, field := range fields {
+				if field == flag {
+					return true
+				}
+			}
+			return false
+		}
+		if !has("--db") || !has("--json") || (tracker == "br" && (!has("--no-auto-import") || !has("--no-auto-flush"))) {
+			caps.Error = "installed tracker cannot bind the required explicit database route"
+		}
+		caps.Claim = has("--claim")
+	}
+	trackerCapabilityCache.Store(key, caps)
+	return caps
+}
+
+// AttachIssueOrigins binds IDs to an actual metadata-declared source before
+// any display namespace is applied. An arbitrary --db JSONL/SQLite input stays
+// readable but cannot borrow a nearby tracker merely by containing matching IDs.
+func AttachIssueOrigins(issues []model.Issue, sourcePath string, complete bool) {
+	origin := resolveIssueOrigin(sourcePath)
+	if !complete && origin.ReadOnlyReason == "" {
+		origin.ReadOnlyReason = "source authority is incomplete or stale"
+	}
+	for i := range issues {
+		local := origin
+		local.LocalID = issues[i].ID
+		issues[i].Origin = &local
+	}
+}
+
+func resolveIssueOrigin(sourcePath string) model.IssueOrigin {
+	origin := model.IssueOrigin{}
+	refuse := func(reason string) model.IssueOrigin {
+		origin.ReadOnlyReason = reason
+		return origin
+	}
+	path, err := filepath.Abs(sourcePath)
+	if err == nil {
+		path, err = filepath.EvalSymlinks(path)
+	}
+	if err != nil {
+		return refuse("source path cannot be resolved to a live tracker")
+	}
+	beadsDir := filepath.Dir(path)
+	metadata, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
+	if err != nil {
+		return refuse("source has no readable tracker metadata")
+	}
+	var meta beadsMetadata
+	if err := stdjson.Unmarshal(metadata, &meta); err != nil {
+		return refuse("source tracker metadata is invalid")
+	}
+	switch strings.ToLower(strings.TrimSpace(meta.Backend)) {
+	case "", "sqlite", "dolt":
+	default:
+		return refuse("unsupported tracker backend: " + meta.Backend)
+	}
+	origin.TrackerDirectory, origin.WorkingDirectory = beadsDir, filepath.Dir(beadsDir)
+	origin.Tracker = "br"
+	resolve := func(name string) (string, error) {
+		if name == "" {
+			return "", fmt.Errorf("empty tracker path")
+		}
+		if !filepath.IsAbs(name) {
+			name = filepath.Join(beadsDir, name)
+		}
+		return filepath.EvalSymlinks(name)
+	}
+	if IsBDWorkspace(beadsDir) {
+		origin.Tracker = "bd"
+		// The bd bridge specifically exports issues.jsonl from this Dolt
+		// directory. An unrelated sidecar is not that live source.
+		if filepath.Base(path) != "issues.jsonl" {
+			return refuse("source is not the live bd compatibility export")
+		}
+		origin.Database = beadsDir
+	} else {
+		database, dbErr := resolve(meta.Database)
+		if dbErr != nil {
+			return refuse("metadata does not resolve to an existing tracker database")
+		}
+		info, err := os.Stat(database)
+		if err != nil || !info.Mode().IsRegular() {
+			return refuse("metadata database is not a regular file")
+		}
+		exportPath, _ := resolve(meta.JSONLExport)
+		if path != database && path != exportPath {
+			return refuse("source is not the metadata-declared live database or export")
+		}
+		origin.Database = database
+	}
+	caps := installedTrackerCapabilities(origin.Tracker)
+	if caps.Error != "" {
+		return refuse(caps.Error)
+	}
+	origin.Executable, origin.SupportsClaim = caps.Executable, caps.Claim
+	return origin
 }
 
 // BeadsDirEnvVar is the name of the environment variable for custom beads directory
@@ -44,14 +191,23 @@ var PreferredJSONLNames = []string{"issues.jsonl", "beads.jsonl", "beads.base.js
 //  3. .beads in the given repoPath (or cwd if empty)
 //  4. .beads in the main git repository root (for worktrees)
 func GetBeadsDir(repoPath string) (string, error) {
+	beadsDir, _, err := GetBeadsDirWithTrace(repoPath)
+	return beadsDir, err
+}
+
+// GetBeadsDirWithTrace resolves the same tracker authority as GetBeadsDir and
+// also returns every redirect file whose present or future value can alter that
+// route. The trace includes the terminal directory's absent redirect path so a
+// watcher can observe a newly added hop.
+func GetBeadsDirWithTrace(repoPath string) (string, []string, error) {
 	// Check BEADS_DB environment variable first (highest priority after --db flag)
-	if envDB := os.Getenv(BeadsDBEnvVar); envDB != "" {
-		return resolveBeadsDB(envDB)
+	if envDB := env.BeadsDB.Get(); envDB != "" {
+		return resolveBeadsDBWithTrace(envDB)
 	}
 
 	// Check BEADS_DIR environment variable
-	if envDir := os.Getenv(BeadsDirEnvVar); envDir != "" {
-		return envDir, nil
+	if envDir := env.BeadsDir.Get(); envDir != "" {
+		return resolveBeadsRedirect(envDir)
 	}
 
 	// Fall back to .beads in repo path
@@ -59,14 +215,16 @@ func GetBeadsDir(repoPath string) (string, error) {
 		var err error
 		repoPath, err = os.Getwd()
 		if err != nil {
-			return "", fmt.Errorf("failed to get current working directory: %w", err)
+			return "", nil, fmt.Errorf("failed to get current working directory: %w", err)
 		}
 	}
 
 	// Check for .beads in the given path first
 	beadsDir := filepath.Join(repoPath, ".beads")
 	if _, err := os.Stat(beadsDir); err == nil {
-		return followBeadsRedirect(beadsDir)
+		return resolveBeadsRedirect(beadsDir)
+	} else if !os.IsNotExist(err) {
+		return "", nil, fmt.Errorf("inspect beads directory %s: %w", beadsDir, err)
 	}
 
 	// If not found, check if we're in a git worktree and look in the main repo
@@ -74,13 +232,15 @@ func GetBeadsDir(repoPath string) (string, error) {
 	if err == nil && mainRepoRoot != "" && mainRepoRoot != repoPath {
 		mainBeadsDir := filepath.Join(mainRepoRoot, ".beads")
 		if _, err := os.Stat(mainBeadsDir); err == nil {
-			return followBeadsRedirect(mainBeadsDir)
+			return resolveBeadsRedirect(mainBeadsDir)
+		} else if !os.IsNotExist(err) {
+			return "", nil, fmt.Errorf("inspect main repository beads directory %s: %w", mainBeadsDir, err)
 		}
 	}
 
 	// Return the original path even if .beads doesn't exist
 	// (caller will handle the error)
-	return beadsDir, nil
+	return beadsDir, []string{filepath.Join(beadsDir, "redirect")}, nil
 }
 
 // maxRedirectBytes and maxRedirectDepth bound .beads/redirect resolution,
@@ -97,23 +257,30 @@ const (
 // a .beads/_beads directory) is surfaced as an error rather than silently
 // falling back to the local .beads, which would reintroduce the stale-read bug.
 func followBeadsRedirect(beadsDir string) (string, error) {
+	resolved, _, err := resolveBeadsRedirect(beadsDir)
+	return resolved, err
+}
+
+func resolveBeadsRedirect(beadsDir string) (string, []string, error) {
 	current := beadsDir
 	if abs, err := filepath.Abs(current); err == nil {
 		current = abs
 	}
 	start := current
 	visited := map[string]bool{current: true}
+	redirectFiles := make([]string, 0, 2)
 
 	for depth := 0; ; depth++ {
+		redirectFiles = append(redirectFiles, filepath.Join(current, "redirect"))
 		target, ok, err := readBeadsRedirect(current)
 		if err != nil {
-			return "", err
+			return "", redirectFiles, err
 		}
 		if !ok {
 			break
 		}
 		if depth >= maxRedirectDepth {
-			return "", fmt.Errorf("redirect chain exceeds max depth (%d): %s", maxRedirectDepth, beadsDir)
+			return "", redirectFiles, fmt.Errorf("redirect chain exceeds max depth (%d): %s", maxRedirectDepth, beadsDir)
 		}
 		if abs, err := filepath.Abs(target); err == nil {
 			target = abs
@@ -122,7 +289,7 @@ func followBeadsRedirect(beadsDir string) (string, error) {
 			break
 		}
 		if visited[target] {
-			return "", fmt.Errorf("redirect loop detected: %s -> %s", current, target)
+			return "", redirectFiles, fmt.Errorf("redirect loop detected: %s -> %s", current, target)
 		}
 		visited[target] = true
 		current = target
@@ -130,17 +297,31 @@ func followBeadsRedirect(beadsDir string) (string, error) {
 
 	// No redirect was followed: return the original directory untouched.
 	if current == start {
-		return beadsDir, nil
+		return beadsDir, redirectFiles, nil
 	}
 
 	info, err := os.Stat(current)
 	if err != nil || !info.IsDir() {
-		return "", fmt.Errorf("redirect target not found: %s", current)
+		return "", redirectFiles, fmt.Errorf("redirect target not found: %s", current)
 	}
 	if base := filepath.Base(current); base != ".beads" && base != "_beads" {
-		return "", fmt.Errorf("redirect target must be a .beads or _beads directory: %s", current)
+		return "", redirectFiles, fmt.Errorf("redirect target must be a .beads or _beads directory: %s", current)
 	}
-	return current, nil
+	return current, redirectFiles, nil
+}
+
+// ResolveBeadsDir follows a checked .beads/redirect chain for an explicitly
+// chosen tracker directory without consulting BEADS_DB or BEADS_DIR. Workspace
+// loaders use this to preserve each repository's configured route instead of
+// letting one ambient process-wide selector override every workspace entry.
+func ResolveBeadsDir(beadsDir string) (string, error) {
+	return followBeadsRedirect(beadsDir)
+}
+
+// ResolveBeadsDirWithTrace is ResolveBeadsDir plus the redirect-file trace used
+// by long-lived watchers.
+func ResolveBeadsDirWithTrace(beadsDir string) (string, []string, error) {
+	return resolveBeadsRedirect(beadsDir)
 }
 
 // readBeadsRedirect reads the redirect file inside beadsDir. It returns the
@@ -148,17 +329,51 @@ func followBeadsRedirect(beadsDir string) (string, error) {
 // targets resolve against beadsDir itself (so "." stays in place), matching br.
 func readBeadsRedirect(beadsDir string) (string, bool, error) {
 	redirectPath := filepath.Join(beadsDir, "redirect")
-	info, err := os.Stat(redirectPath)
-	if err != nil || info.IsDir() {
+	pathInfo, err := os.Stat(redirectPath)
+	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+		// No redirect file, or beadsDir is not a directory at all: report no
+		// redirect and let the caller's directory read produce the real error.
 		return "", false, nil
 	}
-	if info.Size() > maxRedirectBytes {
+	if err != nil {
+		return "", false, fmt.Errorf("failed to inspect redirect file %s: %w", redirectPath, err)
+	}
+	if !pathInfo.Mode().IsRegular() {
+		return "", false, fmt.Errorf("redirect path is not a regular file: %s", redirectPath)
+	}
+	if pathInfo.Size() > maxRedirectBytes {
 		return "", false, fmt.Errorf("redirect file exceeds maximum size of %d bytes: %s", maxRedirectBytes, redirectPath)
 	}
 
-	data, err := os.ReadFile(redirectPath)
+	file, err := os.Open(redirectPath)
 	if err != nil {
 		return "", false, fmt.Errorf("failed to read redirect file %s: %w", redirectPath, err)
+	}
+	defer func() { _ = file.Close() }()
+
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return "", false, fmt.Errorf("failed to inspect opened redirect file %s: %w", redirectPath, err)
+	}
+	if !sameFileSnapshot(pathInfo, openedInfo) {
+		return "", false, fmt.Errorf("redirect file changed while being opened: %s", redirectPath)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(file, maxRedirectBytes+1))
+	if err != nil {
+		return "", false, fmt.Errorf("failed to read redirect file %s: %w", redirectPath, err)
+	}
+	if len(data) > maxRedirectBytes {
+		return "", false, fmt.Errorf("redirect file exceeds maximum size of %d bytes: %s", maxRedirectBytes, redirectPath)
+	}
+
+	afterInfo, err := file.Stat()
+	if err != nil {
+		return "", false, fmt.Errorf("failed to inspect redirect file after reading %s: %w", redirectPath, err)
+	}
+	currentPathInfo, err := os.Stat(redirectPath)
+	if err != nil || !sameFileSnapshot(openedInfo, afterInfo) || !sameFileSnapshot(afterInfo, currentPathInfo) {
+		return "", false, fmt.Errorf("redirect file changed while being read: %s", redirectPath)
 	}
 	if !utf8.Valid(data) {
 		return "", false, fmt.Errorf("redirect file must be valid UTF-8: %s", redirectPath)
@@ -174,6 +389,14 @@ func readBeadsRedirect(beadsDir string) (string, bool, error) {
 	return target, true, nil
 }
 
+func sameFileSnapshot(a, b os.FileInfo) bool {
+	return a != nil && b != nil &&
+		os.SameFile(a, b) &&
+		a.Mode() == b.Mode() &&
+		a.Size() == b.Size() &&
+		a.ModTime().Equal(b.ModTime())
+}
+
 // resolveBeadsDB interprets a BEADS_DB value which can be either:
 //   - An absolute path to a specific file (e.g., /path/to/.beads/beads.{jsonl,db,sqlite3})
 //   - An absolute path to a .beads directory
@@ -181,22 +404,27 @@ func readBeadsRedirect(beadsDir string) (string, bool, error) {
 // If it points to a file, returns the parent directory.
 // If it points to a directory, returns the directory itself.
 func resolveBeadsDB(dbPath string) (string, error) {
+	beadsDir, _, err := resolveBeadsDBWithTrace(dbPath)
+	return beadsDir, err
+}
+
+func resolveBeadsDBWithTrace(dbPath string) (string, []string, error) {
 	info, err := os.Stat(dbPath)
 	if err != nil {
 		// Path doesn't exist yet -- guess based on whether it looks like a file path
 		if looksLikeBeadsDBFile(dbPath) {
-			return filepath.Dir(dbPath), nil
+			return filepath.Dir(dbPath), nil, nil
 		}
 		// Assume it's a directory
-		return dbPath, nil
+		return resolveBeadsRedirect(dbPath)
 	}
 
 	if info.IsDir() {
-		return dbPath, nil
+		return resolveBeadsRedirect(dbPath)
 	}
 
 	// It's a file -- return the parent directory
-	return filepath.Dir(dbPath), nil
+	return filepath.Dir(dbPath), nil, nil
 }
 
 func looksLikeBeadsDBFile(dbPath string) bool {
@@ -290,11 +518,20 @@ func exportBDIssuesJSONL(beadsDir, issuesPath string) error {
 	if _, err := exec.LookPath("bd"); err != nil {
 		return fmt.Errorf("bd binary not found in PATH")
 	}
+	absBeadsDir, err := filepath.Abs(beadsDir)
+	if err != nil {
+		return fmt.Errorf("resolve bd workspace path %s: %w", beadsDir, err)
+	}
+	absIssuesPath, err := filepath.Abs(issuesPath)
+	if err != nil {
+		return fmt.Errorf("resolve bd export path %s: %w", issuesPath, err)
+	}
 
-	repoRoot := filepath.Dir(beadsDir)
-	cmd := exec.Command("bd", "export", "-o", issuesPath)
+	repoRoot := filepath.Dir(absBeadsDir)
+	cmd := exec.Command("bd", "export", "-o", absIssuesPath)
 	cmd.Dir = repoRoot
-	cmd.Env = append(os.Environ(), fmt.Sprintf("%s=%s", BeadsDirEnvVar, beadsDir))
+	env := withoutBeadsAuthorityEnv(os.Environ())
+	cmd.Env = append(env, fmt.Sprintf("%s=%s", BeadsDirEnvVar, absBeadsDir))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
@@ -304,6 +541,18 @@ func exportBDIssuesJSONL(beadsDir, issuesPath string) error {
 		return fmt.Errorf("%w: %s", err, msg)
 	}
 	return nil
+}
+
+func withoutBeadsAuthorityEnv(entries []string) []string {
+	env := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.EqualFold(key, BeadsDirEnvVar) || strings.EqualFold(key, BeadsDBEnvVar) {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return env
 }
 
 // getMainRepoRoot returns the root directory of the main git repository.
@@ -351,10 +600,76 @@ func getMainRepoRoot(repoPath string) (string, error) {
 	return mainRepoRoot, nil
 }
 
+// GetGitWorktreeRoot returns the top-level directory of the Git worktree that
+// owns repoPath. Unlike getMainRepoRoot, it deliberately preserves linked
+// worktree identity; caller-owned artifacts such as .bv indexes and baselines
+// belong to the invoking checkout, not beside a redirected/shared tracker or
+// in the main checkout. Ambient Git routing variables are removed so a parent
+// hook cannot redirect the lookup into another repository.
+func GetGitWorktreeRoot(repoPath string) (string, error) {
+	if strings.TrimSpace(repoPath) == "" {
+		var err error
+		repoPath, err = os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("get current directory: %w", err)
+		}
+	}
+	cmd := exec.Command("git", "--no-replace-objects", "rev-parse", "--show-toplevel")
+	cmd.Dir = repoPath
+	cmd.Env = gitLoaderEnvironment()
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve Git worktree root from %s: %w", repoPath, err)
+	}
+	root := strings.TrimSpace(string(out))
+	if root == "" {
+		return "", fmt.Errorf("resolve Git worktree root from %s: empty output", repoPath)
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve absolute Git worktree root %s: %w", root, err)
+	}
+	return filepath.Clean(absRoot), nil
+}
+
+// GetGitDir returns the absolute Git administrative directory for repoPath.
+// Ambient Git routing/configuration variables are removed so cmd.Dir remains
+// the sole repository authority. In a linked worktree this intentionally
+// returns that worktree's administrative directory, matching `git rev-parse
+// --git-dir` and the location used for its beads-worktrees exports.
+func GetGitDir(repoPath string) (string, error) {
+	if strings.TrimSpace(repoPath) == "" {
+		var err error
+		repoPath, err = os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("get current directory: %w", err)
+		}
+	}
+	absRepoPath, err := filepath.Abs(repoPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve repository path %s: %w", repoPath, err)
+	}
+	cmd := exec.Command("git", "--no-replace-objects", "rev-parse", "--git-dir")
+	cmd.Dir = absRepoPath
+	cmd.Env = gitLoaderEnvironment()
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve Git directory from %s: %w", repoPath, err)
+	}
+	gitDir := strings.TrimSpace(string(out))
+	if gitDir == "" {
+		return "", fmt.Errorf("resolve Git directory from %s: empty output", repoPath)
+	}
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(absRepoPath, gitDir)
+	}
+	return filepath.Clean(gitDir), nil
+}
+
 // FindJSONLPath locates the beads JSONL file in the given directory.
 // Prefers issues.jsonl (current br) over beads.jsonl (legacy bd) and
-// beads.base.jsonl (daemon/base export). Skips backup files and merge artifacts.
-// Skips backup files and merge artifacts.
+// beads.base.jsonl (base snapshot). An existing empty export is authoritative;
+// other JSONL names require an explicit file override.
 func FindJSONLPath(beadsDir string) (string, error) {
 	return FindJSONLPathWithWarnings(beadsDir, nil)
 }
@@ -424,8 +739,13 @@ func FindJSONLPathWithWarnings(beadsDir string, warnFunc func(msg string)) (stri
 		for _, name := range candidates {
 			if name == preferred {
 				path := filepath.Join(beadsDir, name)
-				// Check if file has content (skip empty files)
-				if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+				info, err := os.Stat(path)
+				if err != nil {
+					return "", fmt.Errorf("inspect beads JSONL file %s: %w", path, err)
+				}
+				// Empty exports represent empty projects. Do not resurrect an
+				// older snapshot merely because it still contains records.
+				if info.Mode().IsRegular() {
 					return path, nil
 				}
 			}
@@ -435,26 +755,14 @@ func FindJSONLPathWithWarnings(beadsDir string, warnFunc func(msg string)) (stri
 	// In a bd (Dolt-backed) workspace the issue data lives in the Dolt
 	// database; never fall back to a stray non-issue JSONL (memories,
 	// interactions, ...) — that silently reports an empty project (#189).
-	// Accept an existing-but-empty compatibility export (a legitimately empty
-	// project); otherwise require the export.
+	// Empty compatibility exports were accepted above; otherwise require the
+	// export rather than accepting an unrelated file or a directory.
 	if isBD {
 		issuesPath := filepath.Join(beadsDir, "issues.jsonl")
-		if _, err := os.Stat(issuesPath); err == nil {
-			return issuesPath, nil
-		}
 		return "", fmt.Errorf("no compatibility JSONL found at %s; run 'bd export -o .beads/issues.jsonl'", issuesPath)
 	}
 
-	// Fall back to first non-empty candidate
-	for _, name := range candidates {
-		path := filepath.Join(beadsDir, name)
-		if info, err := os.Stat(path); err == nil && info.Size() > 0 {
-			return path, nil
-		}
-	}
-
-	// Last resort: return first candidate even if empty
-	return filepath.Join(beadsDir, candidates[0]), nil
+	return "", fmt.Errorf("no beads JSONL file found in %s (expected %s; use an explicit file override for other names)", beadsDir, strings.Join(preferredNames, ", "))
 }
 
 func metadataJSONLExportName(beadsDir string) string {
@@ -510,6 +818,32 @@ func LoadIssues(repoPath string) ([]model.Issue, error) {
 // DefaultMaxBufferSize is the default buffer size for the scanner (10MB).
 const DefaultMaxBufferSize = 1024 * 1024 * 10
 
+// MaxLineSizeEnvVar overrides DefaultMaxBufferSize; the value is in megabytes.
+const MaxLineSizeEnvVar = "BV_MAX_LINE_SIZE_MB"
+
+// maxLineSizeMB caps MaxLineSizeEnvVar so a typo cannot ask for terabytes.
+const maxLineSizeMB = 1024
+
+// MaxLineSizeFromEnv returns the maximum JSONL line size in bytes configured
+// through BV_MAX_LINE_SIZE_MB, or 0 when the variable is unset or invalid
+// (ParseOptions treats 0 as DefaultMaxBufferSize). Every loading path — TUI
+// and robot/datasource alike — must consult this so the documented variable
+// has one meaning.
+func MaxLineSizeFromEnv() int {
+	raw := strings.TrimSpace(env.MaxLineSizeMB.Get())
+	if raw == "" {
+		return 0
+	}
+	mb, err := strconv.Atoi(raw)
+	if err != nil || mb <= 0 {
+		return 0
+	}
+	if mb > maxLineSizeMB {
+		mb = maxLineSizeMB
+	}
+	return mb * 1024 * 1024
+}
+
 // ParseOptions configures the behavior of ParseIssues.
 type ParseOptions struct {
 	// WarningHandler is called with warning messages (e.g., malformed JSON).
@@ -525,14 +859,21 @@ type ParseOptions struct {
 	// When nil, all valid issues are included.
 	IssueFilter func(*model.Issue) bool
 
-	// Stats, when non-nil, receives per-line accounting as the stream is
-	// parsed. This lets a single fused loader pass also serve as the
+	// Stats, when non-nil, receives source-order per-line accounting as the
+	// stream is parsed. This lets a single fused loader pass also serve as the
 	// validation pass (issue count + malformed-error-rate gate) so the
 	// 1.9MB issues.jsonl is read once instead of validate-then-load.
-	// Only issue-shaped records are accounted; non-issue `_type` records,
-	// empty lines, and long-skipped lines are not counted toward the gate,
-	// matching datasource.validateJSONL semantics.
+	// Issue-shaped records and over-limit lines that could not be classified are
+	// accounted; recognized non-issue `_type` records are Skipped, while empty
+	// lines are ignored. Treating an unreadable over-limit line as an error keeps
+	// callers from mistaking a partial issue universe for a complete load.
 	Stats *ParseStats
+
+	// WarningCount, when non-nil, is incremented once for every warning the
+	// parser encounters, even when WarningHandler is nil or a higher-level
+	// caller summarizes the warning text. This is separate from Stats.Errors:
+	// source-authority callers can add non-parse warnings to the same count.
+	WarningCount *int
 }
 
 // ParseStats accumulates per-line accounting for a single parse pass so a load
@@ -540,17 +881,21 @@ type ParseOptions struct {
 // second read of the file. The categories mirror datasource.validateJSONL: a line
 // counts toward Valid when its JSON decodes AND the resulting issue passes model
 // validation (which subsumes the required id/title/status check), and toward
-// Errors when the JSON is malformed OR the issue fails validation. Empty lines
-// and over-long skipped lines are not accounted. Recognized non-issue `_type`
+// Errors when the JSON is malformed, the issue fails validation, a later
+// validated record repeats an earlier issue ID, OR an over-limit line cannot be
+// parsed far enough to classify. Duplicate records are removed from Valid and
+// added to Errors. Empty lines are not accounted. Recognized non-issue `_type`
 // records (and unknown `_type`) count toward Skipped — they are not errors, but
 // a file made ENTIRELY of them yielded zero issues, which callers use to reject a
 // wrong/non-issue source (e.g. a stray sprints.jsonl) rather than treat it as a
 // valid empty project.
 type ParseStats struct {
-	// Valid is the number of issue-shaped lines that parsed and validated.
+	// Valid is the number of unique issue-shaped lines that parsed and validated.
 	Valid int
 	// Errors is the number of issue-shaped lines that were malformed JSON or
-	// failed model validation (e.g. missing required fields).
+	// failed model validation (e.g. missing required fields), plus duplicate IDs
+	// and lines dropped for exceeding the per-line byte cap. Every dropped
+	// record counts here so load_stats can surface it.
 	Errors int
 	// Skipped is the number of recognized non-issue `_type` records (memory,
 	// sprint, forecast, burndown, ignore) plus unknown `_type` records — content
@@ -568,18 +913,50 @@ func (s ParseStats) ErrorRate() float64 {
 	return float64(s.Errors) / float64(total)
 }
 
+// openIssuesFile opens a regular file whose identity, mode, size and mtime match
+// its inspected snapshot. Concurrent append or atomic replacement can invalidate
+// that snapshot; discard the handle and inspect/open again without ever reading
+// an unverified handle. Other errors remain immediate, and continuous changes
+// are refused after a bounded number of attempts.
+func openIssuesFile(path string, openFile func(string) (*os.File, error)) (*os.File, error) {
+	const maxOpenAttempts = 3
+	for attempt := 0; attempt < maxOpenAttempts; attempt++ {
+		pathInfo, err := os.Stat(path)
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("no beads issues found at %s", path)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect issues file %s: %w", path, err)
+		}
+		if !pathInfo.Mode().IsRegular() {
+			return nil, fmt.Errorf("issues path is not a regular file: %s", path)
+		}
+
+		file, err := openFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open issues file: %w", err)
+		}
+		openedInfo, err := file.Stat()
+		if err != nil {
+			_ = file.Close()
+			return nil, fmt.Errorf("failed to inspect opened issues file %s: %w", path, err)
+		}
+		if sameFileSnapshot(pathInfo, openedInfo) {
+			return file, nil
+		}
+		_ = file.Close()
+	}
+	return nil, fmt.Errorf("issues file changed while being opened: %s", path)
+}
+
 // LoadIssuesFromFileWithOptions reads issues from a file with custom options.
 func LoadIssuesFromFileWithOptions(path string, opts ParseOptions) ([]model.Issue, error) {
-	// Check if file exists
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return nil, fmt.Errorf("no beads issues found at %s", path)
-	}
-
-	file, err := os.Open(path)
+	defer metrics.Timer(metrics.LoaderParse)()
+	file, err := openIssuesFile(path, os.Open)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open issues file: %w", err)
+		return nil, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	return ParseIssuesWithOptions(file, opts)
 }
@@ -587,16 +964,12 @@ func LoadIssuesFromFileWithOptions(path string, opts ParseOptions) ([]model.Issu
 // LoadIssuesFromFileWithOptionsPooled reads issues from a file with pooling enabled.
 // The caller must return pooled issues via ReturnIssuePtrsToPool when no longer needed.
 func LoadIssuesFromFileWithOptionsPooled(path string, opts ParseOptions) (PooledIssues, error) {
-	// Check if file exists
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return PooledIssues{}, fmt.Errorf("no beads issues found at %s", path)
-	}
-
-	file, err := os.Open(path)
+	defer metrics.Timer(metrics.LoaderParse)()
+	file, err := openIssuesFile(path, os.Open)
 	if err != nil {
-		return PooledIssues{}, fmt.Errorf("failed to open issues file: %w", err)
+		return PooledIssues{}, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	return ParseIssuesWithOptionsPooled(file, opts)
 }
@@ -635,10 +1008,7 @@ func ParseIssuesWithOptionsPooled(r io.Reader, opts ParseOptions) (PooledIssues,
 
 func parseIssuesWithOptions(r io.Reader, opts ParseOptions, usePool bool) ([]model.Issue, []*model.Issue, error) {
 	// Determine buffer size (the 10MB-default per-line cap).
-	maxCapacity := opts.BufferSize
-	if maxCapacity <= 0 {
-		maxCapacity = DefaultMaxBufferSize
-	}
+	maxCapacity := effectiveMaxCapacity(opts.BufferSize)
 
 	// Parallel fast path: for large on-disk files, JSONL is line-independent
 	// (one JSON object per line), so the decode is embarrassingly parallel.
@@ -646,22 +1016,25 @@ func parseIssuesWithOptions(r io.Reader, opts ParseOptions, usePool bool) ([]mod
 	// chunks across a bounded worker pool, and reassemble in ORIGINAL ORDER.
 	// This is the alien-graveyard §8.2 "morsel-driven parallelism" pattern:
 	// fixed-size morsels pulled by a bounded set of workers, with results
-	// stitched back deterministically. The path is byte-equivalent to the
+	// stitched back deterministically. The path is behavior-equivalent to the
 	// serial loop below (same BOM strip, same _type dispatch, same warnings in
-	// original line order, same ParseStats, same pooled deep-copy semantics);
+	// original line order, same sequential filter calls, same ParseStats, and
+	// the same pooled deep-copy semantics);
 	// see parseIssuesParallel and the differential test in loader_test.go.
 	if f, ok := r.(*os.File); ok {
-		if info, err := f.Stat(); err == nil && info.Size() >= parallelParseMinBytes {
-			data, rerr := io.ReadAll(f)
+		if info, err := f.Stat(); err == nil && info.Size() >= parallelParseMinBytes && info.Size() <= parallelParseMaxBytes {
+			data, withinLimit, rerr := readParallelCandidateBounded(f, parallelParseMaxBytes)
 			if rerr != nil {
 				return nil, nil, fmt.Errorf("error reading issues stream: %w", rerr)
 			}
-			if countLines(data) >= parallelParseMinLines {
-				return parseIssuesParallel(data, opts, usePool, maxCapacity)
+			if withinLimit {
+				if countLines(data) >= parallelParseMinLines {
+					return parseIssuesParallel(data, opts, usePool, maxCapacity)
+				}
+				// Small line count after all: fall back to the serial reader over
+				// the bytes we already slurped (avoids a second read).
+				r = bytes.NewReader(data)
 			}
-			// Small line count after all: fall back to the serial reader over
-			// the bytes we already slurped (avoids a second read).
-			r = bytes.NewReader(data)
 		}
 	}
 
@@ -679,9 +1052,15 @@ func parseIssuesWithOptions(r io.Reader, opts ParseOptions, usePool bool) ([]mod
 		}
 	}
 
-	reader := bufio.NewReaderSize(r, maxCapacity)
+	reader, cacheReader := acquireParseReader(r, maxCapacity)
+	if cacheReader {
+		defer releaseParseReader(reader)
+	}
 
-	warn := resolveWarnHandler(opts.WarningHandler)
+	warn := resolveWarnHandler(opts.WarningHandler, opts.WarningCount)
+	decodeOpts := opts
+	decodeOpts.IssueFilter = nil
+	seenIDs := make(map[string]struct{})
 
 	lineNum := 0
 	for {
@@ -701,7 +1080,13 @@ func parseIssuesWithOptions(r io.Reader, opts ParseOptions, usePool bool) ([]mod
 		}
 
 		if isPrefix {
-			// Line too long. Discard the rest of the line.
+			// Line too long. Discard the rest of the line. It is a dropped
+			// record, so it counts as an error: robot load_stats must surface
+			// it just like malformed JSON (#190). Count before warning so a
+			// handler that inspects Stats sees the record already accounted.
+			if opts.Stats != nil {
+				opts.Stats.Errors++
+			}
 			warn(fmt.Sprintf("skipping line %d: line too long (exceeds %d bytes)", lineNum, maxCapacity))
 			for isPrefix {
 				_, isPrefix, err = reader.ReadLine()
@@ -718,7 +1103,9 @@ func parseIssuesWithOptions(r io.Reader, opts ParseOptions, usePool bool) ([]mod
 			continue
 		}
 
-		if len(line) == 0 {
+		// Match datasource validation semantics: blank lines containing spaces or
+		// tabs are formatting, not malformed issue records.
+		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 
@@ -727,18 +1114,96 @@ func parseIssuesWithOptions(r io.Reader, opts ParseOptions, usePool bool) ([]mod
 			line = stripBOM(line)
 		}
 
-		issues, poolRefs = processIssueLine(line, lineNum, opts, usePool, issues, poolRefs, opts.Stats, warn)
+		before := len(issues)
+		issues, poolRefs = processIssueLine(line, lineNum, decodeOpts, usePool, issues, poolRefs, opts.Stats, warn)
+		if len(issues) != before && !keepParsedIssue(
+			&issues[len(issues)-1], pooledRefAt(poolRefs, len(issues)-1), lineNum,
+			opts, seenIDs, warn,
+		) {
+			clear(issues[len(issues)-1:])
+			issues = issues[:len(issues)-1]
+			if usePool {
+				clear(poolRefs[len(poolRefs)-1:])
+				poolRefs = poolRefs[:len(poolRefs)-1]
+			}
+		}
 	}
 
+	issues, poolRefs = normalizeEmptyIssueResults(issues, poolRefs)
 	internRepeatedIssueStrings(issues, poolRefs)
 	return issues, poolRefs, nil
+}
+
+// keepParsedIssue applies the order-sensitive policies that must remain serial:
+// duplicate rejection and the caller-provided filter. Duplicate accounting is
+// intentionally performed before filtering, so every validated record
+// participates in data-integrity checks even when its canonical record is not
+// selected for the returned view.
+func keepParsedIssue(
+	issue *model.Issue,
+	poolRef *model.Issue,
+	lineNum int,
+	opts ParseOptions,
+	seenIDs map[string]struct{},
+	warn func(string),
+) bool {
+	if _, exists := seenIDs[issue.ID]; exists {
+		if opts.Stats != nil {
+			if opts.Stats.Valid > 0 {
+				opts.Stats.Valid--
+			}
+			opts.Stats.Errors++
+		}
+		// Match malformed and validation warnings: callbacks observe the
+		// accounting state after this source line has been fully classified.
+		warn(fmt.Sprintf("skipping duplicate issue ID %q on line %d", issue.ID, lineNum))
+		if poolRef != nil {
+			PutIssue(poolRef)
+		}
+		return false
+	}
+	seenIDs[issue.ID] = struct{}{}
+
+	filterTarget := issue
+	if poolRef != nil {
+		filterTarget = poolRef
+	}
+	if opts.IssueFilter != nil && !opts.IssueFilter(filterTarget) {
+		if poolRef != nil {
+			PutIssue(poolRef)
+		}
+		return false
+	}
+	if poolRef != nil {
+		*issue = *poolRef
+		DeepCopyIssueSlices(issue)
+	}
+	return true
+}
+
+func pooledRefAt(poolRefs []*model.Issue, index int) *model.Issue {
+	if index >= 0 && index < len(poolRefs) {
+		return poolRefs[index]
+	}
+	return nil
+}
+
+func normalizeEmptyIssueResults(issues []model.Issue, poolRefs []*model.Issue) ([]model.Issue, []*model.Issue) {
+	if len(issues) == 0 {
+		issues = nil
+	}
+	if len(poolRefs) == 0 {
+		poolRefs = nil
+	}
+	return issues, poolRefs
 }
 
 // processIssueLine applies the full per-line loader semantics to a single
 // (BOM-stripped, non-empty, end-of-line-trimmed) JSONL line and appends any
 // resulting issue. It is the single source of truth shared by the serial reader
 // loop and the parallel chunk workers, guaranteeing the two paths are
-// byte-equivalent: same `_type` dispatch, same malformed/invalid handling, same
+// behavior-equivalent: same `_type` dispatch, same malformed/invalid handling,
+// same
 // warning text keyed by lineNum, same ParseStats accounting, and the same
 // pooled deep-copy semantics (bv-fn4b). It returns the (possibly grown) issues
 // and poolRefs slices. stats may be nil; warn must be non-nil.
@@ -811,12 +1276,10 @@ func processIssueLine(
 			return issues, poolRefs
 		}
 
-		// Append the struct value first, then deep-copy slice fields on the VALUE
-		// copy to break sharing with pooled backing arrays. This ensures that when
-		// the pooled issue is returned to the pool and its backing arrays are reused,
-		// the copied issue in the snapshot is not affected (bv-fn4b).
+		// Defer the deep copy until duplicate/filter policy accepts this record.
+		// Until then the value intentionally shares slice storage with poolRef;
+		// rejected rows can return to the pool without allocating a throwaway copy.
 		issues = append(issues, *issue)
-		DeepCopyIssueSlices(&issues[len(issues)-1])
 		poolRefs = append(poolRefs, issue)
 		return issues, poolRefs
 	}
@@ -857,8 +1320,9 @@ func processIssueLine(
 // Parallel-parse tuning. JSONL is line-independent, so for large files the
 // JSON decode is embarrassingly parallel. Below these thresholds the goroutine
 // + reassembly overhead outweighs the win, so we keep the serial path. The
-// byte threshold also bounds the io.ReadAll buffer: we only slurp the whole
-// file when it is big enough to benefit.
+// Byte thresholds bound the io.ReadAll buffer: we only slurp the whole file
+// when it is large enough to benefit and small enough not to turn the fast
+// path into a second, unbounded in-memory copy of a huge tracker export.
 const (
 	// parallelParseMinBytes is the file-size floor for attempting the parallel
 	// path, set from the MEASURED crossover. The JSONL parse is dominated by
@@ -875,6 +1339,12 @@ const (
 	// monorepo exports) get the parallel speedup. The threshold sits just below
 	// the crossover so we never knowingly pick the slower path.
 	parallelParseMinBytes = 4 * 1024 * 1024
+	// parallelParseMaxBytes caps the extra whole-file allocation made solely for
+	// parallel parsing. Larger files retain the streaming serial path, whose
+	// memory use is bounded by the line buffer plus the materialized issues. The
+	// measured large-file speedup extends through 40MB, so 128MB leaves ample
+	// headroom without making arbitrary-size exports candidates for io.ReadAll.
+	parallelParseMaxBytes = 128 * 1024 * 1024
 	// parallelParseMinLines is the line-count floor; a few huge lines should
 	// not trigger a parallel split that cannot actually distribute work.
 	parallelParseMinLines = 512
@@ -891,6 +1361,32 @@ const (
 	// too-large chunk target.
 	parallelParseChunksPerWorker = 3
 )
+
+// readParallelCandidateBounded reads at most maxBytes+1 bytes from the file's
+// current offset. When the file grew past the stat-based eligibility check, it
+// restores the original offset and tells the caller to retain the streaming
+// path. The reset preserves ParseIssues' existing behavior for callers that
+// intentionally pass an os.File positioned somewhere other than byte zero.
+func readParallelCandidateBounded(f *os.File, maxBytes int64) ([]byte, bool, error) {
+	if f == nil || maxBytes < 0 {
+		return nil, false, nil
+	}
+	start, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, false, nil
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(data)) <= maxBytes {
+		return data, true, nil
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return nil, false, fmt.Errorf("restore file offset after parallel-read limit: %w", err)
+	}
+	return nil, false, nil
+}
 
 // estimateIssueCap mirrors the serial pre-sizing heuristic: average issue line
 // ~2KB, conservatively under-estimated, clamped to [64, 200k].
@@ -911,15 +1407,22 @@ func estimateIssueCap(size int64) int {
 
 // resolveWarnHandler returns the effective warning sink: the caller's handler,
 // or the default stderr printer (suppressed under BV_ROBOT=1).
-func resolveWarnHandler(h func(string)) func(string) {
-	if h != nil {
-		return h
-	}
-	if os.Getenv("BV_ROBOT") == "1" {
-		return func(string) {}
+func resolveWarnHandler(h func(string), warningCount *int) func(string) {
+	sink := h
+	if sink == nil {
+		if env.Robot.Bool() {
+			sink = func(string) {}
+		} else {
+			sink = func(msg string) {
+				fmt.Fprintf(os.Stderr, "Warning: %s\n", msg)
+			}
+		}
 	}
 	return func(msg string) {
-		fmt.Fprintf(os.Stderr, "Warning: %s\n", msg)
+		if warningCount != nil {
+			*warningCount = *warningCount + 1
+		}
+		sink(msg)
 	}
 }
 
@@ -937,21 +1440,32 @@ func countLines(data []byte) int {
 	return n
 }
 
-// pendingWarn is a warning captured by a chunk worker, tagged with its global
-// line number so the orchestrator can replay warnings in original line order.
-type pendingWarn struct {
-	lineNum int
-	msg     string
+func effectiveMaxCapacity(requested int) int {
+	if requested <= 0 {
+		return DefaultMaxBufferSize
+	}
+	// bufio.Reader clamps smaller buffers to its internal minimum. Use the same
+	// effective cap in the parallel path so boundary behavior matches.
+	if requested < 16 {
+		return 16
+	}
+	return requested
+}
+
+type parsedLineEvent struct {
+	lineNum  int
+	stats    ParseStats
+	warns    []string
+	hasIssue bool
 }
 
 // chunkResult holds one chunk's decoded output in original intra-chunk order,
-// plus its accumulated stats and ordered warnings. Each worker owns its result
+// plus its ordered per-line events. Each worker owns its result
 // exclusively (no shared mutable state), so there are no data races.
 type chunkResult struct {
 	issues   []model.Issue
 	poolRefs []*model.Issue
-	stats    ParseStats
-	warns    []pendingWarn
+	events   []parsedLineEvent
 }
 
 // parseIssuesParallel decodes a whole JSONL buffer concurrently while remaining
@@ -963,7 +1477,11 @@ type chunkResult struct {
 // per-line cap, _type filtering, tombstone/normalize/validate semantics, and
 // ParseStats accounting all match the serial path exactly.
 func parseIssuesParallel(data []byte, opts ParseOptions, usePool bool, maxCapacity int) ([]model.Issue, []*model.Issue, error) {
-	warn := resolveWarnHandler(opts.WarningHandler)
+	maxCapacity = effectiveMaxCapacity(maxCapacity)
+	warn := resolveWarnHandler(opts.WarningHandler, opts.WarningCount)
+	decodeOpts := opts
+	decodeOpts.IssueFilter = nil
+	decodeOpts.Stats = nil
 
 	// Build line-aligned chunk boundaries. Each chunk is [start,end) over data,
 	// ending exactly after a '\n' (except possibly the last). We also record the
@@ -1048,7 +1566,7 @@ func parseIssuesParallel(data []byte, opts ParseOptions, usePool bool, maxCapaci
 					res.poolRefs = make([]*model.Issue, 0, est)
 				}
 			}
-			parseChunkLines(data[span.start:span.end], span.startLine, ci == 0, opts, usePool, maxCapacity, res)
+			parseChunkLines(data[span.start:span.end], span.startLine, ci == 0, decodeOpts, usePool, maxCapacity, res)
 		}
 	}
 	wg.Add(workers)
@@ -1065,32 +1583,78 @@ func parseIssuesParallel(data []byte, opts ParseOptions, usePool bool, maxCapaci
 		totalRefs += len(results[i].poolRefs)
 	}
 
-	issues := make([]model.Issue, 0, total)
+	var issues []model.Issue
+	if total > 0 {
+		issues = make([]model.Issue, 0, total)
+	}
 	var poolRefs []*model.Issue
-	if usePool {
+	if usePool && totalRefs > 0 {
 		poolRefs = make([]*model.Issue, 0, totalRefs)
 	}
-	var stats ParseStats
 	for i := range results {
 		issues = append(issues, results[i].issues...)
 		if usePool {
 			poolRefs = append(poolRefs, results[i].poolRefs...)
 		}
-		stats.Valid += results[i].stats.Valid
-		stats.Errors += results[i].stats.Errors
-		stats.Skipped += results[i].stats.Skipped
-		// Warnings within a chunk are already in line order; chunks are in
-		// order, so concatenating preserves global line order.
-		for _, pw := range results[i].warns {
-			warn(pw.msg)
+	}
+	decodedEvents := 0
+	for i := range results {
+		for _, event := range results[i].events {
+			if event.hasIssue {
+				decodedEvents++
+			}
 		}
 	}
-
-	if opts.Stats != nil {
-		opts.Stats.Valid += stats.Valid
-		opts.Stats.Errors += stats.Errors
-		opts.Stats.Skipped += stats.Skipped
+	if decodedEvents != len(issues) || (usePool && len(poolRefs) != len(issues)) {
+		// Validate the worker result before policy replay starts returning
+		// rejected objects to the pool. That keeps this defensive failure path
+		// from ever double-returning a reference after in-place compaction.
+		if usePool {
+			ReturnIssuePtrsToPool(poolRefs)
+		}
+		return nil, nil, fmt.Errorf(
+			"internal loader error: decoded %d issues, %d issue events, and %d pooled references",
+			len(issues), decodedEvents, len(poolRefs),
+		)
 	}
+
+	seenIDs := make(map[string]struct{}, len(issues))
+	keptIssues := issues[:0]
+	var keptRefs []*model.Issue
+	if usePool {
+		keptRefs = poolRefs[:0]
+	}
+	issueCursor := 0
+	for i := range results {
+		for _, event := range results[i].events {
+			if opts.Stats != nil {
+				opts.Stats.Valid += event.stats.Valid
+				opts.Stats.Errors += event.stats.Errors
+				opts.Stats.Skipped += event.stats.Skipped
+			}
+			for _, message := range event.warns {
+				warn(message)
+			}
+			if !event.hasIssue {
+				continue
+			}
+			ref := pooledRefAt(poolRefs, issueCursor)
+			if keepParsedIssue(&issues[issueCursor], ref, event.lineNum, opts, seenIDs, warn) {
+				keptIssues = append(keptIssues, issues[issueCursor])
+				if usePool {
+					keptRefs = append(keptRefs, ref)
+				}
+			}
+			issueCursor++
+		}
+	}
+	clear(issues[len(keptIssues):])
+	issues = keptIssues
+	if usePool {
+		clear(poolRefs[len(keptRefs):])
+		poolRefs = keptRefs
+	}
+	issues, poolRefs = normalizeEmptyIssueResults(issues, poolRefs)
 
 	internRepeatedIssueStrings(issues, poolRefs)
 	return issues, poolRefs, nil
@@ -1102,18 +1666,15 @@ func parseIssuesParallel(data []byte, opts ParseOptions, usePool bool, maxCapaci
 // consuming logic, strips the BOM from the very first line when isFirstChunk,
 // enforces the per-line byte cap (lines longer than maxCapacity are skipped
 // with the identical "line too long" warning and consume exactly one lineNum),
-// and otherwise defers to processIssueLine. Warnings are buffered with their
-// global line number for ordered replay by the caller.
+// and otherwise defers to processIssueLine. Per-line stats and warnings are
+// buffered for source-order replay by the caller before its filter callback.
 func parseChunkLines(chunk []byte, startLine int, isFirstChunk bool, opts ParseOptions, usePool bool, maxCapacity int, res *chunkResult) {
-	warn := func(lineNum int, msg string) {
-		res.warns = append(res.warns, pendingWarn{lineNum: lineNum, msg: msg})
-	}
-
 	lineNum := startLine - 1
 	for len(chunk) > 0 {
 		lineNum++
 		nl := bytes.IndexByte(chunk, '\n')
 		var line []byte
+		hasNewline := nl >= 0
 		if nl < 0 {
 			line = chunk
 			chunk = nil
@@ -1121,21 +1682,23 @@ func parseChunkLines(chunk []byte, startLine int, isFirstChunk bool, opts ParseO
 			line = chunk[:nl]
 			chunk = chunk[nl+1:]
 		}
-		// bufio.Reader.ReadLine strips the trailing CR of a CRLF line ending.
-		if n := len(line); n > 0 && line[n-1] == '\r' {
-			line = line[:n-1]
-		}
-
 		// Per-line byte cap. The serial path uses bufio.Reader.ReadLine, which
-		// sets isPrefix (→ skip) once a line's content length REACHES the buffer
-		// size, i.e. for len >= maxCapacity. Mirror that exactly (>=, not >), so a
-		// line of length exactly maxCapacity is skipped identically to serial.
+		// sets isPrefix (→ skip) when bytes before '\n' fill the buffer. Check the
+		// raw line before trimming CR so CRLF consumes the same capacity as serial.
 		if len(line) >= maxCapacity {
-			warn(lineNum, fmt.Sprintf("skipping line %d: line too long (exceeds %d bytes)", lineNum, maxCapacity))
+			message := fmt.Sprintf("skipping line %d: line too long (exceeds %d bytes)", lineNum, maxCapacity)
+			// A dropped record is an error, matching the serial path (#190).
+			res.events = append(res.events, parsedLineEvent{lineNum: lineNum, stats: ParseStats{Errors: 1}, warns: []string{message}})
 			continue
 		}
 
-		if len(line) == 0 {
+		// bufio.Reader.ReadLine strips CR only when it is immediately before a
+		// consumed newline. A bare CR on the final unterminated line is content.
+		if n := len(line); hasNewline && n > 0 && line[n-1] == '\r' {
+			line = line[:n-1]
+		}
+
+		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 
@@ -1143,11 +1706,20 @@ func parseChunkLines(chunk []byte, startLine int, isFirstChunk bool, opts ParseO
 			line = stripBOM(line)
 		}
 
+		before := len(res.issues)
+		var lineStats ParseStats
+		var lineWarns []string
 		res.issues, res.poolRefs = processIssueLine(
 			line, lineNum, opts, usePool,
-			res.issues, res.poolRefs, &res.stats,
-			func(msg string) { warn(lineNum, msg) },
+			res.issues, res.poolRefs, &lineStats,
+			func(msg string) { lineWarns = append(lineWarns, msg) },
 		)
+		res.events = append(res.events, parsedLineEvent{
+			lineNum:  lineNum,
+			stats:    lineStats,
+			warns:    lineWarns,
+			hasIssue: len(res.issues) != before,
+		})
 	}
 }
 
@@ -1238,7 +1810,10 @@ func normalizeLoadedIssue(issue *model.Issue) {
 	}
 }
 
-const issueStringInternerSlots = 128
+const (
+	issueStringInternerSlots     = 128
+	issueStringInternerMaxProbes = 8
+)
 
 // issueStringInterner is a bounded, stack-friendly table for the low-cardinality
 // strings repeated across issues. A fixed table avoids both a process-global
@@ -1261,7 +1836,7 @@ func (in *issueStringInterner) intern(value string) string {
 	}
 
 	start := int(hash & (issueStringInternerSlots - 1))
-	for probe := 0; probe < issueStringInternerSlots; probe++ {
+	for probe := 0; probe < issueStringInternerMaxProbes; probe++ {
 		index := (start + probe) & (issueStringInternerSlots - 1)
 		canonical := in.slots[index]
 		if canonical == value {
@@ -1273,8 +1848,9 @@ func (in *issueStringInterner) intern(value string) string {
 		}
 	}
 
-	// High-cardinality input filled the bounded table. Preserve correctness and
-	// skip interning this value rather than growing an unbounded structure.
+	// This hash cluster exceeded the fixed probe budget. Preserve correctness and
+	// skip interning this value: high-cardinality input must not turn every later
+	// string into a full-table scan.
 	return value
 }
 

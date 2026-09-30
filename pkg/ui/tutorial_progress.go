@@ -4,9 +4,19 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/debug"
 )
+
+// savedConfigDisabled reports whether BV_NO_SAVED_CONFIG is set, in which case
+// bv neither reads nor writes anything under the user config directory.
+func savedConfigDisabled() bool {
+	return env.NoSavedConfig.Get() != ""
+}
 
 // TutorialProgress tracks which tutorial pages have been viewed.
 // This persists across sessions so users can see their progress.
@@ -44,19 +54,29 @@ func GetTutorialProgressManager() *tutorialProgressManager {
 	return progressManager
 }
 
-// TutorialProgressPath returns the path to the tutorial progress config file.
+// TutorialProgressPath returns the path to the tutorial progress config file:
+// $XDG_CONFIG_HOME/bv/tutorial-progress.json when XDG_CONFIG_HOME is set,
+// otherwise ~/.config/bv/tutorial-progress.json.
 func TutorialProgressPath() string {
+	if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
+		return filepath.Join(xdg, "bv", "tutorial-progress.json")
+	}
 	home, err := os.UserHomeDir()
-	if err != nil {
+	if err != nil || home == "" {
 		return ""
 	}
 	return filepath.Join(home, ".config", "bv", "tutorial-progress.json")
 }
 
-// Load reads tutorial progress from disk.
+// Load reads tutorial progress from disk. With BV_NO_SAVED_CONFIG set it
+// leaves the in-memory state untouched and reads nothing.
 func (m *tutorialProgressManager) Load() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if savedConfigDisabled() {
+		return nil
+	}
 
 	path := TutorialProgressPath()
 	if path == "" {
@@ -77,7 +97,8 @@ func (m *tutorialProgressManager) Load() error {
 
 	var progress TutorialProgress
 	if err := json.Unmarshal(data, &progress); err != nil {
-		// Invalid JSON, start fresh
+		// Corrupt file: ignore it and start fresh; the next Save overwrites it.
+		debug.Log("tutorial progress: ignoring corrupt %s: %v", path, err)
 		m.progress = &TutorialProgress{
 			ViewedPages: make(map[string]bool),
 		}
@@ -94,13 +115,14 @@ func (m *tutorialProgressManager) Load() error {
 	return nil
 }
 
-// Save writes tutorial progress to disk.
+// Save writes tutorial progress to disk. With BV_NO_SAVED_CONFIG set nothing
+// is written and the in-memory state stays dirty.
 func (m *tutorialProgressManager) Save() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if !m.dirty {
-		return nil // Nothing to save
+	if !m.dirty || savedConfigDisabled() {
+		return nil // Nothing to save, or persistence disabled
 	}
 
 	path := TutorialProgressPath()
@@ -136,13 +158,21 @@ func (m *tutorialProgressManager) Save() error {
 	return nil
 }
 
-// MarkPageViewed marks a page as viewed.
+// MarkPageViewed marks a page as viewed and makes it the resume point. The
+// resume point moves even for pages that were already viewed, so reopening
+// the tutorial lands on the page the user actually left.
 func (m *tutorialProgressManager) MarkPageViewed(pageID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if pageID == "" {
+		return
+	}
 	if !m.progress.ViewedPages[pageID] {
 		m.progress.ViewedPages[pageID] = true
+		m.dirty = true
+	}
+	if m.progress.LastPageID != pageID {
 		m.progress.LastPageID = pageID
 		m.dirty = true
 	}
@@ -267,6 +297,39 @@ func (m *TutorialModel) LoadProgress() {
 			m.progress[page.ID] = true
 		}
 	}
+}
+
+// ResumeLastPage moves to the persisted resume point, if it names a page that
+// is currently visible. Returns true when the page changed.
+func (m *TutorialModel) ResumeLastPage() bool {
+	lastID := GetTutorialProgressManager().GetLastPageID()
+	if lastID == "" {
+		return false
+	}
+	for i, page := range m.visiblePages() {
+		if page.ID == lastID {
+			if i == m.currentPage {
+				return false
+			}
+			m.currentPage = i
+			m.scrollOffset = 0
+			m.tocCursor = i
+			return true
+		}
+	}
+	return false
+}
+
+// markCurrentPageViewed records the current page both in the session map and
+// in the persisted progress so every page change updates the resume point.
+func (m *TutorialModel) markCurrentPageViewed() {
+	pages := m.visiblePages()
+	if m.currentPage < 0 || m.currentPage >= len(pages) {
+		return
+	}
+	id := pages[m.currentPage].ID
+	m.progress[id] = true
+	GetTutorialProgressManager().MarkPageViewed(id)
 }
 
 // HasViewedPage returns whether a page has been viewed (from persisted data).

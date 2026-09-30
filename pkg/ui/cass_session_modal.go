@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -12,6 +14,19 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+const clipboardCopyTimeout = 2 * time.Second
+
+type cassClipboardCopyMsg struct {
+	modalToken *byte
+	err        error
+}
+
+type clipboardStatusMsg struct {
+	requestID uint64
+	success   string
+	err       error
+}
 
 // CassSessionModal displays correlated cass sessions for a bead.
 // It shows session previews with agent name, timestamp, match reason, and snippet.
@@ -27,6 +42,7 @@ type CassSessionModal struct {
 	height     int
 	copied     bool      // Flash feedback for clipboard copy
 	copiedAt   time.Time // When copy happened
+	copyToken  *byte     // Reject late results from a dismissed modal instance (non-zero-size so each allocation is unique)
 	maxDisplay int       // Max sessions to show (rest are summarized)
 }
 
@@ -47,6 +63,7 @@ func NewCassSessionModal(beadID string, result cass.CorrelationResult, theme The
 		theme:      theme,
 		width:      70,
 		height:     25,
+		copyToken:  new(byte),
 		maxDisplay: 3,
 	}
 }
@@ -60,6 +77,12 @@ func (m CassSessionModal) Update(msg tea.Msg) (CassSessionModal, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+	case cassClipboardCopyMsg:
+		if msg.modalToken == m.copyToken && msg.err == nil {
+			m.copied = true
+			m.copiedAt = time.Now()
+		}
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "j", "down":
@@ -71,11 +94,9 @@ func (m CassSessionModal) Update(msg tea.Msg) (CassSessionModal, tea.Cmd) {
 				m.selected--
 			}
 		case "y":
-			// Copy search command to clipboard
-			if err := copyToClipboard(m.searchCmd); err == nil {
-				m.copied = true
-				m.copiedAt = time.Now()
-			}
+			// Clipboard helpers are external processes and may stall. Bubble Tea
+			// runs commands off the Update loop, preserving UI responsiveness.
+			return m, copyToClipboardCmd(m.searchCmd, m.copyToken)
 		}
 	}
 	return m, nil
@@ -343,42 +364,76 @@ func (m CassSessionModal) CenterModal(termWidth, termHeight int) string {
 	return centered
 }
 
-// copyToClipboard copies text to the system clipboard.
-// It uses platform-specific commands and fails silently if unavailable.
-func copyToClipboard(text string) error {
-	var cmd *exec.Cmd
+func copyToClipboardCmd(text string, modalToken *byte) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), clipboardCopyTimeout)
+		defer cancel()
 
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("pbcopy")
-	case "linux":
-		// Try xclip first, then xsel
-		if _, err := exec.LookPath("xclip"); err == nil {
-			cmd = exec.Command("xclip", "-selection", "clipboard")
-		} else if _, err := exec.LookPath("xsel"); err == nil {
-			cmd = exec.Command("xsel", "--clipboard", "--input")
-		} else {
-			return fmt.Errorf("no clipboard utility found")
+		return cassClipboardCopyMsg{
+			modalToken: modalToken,
+			err:        copyToClipboard(ctx, text),
 		}
-	case "windows":
-		cmd = exec.Command("clip")
-	default:
-		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
+}
 
-	stdin, err := cmd.StdinPipe()
+func copyToClipboardStatusCmd(text, success string, requestID uint64) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), clipboardCopyTimeout)
+		defer cancel()
+
+		return clipboardStatusMsg{
+			requestID: requestID,
+			success:   success,
+			err:       copyToClipboard(ctx, text),
+		}
+	}
+}
+
+// copyToClipboard copies text to the system clipboard with a bounded helper
+// lifetime. It uses platform-specific commands and reports failures to its
+// Bubble Tea command caller.
+func copyToClipboard(ctx context.Context, text string) error {
+	cmd, err := clipboardCommand(ctx)
 	if err != nil {
 		return err
 	}
 
-	if err := cmd.Start(); err != nil {
-		return err
+	cmd.Stdin = strings.NewReader(text)
+	if err := cmd.Run(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("clipboard helper timed out: %w", ctxErr)
+		}
+		return fmt.Errorf("run clipboard helper: %w", err)
 	}
+	return nil
+}
 
-	if _, err := stdin.Write([]byte(text)); err != nil {
-		return err
+func clipboardCommand(ctx context.Context) (*exec.Cmd, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.CommandContext(ctx, "pbcopy"), nil
+	case "windows":
+		return exec.CommandContext(ctx, "clip.exe"), nil
+	case "linux", "freebsd", "netbsd", "openbsd", "dragonfly", "solaris":
+		if os.Getenv("WAYLAND_DISPLAY") != "" {
+			if _, err := exec.LookPath("wl-copy"); err == nil {
+				return exec.CommandContext(ctx, "wl-copy"), nil
+			}
+		}
+		if _, err := exec.LookPath("xclip"); err == nil {
+			return exec.CommandContext(ctx, "xclip", "-in", "-selection", "clipboard"), nil
+		}
+		if _, err := exec.LookPath("xsel"); err == nil {
+			return exec.CommandContext(ctx, "xsel", "--input", "--clipboard"), nil
+		}
+		if _, err := exec.LookPath("termux-clipboard-set"); err == nil {
+			return exec.CommandContext(ctx, "termux-clipboard-set"), nil
+		}
+		if _, err := exec.LookPath("clip.exe"); err == nil {
+			return exec.CommandContext(ctx, "clip.exe"), nil
+		}
+		return nil, fmt.Errorf("no clipboard utility found")
+	default:
+		return nil, fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
-	stdin.Close()
-
-	return cmd.Wait()
 }

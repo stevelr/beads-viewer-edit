@@ -10,6 +10,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/cass"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
 	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -164,6 +165,44 @@ type HistoryModel struct {
 
 	// View mode transition state (bv-kvlx)
 	modeChangedAt time.Time // Timestamp of last mode toggle for transition animation
+
+	// Timeline pane override (bv-1x6o). The pane is shown by default at
+	// >= layoutBreakpointWide columns; pressing t pins it on or off.
+	timelinePinned  bool // true once the user toggled explicitly
+	timelineVisible bool // the pinned value; ignored until timelinePinned
+}
+
+// TimelineAvailable reports whether the timeline pane can be shown at all:
+// bead mode (git mode has no per-bead timeline) at a width that fits three
+// or more panes.
+func (h *HistoryModel) TimelineAvailable() bool {
+	return h.viewMode != historyModeGit && h.determineLayout() != layoutNarrow
+}
+
+// TimelineVisible reports whether the timeline pane is currently shown: the
+// explicit toggle wins, otherwise the width rule applies.
+func (h *HistoryModel) TimelineVisible() bool {
+	if !h.TimelineAvailable() {
+		return false
+	}
+	if h.timelinePinned {
+		return h.timelineVisible
+	}
+	return h.determineLayout() == layoutWide
+}
+
+// ToggleTimeline flips the timeline pane and returns the new visibility.
+// When the pane is unavailable it stays hidden and false is returned.
+func (h *HistoryModel) ToggleTimeline() bool {
+	if !h.TimelineAvailable() {
+		return false
+	}
+	h.timelineVisible = !h.TimelineVisible()
+	h.timelinePinned = true
+	if !h.timelineVisible && h.focused == historyFocusTimeline {
+		h.focused = historyFocusList
+	}
+	return h.timelineVisible
 }
 
 // NewHistoryModel creates a new history view from a correlation report
@@ -190,8 +229,113 @@ func NewHistoryModel(report *correlation.HistoryReport, theme Theme) HistoryMode
 
 // SetReport updates the history data
 func (h *HistoryModel) SetReport(report *correlation.HistoryReport) {
+	selectedBeadID := h.SelectedBeadID()
+	selectedBeadCommitSHA := ""
+	if selected := h.SelectedCommit(); selected != nil {
+		selectedBeadCommitSHA = selected.SHA
+	}
+	selectedGitSHA := ""
+	selectedRelatedBead := ""
+	if selected := h.SelectedGitCommit(); selected != nil {
+		selectedGitSHA = selected.SHA
+		selectedRelatedBead = h.SelectedRelatedBeadID()
+	}
+	expandedPaths := make(map[string]bool)
+	var rememberExpansion func([]*FileTreeNode)
+	rememberExpansion = func(nodes []*FileTreeNode) {
+		for _, node := range nodes {
+			if node.Expanded {
+				expandedPaths[node.Path] = true
+			}
+			rememberExpansion(node.Children)
+		}
+	}
+	rememberExpansion(h.fileTree)
+	hadFileTree := h.fileTree != nil
+	selectedFilePath := ""
+	if h.selectedFileIdx >= 0 && h.selectedFileIdx < len(h.flatFileList) {
+		selectedFilePath = h.flatFileList[h.selectedFileIdx].Path
+	}
+
 	h.report = report
-	h.rebuildFilteredList()
+	// Keep the user's query, search focus, filters, and view mode while applying
+	// the refreshed report. Rebuilding only the base bead list would silently
+	// drop an active query and leave git-mode results tied to the old report.
+	h.applySearchFilter()
+	if h.viewMode == historyModeBead {
+		h.selectedBead = 0
+		h.selectedCommit = 0
+		for i, beadID := range h.beadIDs {
+			if beadID != selectedBeadID {
+				continue
+			}
+			h.selectedBead = i
+			for j := range h.histories[i].Commits {
+				if h.histories[i].Commits[j].SHA == selectedBeadCommitSHA {
+					h.selectedCommit = j
+					break
+				}
+			}
+			break
+		}
+		h.ensureBeadVisible()
+		if h.selectedBead < len(h.histories) {
+			h.ensureMiddleScrollVisible(h.selectedCommit, len(h.histories[h.selectedBead].Commits))
+		} else {
+			h.middleScrollOffset = 0
+		}
+	} else {
+		commits := h.GetFilteredCommitList()
+		h.selectedGitCommit = 0
+		h.selectedRelatedBead = 0
+		for i := range commits {
+			if commits[i].SHA != selectedGitSHA {
+				continue
+			}
+			h.selectedGitCommit = i
+			for j, beadID := range commits[i].BeadIDs {
+				if beadID == selectedRelatedBead {
+					h.selectedRelatedBead = j
+					break
+				}
+			}
+			break
+		}
+		h.ensureGitCommitVisible()
+		if h.selectedGitCommit < len(commits) {
+			h.ensureMiddleScrollVisible(h.selectedRelatedBead, len(commits[h.selectedGitCommit].BeadIDs))
+		} else {
+			h.middleScrollOffset = 0
+		}
+	}
+	// Timeline rows are derived from the whole report and do not have a stable
+	// row identity across refreshes. Reset rather than retaining an invalid old
+	// offset that can display impossible percentages or require many keypresses.
+	h.timelineScrollOffset = 0
+	if h.showFileTree || hadFileTree {
+		h.buildFileTree()
+		var restoreExpansion func([]*FileTreeNode)
+		restoreExpansion = func(nodes []*FileTreeNode) {
+			for _, node := range nodes {
+				node.Expanded = expandedPaths[node.Path]
+				restoreExpansion(node.Children)
+			}
+		}
+		restoreExpansion(h.fileTree)
+		h.rebuildFlatFileList()
+		h.selectedFileIdx = 0
+		for i, node := range h.flatFileList {
+			if node.Path == selectedFilePath {
+				h.selectedFileIdx = i
+				break
+			}
+		}
+		if len(h.flatFileList) == 0 {
+			h.fileTreeScroll = 0
+		} else if h.fileTreeScroll >= len(h.flatFileList) {
+			h.fileTreeScroll = len(h.flatFileList) - 1
+		}
+	}
 }
 
 // SetSessionsForBead stores correlated sessions for a bead in the cache (bv-pr1l)
@@ -777,17 +921,17 @@ func (h *HistoryModel) ToggleExpand() {
 // Search and Filter methods (bv-nkrj)
 
 // StartSearch activates the search input
-func (h *HistoryModel) StartSearch() {
+func (h *HistoryModel) StartSearch() tea.Cmd {
 	h.searchActive = true
 	h.searchMode = searchModeAll
-	h.searchInput.Focus()
+	return h.searchInput.Focus()
 }
 
 // StartSearchWithMode activates search with a specific mode
-func (h *HistoryModel) StartSearchWithMode(mode historySearchMode) {
+func (h *HistoryModel) StartSearchWithMode(mode historySearchMode) tea.Cmd {
 	h.searchActive = true
 	h.searchMode = mode
-	h.searchInput.Focus()
+	cmd := h.searchInput.Focus()
 
 	// Set appropriate placeholder based on mode
 	switch mode {
@@ -802,6 +946,7 @@ func (h *HistoryModel) StartSearchWithMode(mode historySearchMode) {
 	default:
 		h.searchInput.Placeholder = "Search commits, beads, authors..."
 	}
+	return cmd
 }
 
 // CancelSearch cancels the search and clears the query
@@ -837,9 +982,11 @@ func (h *HistoryModel) SearchQuery() string {
 	return h.searchInput.Value()
 }
 
-// UpdateSearchInput updates the search input model (call from Update)
-func (h *HistoryModel) UpdateSearchInput(msg interface{}) {
-	h.searchInput, _ = h.searchInput.Update(msg)
+// UpdateSearchInput updates the search input model (call from Update) and
+// returns any follow-up command, such as an asynchronous clipboard paste.
+func (h *HistoryModel) UpdateSearchInput(msg tea.Msg) tea.Cmd {
+	var cmd tea.Cmd
+	h.searchInput, cmd = h.searchInput.Update(msg)
 
 	// Check if query changed and apply filter
 	currentQuery := h.searchInput.Value()
@@ -847,6 +994,7 @@ func (h *HistoryModel) UpdateSearchInput(msg interface{}) {
 		h.lastSearchQuery = currentQuery
 		h.applySearchFilter()
 	}
+	return cmd
 }
 
 // applySearchFilter filters the data based on current search query
@@ -876,12 +1024,18 @@ func (h *HistoryModel) applySearchFilter() {
 // filterCommitList filters commits in git mode based on search query
 func (h *HistoryModel) filterCommitList(query string) {
 	if len(h.commitList) == 0 {
-		h.filteredCommits = nil
+		// A non-empty query with no source commits is still an active filter.
+		// Keep a non-nil empty slice so GetFilteredCommitList does not interpret
+		// this as the sentinel for "no filter" if commits are installed later.
+		h.filteredCommits = []CommitListEntry{}
 		return
 	}
 
 	query = strings.ToLower(query)
-	var filtered []CommitListEntry
+	// nil means "no active query" throughout HistoryModel. Start with a
+	// non-nil empty result so a valid query that matches nothing cannot fall
+	// through to the complete commit list.
+	filtered := make([]CommitListEntry, 0)
 
 	for _, commit := range h.commitList {
 		if h.commitMatchesQuery(commit, query) {
@@ -1328,7 +1482,7 @@ func (h *HistoryModel) determineLayout() historyLayout {
 // paneCount returns the number of visible panes for the current layout (bv-xrfh)
 func (h *HistoryModel) paneCount() int {
 	layout := h.determineLayout()
-	if layout == layoutWide && h.viewMode != historyModeGit {
+	if h.TimelineVisible() {
 		return 4
 	}
 	switch layout {
@@ -1402,8 +1556,9 @@ func (h *HistoryModel) renderThreePaneView() string {
 	header := h.renderHeader()
 	panelHeight := h.height - 2
 
-	// Wide layout: 4 panes with timeline (bv-1x6o)
-	if layout == layoutWide && h.viewMode != historyModeGit {
+	// Four panes with the timeline (bv-1x6o): default in wide layout, or
+	// pinned on with t in the standard layout.
+	if h.TimelineVisible() {
 		// Wide bead mode: 20% beads | 22% timeline | 25% commits | 33% details
 		listWidth := int(float64(h.width) * 0.20)
 		timelineWidth := int(float64(h.width) * 0.22)

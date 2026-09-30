@@ -207,6 +207,23 @@ func TestConfigValidate(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "distinct prefixes with duplicate normalized source repo",
+			config: workspace.Config{
+				Repos: []workspace.RepoConfig{
+					{Path: "api", Prefix: "api-"},
+					{Path: "web", Prefix: "api:"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "prefix without usable source repo key",
+			config: workspace.Config{
+				Repos: []workspace.RepoConfig{{Path: "api", Prefix: "-_"}},
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -350,6 +367,12 @@ func TestFindWorkspaceConfig(t *testing.T) {
 }
 
 func TestFindWorkspaceConfigNotFound(t *testing.T) {
+	// This test asserts that no ancestor config exists. Use the platform temp
+	// root, since RCH's TMPDIR can be below a source checkout with .bv config.
+	// TestFindWorkspaceConfig retains real parent traversal within its fixture.
+	t.Setenv("TMPDIR", "")
+	t.Setenv("TMP", "")
+	t.Setenv("TEMP", "")
 	tmpDir := t.TempDir()
 
 	_, err := workspace.FindWorkspaceConfig(tmpDir)
@@ -479,6 +502,8 @@ func TestQualifyID(t *testing.T) {
 		{"AUTH-123", "api-", "api-AUTH-123"},
 		{"api-AUTH-123", "api-", "api-AUTH-123"}, // Already qualified
 		{"UI-1", "web-", "web-UI-1"},
+		{"", "api-", ""}, // Missing optional references stay missing
+		{"AUTH-123", "", "AUTH-123"},
 	}
 
 	for _, tt := range tests {

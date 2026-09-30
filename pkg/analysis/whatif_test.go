@@ -1,13 +1,166 @@
 package analysis
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+func TestWaitForPhase2ContextCancellationAndCompletion(t *testing.T) {
+	for _, complete := range []bool{false, true} {
+		done := make(chan struct{})
+		stats := &GraphStats{phase2Done: done}
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan error, 1)
+		go func() { result <- stats.WaitForPhase2Context(ctx) }()
+		if complete {
+			close(done)
+		} else {
+			cancel()
+		}
+		select {
+		case err := <-result:
+			if complete && err != nil || !complete && !errors.Is(err, context.Canceled) {
+				t.Fatalf("completion=%v: got %v", complete, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("phase wait did not finish after completion/cancellation")
+		}
+		cancel()
+		if err := stats.WaitForPhase2Context(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("already-canceled wait returned %v", err)
+		}
+	}
+}
+
+func TestTransitiveUnblocksWorkTracksAffectedFrontier(t *testing.T) {
+	measure := func(unrelated int) float64 {
+		issues := []model.Issue{
+			{ID: "root", Status: model.StatusOpen},
+			{ID: "child", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}}},
+			{ID: "grandchild", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "child", Type: model.DepBlocks}}},
+			// An unblocked parent does not prevent its child being ready already.
+			// This pre-existing ready child is not new work caused by completion.
+			{ID: "already-ready", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepParentChild}}},
+			{ID: "parked", Status: model.StatusBlocked, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}}},
+			{ID: "missing", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}, {DependsOnID: "absent", Type: model.DepBlocks}}},
+		}
+		for i := 0; i < unrelated; i++ {
+			issues = append(issues, model.Issue{ID: fmt.Sprintf("unrelated-%05d", i), Status: model.StatusOpen})
+		}
+		analyzer := NewAnalyzer(issues)
+		if got := analyzer.countTransitiveUnblocks("root"); got != 2 {
+			t.Fatalf("cascade counted pre-existing/parked/missing work: got %d want 2", got)
+		}
+		return testing.AllocsPerRun(5, func() {
+			if got := analyzer.countTransitiveUnblocks("root"); got != 2 {
+				t.Fatalf("repeated cascade=%d want2", got)
+			}
+		})
+	}
+	small, large := measure(1000), measure(10000)
+	t.Logf("same two-node affected frontier:1k unrelated %.0f allocations,10k unrelated %.0f", small, large)
+	if large > small+5 {
+		t.Fatalf("unrelated ready work expanded cascade allocations: %.0f -> %.0f", small, large)
+	}
+}
+
+func TestTransitiveUnblocksConcurrentFrontiersAndClock(t *testing.T) {
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	issues := []model.Issue{
+		{ID: "root", Status: model.StatusOpen},
+		{ID: "a", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "root", Type: model.DepBlocks},
+			{DependsOnID: "root", Type: model.DepBlocks},
+			{DependsOnID: "root", Type: model.DepParentChild},
+		}},
+		// a visits join before bridge completes b, so join must be retried.
+		{ID: "bridge", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}}},
+		{ID: "b", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "bridge", Type: model.DepBlocks}}},
+		{ID: "join", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "a", Type: model.DepBlocks}, {DependsOnID: "b", Type: model.DepBlocks},
+		}},
+		{ID: "hierarchy", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "a", Type: model.DepParentChild}}},
+		{ID: "deferred", Status: model.StatusOpen, DeferUntil: &future, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}}},
+		{ID: "parked", Status: model.StatusBlocked, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}}},
+		{ID: "missing-parent", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "root", Type: model.DepBlocks}, {DependsOnID: "absent", Type: model.DepParentChild},
+		}},
+	}
+	analyzer := NewAnalyzer(issues)
+	analyzer.SetNow(now)
+	const workers = 12
+	results := make(chan int, workers)
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			results <- analyzer.countTransitiveUnblocks("root")
+		}()
+	}
+	close(start)
+	for i := 0; i < workers; i++ {
+		if got := <-results; got != 5 {
+			t.Errorf("concurrent cascade=%d, want a, bridge, b, join and hierarchy", got)
+		}
+	}
+	// Adjacency reuse must not freeze readiness at the first query's clock.
+	analyzer.SetNow(future)
+	if got := analyzer.countTransitiveUnblocks("root"); got != 6 {
+		t.Fatalf("cascade at deferral boundary=%d, want 6", got)
+	}
+}
+
+func TestPriorityRecommendationsFromStatsPreserveResultsAndSourceReadiness(t *testing.T) {
+	issues := []model.Issue{{ID: "ROOT", Status: model.StatusOpen, Priority: 4}}
+	for i := 0; i < 8; i++ {
+		issues = append(issues, model.Issue{
+			ID: fmt.Sprintf("CHILD-%d", i), Status: model.StatusOpen, Priority: 2,
+			Dependencies: []*model.Dependency{{DependsOnID: "ROOT", Type: model.DepBlocks}},
+		})
+	}
+	analyzer := NewAnalyzer(issues)
+	analyzer.SetNow(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+	stats := analyzer.Analyze()
+	thresholds := DefaultThresholds()
+	want := analyzer.GenerateRecommendationsWithThresholds(thresholds)
+	got := analyzer.GenerateRecommendationsFromStats(&stats, thresholds)
+	if len(got) == 0 || !reflect.DeepEqual(got, want) {
+		t.Fatalf("provided analysis changed recommendations:\ngot=%+v\nwant=%+v", got, want)
+	}
+	// Deliberately supplied critical-path data must be used in each what-if,
+	// not replaced by a hidden per-recommendation re-analysis of the graph.
+	provided := &GraphStats{criticalPathScore: map[string]float64{"ROOT": MaxCriticalPathDepth}}
+	thresholds.MinConfidence = 0
+	fromProvided := analyzer.GenerateRecommendationsFromStats(provided, thresholds)
+	var root *PriorityRecommendation
+	for i := range fromProvided {
+		if fromProvided[i].IssueID == "ROOT" {
+			root = &fromProvided[i]
+		}
+	}
+	if root == nil || root.WhatIf == nil || root.WhatIf.DepthReduction != 1 || root.WhatIf.DirectUnblocks != 8 {
+		t.Fatalf("provided stats were not consumed with real dependency effects: %+v", root)
+	}
+	for i := 1; i < len(issues); i++ {
+		issues[i].Status = model.StatusBlocked
+	}
+	parked := NewAnalyzer(issues).GenerateRecommendationsFromStats(provided, thresholds)
+	for _, rec := range parked {
+		if rec.WhatIf != nil && (rec.WhatIf.DirectUnblocks != 0 || rec.WhatIf.TransitiveUnblocks != 0) {
+			t.Fatalf("provided metrics resumed parked source rows: %+v", rec)
+		}
+	}
+}
 
 func TestGenerateTopReasons_Empty(t *testing.T) {
 	score := ImpactScore{
@@ -21,6 +174,27 @@ func TestGenerateTopReasons_Empty(t *testing.T) {
 		if r.Weight < 0.01 {
 			t.Errorf("should not include negligible reason %s with weight %f", r.Factor, r.Weight)
 		}
+	}
+}
+
+func TestEstimateDaysSavedDoesNotOverflowIntAccumulator(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	issueMap := map[string]model.Issue{
+		"A": {ID: "A", EstimatedMinutes: &maxInt},
+		"B": {ID: "B", EstimatedMinutes: &maxInt},
+	}
+
+	got := estimateDaysSaved([]string{"A", "B"}, issueMap)
+	if got <= 0 || math.IsInf(got, 0) || math.IsNaN(got) {
+		t.Fatalf("estimateDaysSaved overflowed: %v", got)
+	}
+
+	analyzer := NewAnalyzer([]model.Issue{
+		{ID: "A", EstimatedMinutes: &maxInt},
+		{ID: "B", EstimatedMinutes: &maxInt},
+	})
+	if got := analyzer.computeMedianEstimatedMinutes(); got != maxInt {
+		t.Fatalf("median estimate=%d, want %d", got, maxInt)
 	}
 }
 
@@ -260,6 +434,26 @@ func TestGenerateEnhancedRecommendations_WithIssues(t *testing.T) {
 	}
 }
 
+func TestGenerateEnhancedRecommendations_UsesAnalyzerClock(t *testing.T) {
+	pinned := time.Date(2026, 8, 26, 12, 34, 56, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "blocker", Title: "Blocker", Status: model.StatusOpen, Priority: 4, UpdatedAt: pinned.Add(-30 * 24 * time.Hour)},
+		{ID: "dependent", Title: "Dependent", Status: model.StatusOpen, Priority: 0, Dependencies: []*model.Dependency{{DependsOnID: "blocker", Type: model.DepBlocks}}},
+	}
+	analyzer := NewAnalyzer(issues)
+	analyzer.SetNow(pinned)
+
+	recommendations := analyzer.GenerateEnhancedRecommendations()
+	if len(recommendations) == 0 {
+		t.Fatal("expected at least one enhanced recommendation")
+	}
+	for _, recommendation := range recommendations {
+		if got, want := recommendation.Explanation.Status.ComputedAt, pinned.Format(time.RFC3339); got != want {
+			t.Fatalf("computed_at = %q, want %q", got, want)
+		}
+	}
+}
+
 func TestTopWhatIfDeltas_SkipsTombstone(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "A", Title: "Removed blocker", Status: model.StatusTombstone},
@@ -280,6 +474,113 @@ func TestTopWhatIfDeltas_SkipsTombstone(t *testing.T) {
 	}
 }
 
+func TestTopWhatIfDeltas_CandidateScope(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "outer", Status: model.StatusOpen},
+		{ID: "a", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "outer", Type: model.DepBlocks}}},
+		{ID: "b", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "outer", Type: model.DepBlocks}}},
+		{ID: "a-leaf", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "a", Type: model.DepBlocks}}},
+		{ID: "b-leaf", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "b", Type: model.DepBlocks}}},
+	}
+	selected := map[string]bool{"outer": false, "a": true, "b": true, "a-leaf": true, "b-leaf": true}
+	for _, tc := range []struct {
+		name       string
+		candidates map[string]bool
+		limit      int
+		want       []string
+		potential  int
+	}{
+		{"unrestricted", nil, 10, []string{"outer", "a", "b"}, 5},
+		{"all", map[string]bool{"outer": true, "a": true, "b": true, "a-leaf": true, "b-leaf": true}, 10, []string{"outer", "a", "b"}, 5},
+		{"selected", selected, 10, []string{"a", "b"}, 4},
+		{"before_limit", selected, 1, []string{"a"}, 4},
+		{"default_limit", selected, 0, []string{"a", "b"}, 4},
+		{"negative_limit", selected, -1, []string{"a", "b"}, 4},
+		{"oversized_limit", selected, 100, []string{"a", "b"}, 4},
+		{"empty", map[string]bool{}, 10, nil, 0},
+		{"no_positive_gain", map[string]bool{"a-leaf": true}, 10, nil, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			analyzer := NewAnalyzer(issues)
+			analyzer.SetReadinessScope(model.NewReadinessIndex(issues), tc.candidates)
+			stats := analyzer.Analyze()
+			results := analyzer.TopWhatIfDeltasFromStats(&stats, tc.limit)
+			var ids []string
+			for _, result := range results {
+				ids = append(ids, result.IssueID)
+				if result.IssueID == "a" || result.IssueID == "b" {
+					if result.Delta.DirectUnblocks != 1 || result.Delta.TransitiveUnblocks != 1 || !reflect.DeepEqual(result.Delta.UnblockedIssueIDs, []string{result.IssueID + "-leaf"}) {
+						t.Errorf("hypothetical completion lost its real gain: %+v", result)
+					}
+				}
+			}
+			if !reflect.DeepEqual(ids, tc.want) {
+				t.Errorf("ranked candidates=%v, want %v", ids, tc.want)
+			}
+			topK := analyzer.generateTopKSet(5)
+			if topK.Status.Limited != tc.potential {
+				t.Errorf("potential candidates=%d, want %d", topK.Status.Limited, tc.potential)
+			}
+			if tc.candidates != nil && !tc.candidates["outer"] && len(topK.Items) != 0 {
+				t.Errorf("outside prerequisite was implicitly completed: %+v", topK)
+			}
+			if depth, ok := stats.CriticalPathValue("outer"); !ok || depth != 3 {
+				t.Errorf("candidate filtering changed graph context: outer depth=%v present=%v", depth, ok)
+			}
+		})
+	}
+}
+
+func TestWhatIfDeltaExcludesDeferredAndParentGatedCascade(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	issues := []model.Issue{
+		{ID: "ROOT", Status: model.StatusOpen},
+		{ID: "PARENT-BLOCKER", Status: model.StatusOpen},
+		{ID: "PARENT", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "PARENT-BLOCKER", Type: model.DepBlocks},
+		}},
+		{ID: "DEFERRED", Status: model.StatusOpen, DeferUntil: &future, Dependencies: []*model.Dependency{
+			{DependsOnID: "ROOT", Type: model.DepBlocks},
+		}},
+		{ID: "PARENT-GATED", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "ROOT", Type: model.DepBlocks},
+			{DependsOnID: "PARENT", Type: model.DepParentChild},
+		}},
+	}
+
+	analyzer := NewAnalyzer(issues)
+	analyzer.SetNow(now)
+	delta := analyzer.computeWhatIfDeltaFromStats("ROOT", &GraphStats{})
+	if delta.DirectUnblocks != 0 || delta.TransitiveUnblocks != 0 || delta.BlockedReduction != 0 {
+		t.Fatalf("what-if claimed unavailable work became actionable: %+v", delta)
+	}
+}
+
+func TestWhatIfDeltaCountsParentPropagationCascade(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "ROOT", Status: model.StatusOpen},
+		{ID: "PARENT", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "ROOT", Type: model.DepBlocks},
+		}},
+		{ID: "CHILD", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "PARENT", Type: model.DepParentChild},
+		}},
+	}
+
+	analyzer := NewAnalyzer(issues)
+	delta := analyzer.computeWhatIfDeltaFromStats("ROOT", &GraphStats{})
+	if delta.DirectUnblocks != 1 || delta.TransitiveUnblocks != 2 {
+		t.Fatalf("what-if parent cascade = %+v, want direct=1 transitive=2", delta)
+	}
+	issues[1].Status = model.StatusBlocked
+	issues[2].Status = model.StatusBlocked
+	parked := NewAnalyzer(issues).computeWhatIfDeltaFromStats("ROOT", &GraphStats{})
+	if parked.DirectUnblocks != 0 || parked.TransitiveUnblocks != 0 || parked.BlockedReduction != 0 {
+		t.Fatalf("parent cascade cannot resume parked work: %+v", parked)
+	}
+}
+
 func TestTopWhatIfDeltasFromStats_UsesProvidedStatsAndPreservesOutput(t *testing.T) {
 	const dependentCount = 12
 	issues := make([]model.Issue, 0, dependentCount+2)
@@ -289,7 +590,7 @@ func TestTopWhatIfDeltasFromStats_UsesProvidedStatsAndPreservesOutput(t *testing
 		issues = append(issues, model.Issue{
 			ID:     id,
 			Title:  id,
-			Status: model.StatusBlocked,
+			Status: model.StatusOpen,
 			Dependencies: []*model.Dependency{
 				{IssueID: id, DependsOnID: "ROOT", Type: model.DepBlocks},
 			},
@@ -298,7 +599,7 @@ func TestTopWhatIfDeltasFromStats_UsesProvidedStatsAndPreservesOutput(t *testing
 	issues = append(issues, model.Issue{
 		ID:     "CASCADE",
 		Title:  "Cascade leaf",
-		Status: model.StatusBlocked,
+		Status: model.StatusOpen,
 		Dependencies: []*model.Dependency{
 			{IssueID: "CASCADE", DependsOnID: "DEPENDENT-000", Type: model.DepBlocks},
 		},
@@ -338,6 +639,15 @@ func TestTopWhatIfDeltasFromStats_UsesProvidedStatsAndPreservesOutput(t *testing
 	fromNil := analyzer.TopWhatIfDeltasFromStats(nil, 0)
 	if !reflect.DeepEqual(fromNil, want) {
 		t.Fatalf("nil stats fallback differs from ordinary output:\n got: %#v\nwant: %#v", fromNil, want)
+	}
+	for i := range issues {
+		if issues[i].ID != "ROOT" {
+			issues[i].Status = model.StatusBlocked
+		}
+	}
+	parked := NewAnalyzer(issues).TopWhatIfDeltasFromStats(&stats, 0)
+	if len(parked) != 0 {
+		t.Fatalf("provided graph stats cannot make parked dependents actionable: %#v", parked)
 	}
 }
 
@@ -452,5 +762,105 @@ func BenchmarkTopWhatIfDeltas_StatsReuse(b *testing.B) {
 		if len(got) != 1 || got[0].IssueID != "ROOT" || got[0].Delta.TransitiveUnblocks != issueCount-1 {
 			b.Fatalf("unexpected top what-if result: %+v", got)
 		}
+	}
+}
+
+// BenchmarkTransitiveUnblocksChainBatch checks every starting point in a chain.
+func BenchmarkTransitiveUnblocksChainBatch(b *testing.B) {
+	const size = 540
+	issues := make([]model.Issue, size)
+	for i := range issues {
+		issues[i] = model.Issue{ID: fmt.Sprintf("chain-%03d", i), Status: model.StatusOpen}
+		if i > 0 {
+			issues[i].Dependencies = []*model.Dependency{{DependsOnID: issues[i-1].ID, Type: model.DepBlocks}}
+		}
+	}
+	analyzer := NewAnalyzer(issues)
+	check := func() {
+		for i, issue := range issues {
+			if got := analyzer.countTransitiveUnblocks(issue.ID); got != size-i-1 {
+				b.Fatalf("%s cascade=%d, want %d", issue.ID, got, size-i-1)
+			}
+		}
+	}
+	check()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		check()
+	}
+}
+
+// BenchmarkEnhancedPriorityBatch isolates batch analysis reuse from long
+// cascades: every dependent has only the root as its prerequisite.
+func BenchmarkEnhancedPriorityBatch(b *testing.B) {
+	b.Setenv("BV_ROBOT", "1")
+	b.Setenv("BV_CACHE_DIR", b.TempDir())
+	analyzer := enhancedPriorityBatchFixture()
+	want := analyzer.GenerateEnhancedRecommendations()
+	if len(want) != 10 {
+		b.Fatalf("expected capped enhanced recommendations, got %d", len(want))
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	var got []EnhancedPriorityRecommendation
+	for i := 0; i < b.N; i++ {
+		got = analyzer.GenerateEnhancedRecommendations()
+	}
+	b.StopTimer()
+	if !reflect.DeepEqual(got, want) {
+		b.Fatal("enhanced recommendations changed across identical calls")
+	}
+}
+
+func enhancedPriorityBatchFixture() *Analyzer {
+	const issueCount = 540
+	issues := make([]model.Issue, issueCount)
+	issues[0] = model.Issue{ID: "ROOT", Status: model.StatusOpen, Priority: 4}
+	for i := 1; i < issueCount; i++ {
+		id := fmt.Sprintf("DEPENDENT-%03d", i)
+		issues[i] = model.Issue{
+			ID: id, Status: model.StatusOpen, Priority: i % 5,
+			Dependencies: []*model.Dependency{{DependsOnID: "ROOT", Type: model.DepBlocks}},
+		}
+	}
+	analyzer := NewAnalyzer(issues)
+	analyzer.SetNow(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
+	return analyzer
+}
+
+func TestEnhancedPriorityBatchRegression(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+	analyzer := enhancedPriorityBatchFixture()
+	// Pin metric policy as well as scoring time for the output golden. The
+	// separate benchmark retains the ordinary size-tiered production policy.
+	config := AnalysisConfig{
+		RunToCompletion: true, ComputeBetweenness: true, BetweennessMode: BetweennessExact,
+		ComputePageRank: true, ComputeHITS: true, ComputeCycles: true, MaxCyclesToStore: 10000,
+		ComputeEigenvector: true, ComputeCriticalPath: true,
+		ComputeKCore: true, ComputeArticulation: true, ComputeSlack: true,
+	}
+	analyzer.SetConfig(&config)
+	got := analyzer.GenerateEnhancedRecommendations()
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Captured from the pre-reuse implementation at 52853c6a with this exact
+	// fixture and explicit metric policy; includes every serialized field.
+	const wantSHA = "0910d7fe9597707b58c50d594a33bdca75698ca5da0b29ce59a92243c0bcab46"
+	if gotSHA := fmt.Sprintf("%x", sha256.Sum256(encoded)); gotSHA != wantSHA {
+		t.Fatalf("complete enhanced output SHA256=%s want %s\n%s", gotSHA, wantSHA, encoded)
+	}
+	allocs := testing.AllocsPerRun(1, func() {
+		if repeated := analyzer.GenerateEnhancedRecommendations(); !reflect.DeepEqual(repeated, got) {
+			t.Fatal("identical batch changed complete recommendations")
+		}
+	})
+	// The old path allocated over three million objects to reread the same
+	// analysis for 540 issues. Leave ample room for actual scoring and output.
+	if allocs > 250000 {
+		t.Fatalf("enhanced batch allocated %.0f objects; want at most 250000", allocs)
 	}
 }

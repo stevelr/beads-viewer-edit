@@ -1,3 +1,6 @@
+> **Status (2026-09-06): historical proposal; current implementation differs**
+> The code uses the `toon-go` module to invoke the external `toon_rust` encoder. Production discovery accepts `TOON_TRU_BIN`, then `TOON_BIN`, followed by validated `tru` or `toon` executables on PATH and the module's fallback paths. An invalid configured override fails discovery instead of falling through. This is the Rust encoder route, not an embedded Go or Node.js encoder. When discovery fails, `bv` warns on stderr and emits JSON; a successful fallback does not prove TOON encoding. The proposed APIs, schemas, completion checkboxes and size estimates below are historical, not current acceptance evidence. Measured TOON vs JSON sizes live in `tests/artifacts/perf/toon_vs_json.md`; README describes their workload limits.
+
 # TOON Integration Brief: beads_viewer (bv)
 
 **Bead:** bd-19e

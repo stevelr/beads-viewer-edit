@@ -374,35 +374,38 @@ func (s *Scorer) BuildExplanation(commit CorrelatedCommit, beadID string) Correl
 	}
 }
 
-// ExtractSignals derives individual signals from a CorrelatedCommit
+// ExtractSignals derives individual signals from a CorrelatedCommit. Every
+// method that matched the commit (Methods; falling back to Method) contributes
+// its signal, so a commit found by two strategies explains both.
 func (s *Scorer) ExtractSignals(commit CorrelatedCommit) []CorrelationSignal {
 	var signals []CorrelationSignal
 
-	// Primary signal based on correlation method
-	switch commit.Method {
-	case MethodCoCommitted:
-		signals = append(signals, CorrelationSignal{
-			Type:   SignalCoCommit,
-			Weight: 50,
-			Detail: "Commit modified both code and beads file together (direct causation)",
-		})
-	case MethodExplicitID:
-		signals = append(signals, CorrelationSignal{
-			Type:   SignalMessageMatch,
-			Weight: 40,
-			Detail: "Commit message contains bead ID reference",
-		})
-	case MethodTemporalAuthor:
-		signals = append(signals, CorrelationSignal{
-			Type:   SignalTiming,
-			Weight: 25,
-			Detail: "Commit within bead's active time window",
-		})
-		signals = append(signals, CorrelationSignal{
-			Type:   SignalAuthorMatch,
-			Weight: 15,
-			Detail: fmt.Sprintf("By assignee: %s", commit.Author),
-		})
+	for _, method := range commit.AllMethods() {
+		switch CorrelationMethod(method) {
+		case MethodCoCommitted:
+			signals = append(signals, CorrelationSignal{
+				Type:   SignalCoCommit,
+				Weight: 50,
+				Detail: "Commit modified both code and beads file together (direct causation)",
+			})
+		case MethodExplicitID:
+			signals = append(signals, CorrelationSignal{
+				Type:   SignalMessageMatch,
+				Weight: 40,
+				Detail: "Commit message contains bead ID reference",
+			})
+		case MethodTemporalAuthor:
+			signals = append(signals, CorrelationSignal{
+				Type:   SignalTiming,
+				Weight: 25,
+				Detail: "Commit within bead's active time window",
+			})
+			signals = append(signals, CorrelationSignal{
+				Type:   SignalAuthorMatch,
+				Weight: 15,
+				Detail: fmt.Sprintf("By assignee: %s", commit.Author),
+			})
+		}
 	}
 
 	// File-based signals
@@ -429,16 +432,23 @@ func (s *Scorer) ExtractSignals(commit CorrelatedCommit) []CorrelationSignal {
 	return signals
 }
 
-// buildSummary creates a one-line summary of the correlation
+// buildSummary creates a one-line summary of the correlation, naming every
+// method that matched.
 func (s *Scorer) buildSummary(commit CorrelatedCommit, signals []CorrelationSignal) string {
-	methodDesc := ""
-	switch commit.Method {
-	case MethodCoCommitted:
-		methodDesc = "Co-committed with bead update"
-	case MethodExplicitID:
-		methodDesc = "Explicitly references bead ID"
-	case MethodTemporalAuthor:
-		methodDesc = "Temporal+author correlation"
+	descs := make([]string, 0, 3)
+	for _, method := range commit.AllMethods() {
+		switch CorrelationMethod(method) {
+		case MethodCoCommitted:
+			descs = append(descs, "Co-committed with bead update")
+		case MethodExplicitID:
+			descs = append(descs, "Explicitly references bead ID")
+		case MethodTemporalAuthor:
+			descs = append(descs, "Temporal+author correlation")
+		}
+	}
+	methodDesc := strings.Join(descs, " + ")
+	if commit.Confirmed {
+		methodDesc += ", confirmed by feedback"
 	}
 
 	return fmt.Sprintf("%s (%.0f%% confidence, %d signals)",

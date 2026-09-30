@@ -17,11 +17,11 @@ import (
 )
 
 // ============================================================================
-// Full update flow integration tests
+// Update-check integration tests
 // ============================================================================
 
-func TestFullUpdateFlow_WithMockServer(t *testing.T) {
-	// Create a mock GitHub API and download server
+func TestCheckForUpdates_WithMockServer(t *testing.T) {
+	// Create realistic archive/checksum metadata for a mock GitHub API response.
 	binaryContent := []byte("#!/bin/sh\necho 'mock bv v99.0.0'")
 
 	// Create tar.gz archive
@@ -40,32 +40,43 @@ func TestFullUpdateFlow_WithMockServer(t *testing.T) {
 	if _, err := tw.Write(binaryContent); err != nil {
 		t.Fatalf("write tar content: %v", err)
 	}
-	tw.Close()
-	gzw.Close()
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar writer: %v", err)
+	}
+	if err := gzw.Close(); err != nil {
+		t.Fatalf("close gzip writer: %v", err)
+	}
 	archiveBytes := archiveBuf.Bytes()
 
 	// Calculate checksum
 	h := sha256.New()
-	h.Write(archiveBytes)
+	if _, err := h.Write(archiveBytes); err != nil {
+		t.Fatalf("hash archive: %v", err)
+	}
 	archiveHash := hex.EncodeToString(h.Sum(nil))
 	assetName := getAssetName("v99.0.0")
 	checksumContent := fmt.Sprintf("%s  %s\n", archiveHash, assetName)
+	checksumHash := sha256.Sum256([]byte(checksumContent))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, _ *http.Request) {
 		release := Release{
 			TagName: "v99.0.0",
-			HTMLURL: "http://example.com/release",
+			HTMLURL: "https://github.com/stevelr/beads-viewer-edit/releases/tag/v99.0.0",
 			Assets: []Asset{
 				{
 					Name:               assetName,
-					BrowserDownloadURL: "http://localhost/archive",
+					BrowserDownloadURL: "https://github.com/stevelr/beads-viewer-edit/releases/download/v99.0.0/" + assetName,
 					Size:               int64(len(archiveBytes)),
+					Digest:             "sha256:" + archiveHash,
+					State:              "uploaded",
 				},
 				{
 					Name:               "checksums.txt",
-					BrowserDownloadURL: "http://localhost/checksums",
+					BrowserDownloadURL: "https://github.com/stevelr/beads-viewer-edit/releases/download/v99.0.0/checksums.txt",
 					Size:               int64(len(checksumContent)),
+					Digest:             "sha256:" + hex.EncodeToString(checksumHash[:]),
+					State:              "uploaded",
 				},
 			},
 		}
@@ -90,6 +101,7 @@ func TestFullUpdateFlow_WithMockServer(t *testing.T) {
 
 	// Test that the mocked release can be parsed
 	client := srv.Client()
+	rewriteGitHubDownloadsToServer(t, client, srv.URL)
 	tag, url, err := checkForUpdates(client, srv.URL+"/releases/latest")
 	if err != nil {
 		t.Fatalf("checkForUpdates failed: %v", err)
@@ -98,7 +110,7 @@ func TestFullUpdateFlow_WithMockServer(t *testing.T) {
 	if tag != "v99.0.0" {
 		t.Errorf("expected tag v99.0.0, got %s", tag)
 	}
-	if url != "http://example.com/release" {
+	if url != "https://github.com/stevelr/beads-viewer-edit/releases/tag/v99.0.0" {
 		t.Errorf("expected release URL, got %s", url)
 	}
 }
@@ -108,7 +120,7 @@ func TestCheckUpdateAvailable_NoUpdateNeeded(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		release := Release{
 			TagName: "v0.0.1", // Lower than any real version
-			HTMLURL: "http://example.com/release",
+			HTMLURL: "https://github.com/stevelr/beads-viewer-edit/releases/tag/v0.0.1",
 		}
 		if err := json.NewEncoder(w).Encode(release); err != nil {
 			t.Errorf("encode release: %v", err)

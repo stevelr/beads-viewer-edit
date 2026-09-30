@@ -177,13 +177,23 @@ func TestCloudflare_ServiceWorkerForCOI(t *testing.T) {
 		t.Errorf("coi-serviceworker.js not found: %v", err)
 	}
 
-	// Verify index.html references it
+	// The registration lives in head_init.js (the CSP forbids inline scripts);
+	// index.html must load that file and the file must register the worker.
 	indexBytes, err := os.ReadFile(filepath.Join(exportDir, "index.html"))
 	if err != nil {
 		t.Fatalf("read index.html: %v", err)
 	}
-	if !strings.Contains(string(indexBytes), "coi-serviceworker") {
-		t.Error("index.html should reference coi-serviceworker")
+	if !strings.Contains(string(indexBytes), `src="head_init.js`) {
+		t.Error("index.html should load head_init.js, which registers coi-serviceworker")
+	}
+	headInit, err := os.ReadFile(filepath.Join(exportDir, "head_init.js"))
+	if err != nil {
+		t.Fatalf("read head_init.js: %v", err)
+	}
+	// This is static inspection of the shipped registration contract; the
+	// separate browser suite exercises activation and offline behavior.
+	if !strings.Contains(string(headInit), "serviceWorker.register('./coi-serviceworker.js', { updateViaCache: 'none' })") {
+		t.Error("head_init.js should register coi-serviceworker.js with updateViaCache none")
 	}
 }
 

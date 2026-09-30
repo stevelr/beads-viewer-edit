@@ -844,7 +844,7 @@ func (m *Model) tryEditKeyHandler(key string) (*Model, tea.Cmd, bool) {
 		m.showHelp || m.showTutorial || m.showQuitConfirm ||
 		m.showTimeTravelPrompt || m.showAlertsPanel ||
 		m.showLabelHealthDetail || m.showLabelDrilldown ||
-		m.showLabelGraphAnalysis || m.showAttentionView {
+		m.showLabelGraphAnalysis {
 		return m, nil, false
 	}
 

@@ -108,6 +108,7 @@ func TestGenerateInteractiveGraphHTML_ContextMenuCopyActions(t *testing.T) {
 		`id="ctx-copy-description">📝 Copy description`,
 		"const value = contextNode ? contextNode.id : '';",
 		"const value = contextNode ? contextNode.description : '';",
+		"Permission policies can reject the modern API",
 		"document.execCommand('copy')",
 		"showToast('No ' + fieldName.toLowerCase() + ' to copy')",
 		"showToast('Copy failed')",

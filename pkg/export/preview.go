@@ -17,15 +17,23 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 // PreviewServer serves a static site bundle locally for previewing.
 type PreviewServer struct {
-	bundlePath    string
-	port          int
+	bundlePath string
+	port       int
+
+	// SAFETY: server publication and stopRequested form one lifecycle state.
+	// Never call into net/http while holding mu: Shutdown may wait for handlers,
+	// and handlers are allowed to call PreviewServer methods.
+	mu            sync.Mutex
 	server        *http.Server
+	stopRequested bool
+
 	liveReloadHub *LiveReloadHub
 }
 
@@ -52,7 +60,7 @@ func (p *PreviewServer) Start() error {
 	// Status endpoint
 	mux.HandleFunc("/__preview__/status", p.statusHandler)
 
-	p.server = &http.Server{
+	httpServer := &http.Server{
 		Addr:              fmt.Sprintf("127.0.0.1:%d", p.port),
 		Handler:           mux,
 		ReadTimeout:       10 * time.Second,
@@ -60,27 +68,37 @@ func (p *PreviewServer) Start() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	listener, err := net.Listen("tcp", p.server.Addr)
+	listener, err := net.Listen("tcp", httpServer.Addr)
 	if err != nil {
-		return fmt.Errorf("listen on %s: %w", p.server.Addr, err)
+		return fmt.Errorf("listen on %s: %w", httpServer.Addr, err)
 	}
 	defer listener.Close()
 
-	// Open browser after short delay
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		url := fmt.Sprintf("http://127.0.0.1:%d", p.port)
-		if err := OpenInBrowser(url); err != nil {
-			fmt.Printf("Could not open browser: %v\n", err)
-			fmt.Printf("Open %s in your browser\n", url)
-		}
-	}()
+	if err := p.publishServer(httpServer); err != nil {
+		return err
+	}
+
+	// Open browser after a short delay. The command and environment are
+	// resolved now (see prepareBrowserOpen); the goroutine only launches.
+	url := fmt.Sprintf("http://127.0.0.1:%d", p.port)
+	if opener, err := prepareBrowserOpen(url); err != nil {
+		fmt.Printf("Could not open browser: %v\n", err)
+		fmt.Printf("Open %s in your browser\n", url)
+	} else if opener != nil {
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			if err := opener.Start(); err != nil {
+				fmt.Printf("Could not open browser: %v\n", err)
+				fmt.Printf("Open %s in your browser\n", url)
+			}
+		}()
+	}
 
 	fmt.Printf("\nPreview server running at http://127.0.0.1:%d\n", p.port)
 	fmt.Printf("Serving: %s\n", p.bundlePath)
 	fmt.Println("\nPress Ctrl+C to stop")
 
-	return p.server.Serve(listener)
+	return httpServer.Serve(listener)
 }
 
 // StartWithGracefulShutdown starts the server with signal handling for clean shutdown.
@@ -90,36 +108,75 @@ func (p *PreviewServer) StartWithGracefulShutdown() error {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(stop)
 
-	// Channel to receive server errors
-	errChan := make(chan error, 1)
+	// Every server exit, including a graceful external Stop, must wake the
+	// owner. Suppressing http.ErrServerClosed here previously left the select
+	// below blocked forever after another goroutine called Stop.
+	serverDone := make(chan error, 1)
 
 	// Start server in goroutine
 	go func() {
-		if err := p.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errChan <- err
+		err := p.Start()
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
 		}
+		serverDone <- err
 	}()
 
-	// Wait for either signal or error
+	// Wait for either signal or server completion.
 	select {
 	case <-stop:
 		fmt.Println("\nShutting down preview server...")
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return p.server.Shutdown(ctx)
-	case err := <-errChan:
+		stopErr := p.Stop()
+		// Stop force-closes the listener if graceful shutdown times out, so the
+		// owner can always join the server goroutine before returning.
+		serverErr := <-serverDone
+		return errors.Join(stopErr, serverErr)
+	case err := <-serverDone:
 		return err
 	}
 }
 
 // Stop gracefully stops the preview server.
 func (p *PreviewServer) Stop() error {
-	if p.server == nil {
-		return nil
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return p.server.Shutdown(ctx)
+
+	server := p.requestStop()
+	if server == nil {
+		return nil
+	}
+	if err := server.Shutdown(ctx); err != nil {
+		shutdownErr := fmt.Errorf("graceful preview shutdown: %w", err)
+		// Shutdown leaves the server running when its context expires. Close is
+		// the bounded fallback that preserves the owner/child join contract.
+		if closeErr := server.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+			return errors.Join(shutdownErr, fmt.Errorf("force-close preview server: %w", closeErr))
+		}
+		return shutdownErr
+	}
+	return nil
+}
+
+func (p *PreviewServer) publishServer(server *http.Server) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.stopRequested {
+		return http.ErrServerClosed
+	}
+	if p.server != nil {
+		return fmt.Errorf("preview server already started")
+	}
+	p.server = server
+	return nil
+}
+
+func (p *PreviewServer) requestStop() *http.Server {
+	p.mu.Lock()
+	p.stopRequested = true
+	server := p.server
+	p.mu.Unlock()
+	return server
 }
 
 // Port returns the port the server is running on.
@@ -402,9 +459,12 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 				liveReloadHub.Stop()
 				liveReloadHub = nil
 			} else {
-				// Add SSE endpoint for live-reload
+				// Add SSE endpoint for live-reload and the script that subscribes
+				// to it (served as a file so the dashboard's CSP, which forbids
+				// inline scripts, still lets it run).
 				mux.HandleFunc("/__preview__/events", liveReloadHub.SSEHandler())
-				// Wrap file server with live-reload script injection
+				mux.HandleFunc(LiveReloadScriptPath, liveReloadScriptHandler)
+				// Wrap file server with live-reload script-tag injection
 				mux.Handle("/", liveReloadMiddleware(noCacheMiddleware(fileServer)))
 			}
 		}
@@ -418,7 +478,7 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 	mux.HandleFunc("/__preview__/status", server.statusHandler)
 	server.liveReloadHub = liveReloadHub
 
-	server.server = &http.Server{
+	httpServer := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
 		ReadTimeout:       10 * time.Second,
@@ -426,18 +486,28 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	// Handle opening browser
+	// Handle opening browser. Resolve the command and environment NOW; the
+	// delayed goroutine must not consult PATH/env later, when a different
+	// caller (or the next test) may have changed them.
 	if config.OpenBrowser {
-		go func() {
-			time.Sleep(500 * time.Millisecond)
-			url := server.URL()
-			if err := OpenInBrowser(url); err != nil {
-				if !config.Quiet {
-					fmt.Printf("Could not open browser: %v\n", err)
-					fmt.Printf("Open %s in your browser\n", url)
-				}
+		url := server.URL()
+		opener, err := prepareBrowserOpen(url)
+		if err != nil {
+			if !config.Quiet {
+				fmt.Printf("Could not open browser: %v\n", err)
+				fmt.Printf("Open %s in your browser\n", url)
 			}
-		}()
+		} else if opener != nil {
+			go func() {
+				time.Sleep(500 * time.Millisecond)
+				if err := opener.Start(); err != nil {
+					if !config.Quiet {
+						fmt.Printf("Could not open browser: %v\n", err)
+						fmt.Printf("Open %s in your browser\n", url)
+					}
+				}
+			}()
+		}
 	}
 
 	// Print status message
@@ -460,7 +530,7 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 
 	// Start server in goroutine
 	go func() {
-		if err := server.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errChan <- err
 		}
 	}()
@@ -477,7 +547,7 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return server.server.Shutdown(ctx)
+		return httpServer.Shutdown(ctx)
 	case err := <-errChan:
 		// Stop live-reload hub on error
 		if liveReloadHub != nil {

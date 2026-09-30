@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	json "github.com/goccy/go-json"
 )
 
@@ -108,7 +109,7 @@ func perCommitCoCommitCacheNamespace() string {
 }
 
 func perCommitCoCommitCachePath(create bool) (string, error) {
-	base := os.Getenv("BV_CACHE_DIR")
+	base := env.CacheDir.Get()
 	if base == "" {
 		dir, err := os.UserCacheDir()
 		if err != nil {
@@ -245,7 +246,7 @@ func pruneAndBoundPerCommitCoCommitEntries(now time.Time, entries map[string]per
 	var all []item
 	for ns, bucket := range entries {
 		for sha, e := range bucket.Commits {
-			if e.CreatedAt.IsZero() || now.Sub(e.CreatedAt) > perCommitCoCommitCacheMaxAge {
+			if !cacheCreatedAtIsFresh(e.CreatedAt, now, perCommitCoCommitCacheMaxAge) {
 				delete(bucket.Commits, sha)
 				continue
 			}
@@ -311,7 +312,7 @@ func loadPerCommitCoCommit(namespace string) map[string]perCommitCoCommitEntry {
 	// Filter aged entries out of the returned view without rewriting the file.
 	out := make(map[string]perCommitCoCommitEntry, len(bucket.Commits))
 	for sha, e := range bucket.Commits {
-		if e.CreatedAt.IsZero() || now.Sub(e.CreatedAt) > perCommitCoCommitCacheMaxAge {
+		if !cacheCreatedAtIsFresh(e.CreatedAt, now, perCommitCoCommitCacheMaxAge) {
 			continue
 		}
 		out[sha] = e

@@ -1,8 +1,10 @@
 package agents
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -125,6 +127,7 @@ func TestAgentFileDetectionMethods(t *testing.T) {
 			{"empty", AgentFileDetection{}, false},
 			{"found without blurb", AgentFileDetection{FilePath: "/path", HasBlurb: false}, true},
 			{"found with blurb", AgentFileDetection{FilePath: "/path", HasBlurb: true}, false},
+			{"found with malformed markers", AgentFileDetection{FilePath: "/path", BlurbStructureError: "bad markers"}, false},
 		}
 
 		for _, tt := range tests {
@@ -143,8 +146,11 @@ func TestAgentFileDetectionMethods(t *testing.T) {
 			expected bool
 		}{
 			{"no blurb", AgentFileDetection{HasBlurb: false}, false},
-			{"current version", AgentFileDetection{HasBlurb: true, BlurbVersion: BlurbVersion}, false},
+			{"current version", AgentFileDetection{HasBlurb: true, BlurbVersion: BlurbVersion, BlurbCount: 1}, false},
 			{"old version", AgentFileDetection{HasBlurb: true, BlurbVersion: 0}, true},
+			{"future version", AgentFileDetection{HasBlurb: true, BlurbVersion: BlurbVersion + 1, BlurbCount: 1}, true},
+			{"malformed current version", AgentFileDetection{HasBlurb: true, BlurbVersion: BlurbVersion, BlurbStructureError: "bad markers"}, true},
+			{"duplicate current version", AgentFileDetection{HasBlurb: true, BlurbVersion: BlurbVersion, BlurbCount: 2}, true},
 		}
 
 		for _, tt := range tests {
@@ -155,6 +161,246 @@ func TestAgentFileDetectionMethods(t *testing.T) {
 			})
 		}
 	})
+
+	t.Run("HasFutureBlurb", func(t *testing.T) {
+		if (AgentFileDetection{HasBlurb: true, BlurbVersion: BlurbVersion}).HasFutureBlurb() {
+			t.Fatal("current blurb reported as future")
+		}
+		if !(AgentFileDetection{HasBlurb: true, BlurbVersion: BlurbVersion + 1}).HasFutureBlurb() {
+			t.Fatal("newer blurb was not reported as future")
+		}
+	})
+}
+
+func TestDetectAgentFileReportsMalformedAndDuplicateBlurbs(t *testing.T) {
+	tests := []struct {
+		name          string
+		content       string
+		wantHasBlurb  bool
+		wantCount     int
+		wantMalformed bool
+		wantDuplicate bool
+	}{
+		{
+			name:          "unterminated current blurb",
+			content:       "# Header\n\n<!-- bv-agent-instructions-v5 -->\ncontent",
+			wantHasBlurb:  true,
+			wantMalformed: true,
+		},
+		{
+			name:          "stray end marker",
+			content:       "# Header\n\n<!-- end-bv-agent-instructions -->",
+			wantMalformed: true,
+		},
+		{
+			name: "duplicate current blurbs",
+			content: "<!-- bv-agent-instructions-v5 -->\none\n<!-- end-bv-agent-instructions -->\n" +
+				"<!-- bv-agent-instructions-v5 -->\ntwo\n<!-- end-bv-agent-instructions -->",
+			wantHasBlurb:  true,
+			wantCount:     2,
+			wantDuplicate: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			filePath := filepath.Join(tmpDir, "AGENTS.md")
+			if err := os.WriteFile(filePath, []byte(tt.content), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			detection := DetectAgentFile(tmpDir)
+			if detection.HasBlurb != tt.wantHasBlurb {
+				t.Fatalf("HasBlurb=%v, want %v", detection.HasBlurb, tt.wantHasBlurb)
+			}
+			if detection.BlurbCount != tt.wantCount {
+				t.Fatalf("BlurbCount=%d, want %d", detection.BlurbCount, tt.wantCount)
+			}
+			if detection.HasMalformedBlurb() != tt.wantMalformed {
+				t.Fatalf("HasMalformedBlurb()=%v, want %v (error=%q)", detection.HasMalformedBlurb(), tt.wantMalformed, detection.BlurbStructureError)
+			}
+			if detection.HasDuplicateBlurbs() != tt.wantDuplicate {
+				t.Fatalf("HasDuplicateBlurbs()=%v, want %v", detection.HasDuplicateBlurbs(), tt.wantDuplicate)
+			}
+			if !detection.NeedsUpgrade() {
+				t.Fatal("malformed or duplicate blurb should need update/normalization")
+			}
+			if detection.NeedsBlurb() {
+				t.Fatal("malformed marker structure must not be treated as a safe append target")
+			}
+		})
+	}
+}
+
+func TestDetectAgentFileReportsHighestAndFutureBlurbVersion(t *testing.T) {
+	tmpDir := t.TempDir()
+	content := "<!-- bv-agent-instructions-v5 -->\ncurrent\n<!-- end-bv-agent-instructions -->\n" +
+		"<!-- bv-agent-instructions-v7 -->\nfuture\n<!-- end-bv-agent-instructions -->\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, "AGENTS.md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	detection := DetectAgentFile(tmpDir)
+	if detection.BlurbVersion != 7 {
+		t.Fatalf("BlurbVersion=%d, want highest version 7", detection.BlurbVersion)
+	}
+	if !detection.HasFutureBlurb() || !detection.NeedsUpgrade() {
+		t.Fatalf("future detection=%+v, want future and needs-attention state", detection)
+	}
+}
+
+func TestDetectAgentFileReportsFutureBlurbRevealedByLegacyRemoval(t *testing.T) {
+	tmpDir := t.TempDir()
+	content := LegacyBlurbContent + "\n" +
+		"<!-- bv-agent-instructions-v11 -->\n" +
+		"```bash\nfuture command\n```\n" +
+		"future\n<!-- end-bv-agent-instructions -->\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, "AGENTS.md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	detection := DetectAgentFile(tmpDir)
+	if detection.BlurbVersion != 11 || !detection.HasFutureBlurb() {
+		t.Fatalf("future detection behind legacy fence=%+v, want version 11 future state", detection)
+	}
+	if detection.HasMalformedBlurb() || detection.BlurbCount != 1 {
+		t.Fatalf("revealed future structure=%+v, want one complete block", detection)
+	}
+}
+
+func TestDetectAgentFileCompleteFutureBlockPrecedesLaterMalformedMarker(t *testing.T) {
+	futureVersion := BlurbVersion + 8
+	futureBlockWithStrayEnd := fmt.Sprintf("<!-- bv-agent-instructions-v%d -->\nfuture instructions\n%s\n%s\n", futureVersion, BlurbEndMarker, BlurbEndMarker)
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name:    "direct view",
+			content: futureBlockWithStrayEnd,
+		},
+		{
+			name: "legacy-revealed conservative view",
+			content: LegacyBlurbContent + "\n" +
+				BlurbStartMarker + "\ncurrent physical block\n" + BlurbEndMarker + "\n" +
+				"```\n" +
+				futureBlockWithStrayEnd,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(tmpDir, "AGENTS.md"), []byte(tt.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			detection := DetectAgentFile(tmpDir)
+			if !detection.HasFutureBlurb() {
+				t.Fatalf("detection=%+v, want complete future block classification", detection)
+			}
+			if detection.HasMalformedBlurb() {
+				t.Fatalf("lower-precedence marker error survived complete future block: %+v", detection)
+			}
+			if detection.BlurbVersion != futureVersion || detection.BlurbCount != 1 {
+				t.Fatalf("future detection version/count=%d/%d, want %d/1", detection.BlurbVersion, detection.BlurbCount, futureVersion)
+			}
+		})
+	}
+}
+
+func TestDetectAgentFileReportsAmbiguousCurrentBlurbAsMalformed(t *testing.T) {
+	tmpDir := t.TempDir()
+	content := LegacyBlurbContent + "\n" +
+		"<!-- bv-agent-instructions-v5 -->\n" +
+		"```bash\ncurrent command\n```\n" +
+		"current\n<!-- end-bv-agent-instructions -->\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, "AGENTS.md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	detection := DetectAgentFile(tmpDir)
+	if !detection.HasMalformedBlurb() || !detection.NeedsUpgrade() {
+		t.Fatalf("ambiguous legacy/current detection=%+v, want fail-closed malformed state", detection)
+	}
+	if detection.HasFutureBlurb() {
+		t.Fatalf("current-version fenced content was misclassified as future: %+v", detection)
+	}
+}
+
+func TestDetectAgentFileAnalyzesEveryPreservedAmbiguousLegacyFence(t *testing.T) {
+	tests := []struct {
+		name          string
+		version       int
+		body          string
+		wantFuture    bool
+		wantMalformed bool
+	}{
+		{name: "current simple body", version: BlurbVersion, body: "current instructions\n", wantMalformed: true},
+		{name: "current bare fenced body", version: BlurbVersion, body: "```\ncurrent command\n```\ncurrent instructions\n", wantMalformed: true},
+		{name: "future simple body", version: BlurbVersion + 7, body: "future instructions\n", wantFuture: true},
+		{name: "future bare fenced body", version: BlurbVersion + 7, body: "```\nfuture command\n```\nfuture instructions\n", wantFuture: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			content := LegacyBlurbContent + "\n" +
+				fmt.Sprintf("<!-- bv-agent-instructions-v%d -->\n", tt.version) +
+				tt.body + BlurbEndMarker + "\n"
+			if err := os.WriteFile(filepath.Join(tmpDir, "AGENTS.md"), []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			detection := DetectAgentFile(tmpDir)
+			if detection.HasFutureBlurb() != tt.wantFuture {
+				t.Fatalf("HasFutureBlurb()=%v, want %v: %+v", detection.HasFutureBlurb(), tt.wantFuture, detection)
+			}
+			if detection.HasMalformedBlurb() != tt.wantMalformed {
+				t.Fatalf("HasMalformedBlurb()=%v, want %v: %+v", detection.HasMalformedBlurb(), tt.wantMalformed, detection)
+			}
+			if tt.wantFuture && (detection.BlurbVersion != tt.version || detection.BlurbCount != 1) {
+				t.Fatalf("future detection version/count=%d/%d, want %d/1", detection.BlurbVersion, detection.BlurbCount, tt.version)
+			}
+		})
+	}
+}
+
+func TestDetectAgentFileRejectsAmbiguousLegacyInterpretations(t *testing.T) {
+	tests := []struct {
+		name      string
+		content   string
+		wantError string
+	}{
+		{
+			name:      "same-version physical blocks swap visibility",
+			content:   ambiguousSameVersionBlockSwapContent(),
+			wantError: "ambiguous marker material",
+		},
+		{
+			name:      "legacy removal count diverges",
+			content:   ambiguousTwoLegacyBlocksContent(),
+			wantError: "removal count",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(tmpDir, "AGENTS.md"), []byte(tt.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			detection := DetectAgentFile(tmpDir)
+			if !detection.HasMalformedBlurb() || !strings.Contains(detection.BlurbStructureError, tt.wantError) {
+				t.Fatalf("detection=%+v, want malformed error containing %q", detection, tt.wantError)
+			}
+			if detection.HasFutureBlurb() {
+				t.Fatalf("ambiguous current/legacy content was misclassified as future: %+v", detection)
+			}
+		})
+	}
 }
 
 func TestDetectAgentFileInParents(t *testing.T) {

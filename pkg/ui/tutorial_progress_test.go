@@ -2,11 +2,16 @@ package ui
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -80,6 +85,8 @@ func TestTutorialProgressManager_SaveLoad(t *testing.T) {
 	// Create temp directory for testing
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", "")    // exercise the ~/.config fallback path
+	t.Setenv("BV_NO_SAVED_CONFIG", "") // TestMain disables persistence; opt back in
 
 	// Create a manager
 	pm := &tutorialProgressManager{
@@ -132,6 +139,8 @@ func TestTutorialProgressManager_SaveLoad(t *testing.T) {
 func TestTutorialProgressManager_LoadNonexistent(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", "")    // exercise the ~/.config fallback path
+	t.Setenv("BV_NO_SAVED_CONFIG", "") // TestMain disables persistence; opt back in
 
 	pm := &tutorialProgressManager{
 		progress: &TutorialProgress{
@@ -152,6 +161,8 @@ func TestTutorialProgressManager_LoadNonexistent(t *testing.T) {
 func TestTutorialProgressManager_LoadInvalidJSON(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", "")    // exercise the ~/.config fallback path
+	t.Setenv("BV_NO_SAVED_CONFIG", "") // TestMain disables persistence; opt back in
 
 	// Create invalid JSON file
 	configPath := filepath.Join(tmpDir, ".config", "bv", "tutorial-progress.json")
@@ -326,6 +337,8 @@ func TestTutorialModel_SaveProgress(t *testing.T) {
 	// Create temp directory for testing
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", "")    // exercise the ~/.config fallback path
+	t.Setenv("BV_NO_SAVED_CONFIG", "") // TestMain disables persistence; opt back in
 
 	// Reset singleton for test isolation
 	progressManager = nil
@@ -360,6 +373,8 @@ func TestTutorialModel_LoadProgress(t *testing.T) {
 	// Create temp directory for testing
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", "")    // exercise the ~/.config fallback path
+	t.Setenv("BV_NO_SAVED_CONFIG", "") // TestMain disables persistence; opt back in
 
 	// Reset singleton
 	progressManager = nil
@@ -395,6 +410,8 @@ func TestTutorialModel_HasViewedPage(t *testing.T) {
 	// Create temp directory for testing
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", "")    // exercise the ~/.config fallback path
+	t.Setenv("BV_NO_SAVED_CONFIG", "") // TestMain disables persistence; opt back in
 
 	// Reset singleton
 	progressManager = nil
@@ -440,6 +457,8 @@ func TestTutorialModel_SaveProgress_AllViewed(t *testing.T) {
 	// Create temp directory for testing
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", "")    // exercise the ~/.config fallback path
+	t.Setenv("BV_NO_SAVED_CONFIG", "") // TestMain disables persistence; opt back in
 
 	// Reset singleton
 	progressManager = nil
@@ -462,4 +481,279 @@ func TestTutorialModel_SaveProgress_AllViewed(t *testing.T) {
 	if !pm.HasCompletedOnce() {
 		t.Error("Expected tutorial to be marked as completed when all pages viewed")
 	}
+}
+
+// =============================================================================
+// Persistence wiring through the TUI model (E3): load on open, mark on page
+// change, save on close, resume last page, BV_NO_SAVED_CONFIG disables.
+// =============================================================================
+
+// isolatedTutorialProgress points tutorial persistence at a fresh
+// XDG_CONFIG_HOME, opts back in to saved config (TestMain disables it), and
+// resets the singleton so the test starts from an empty progress file.
+// Returns the path the progress file will be written to.
+func isolatedTutorialProgress(t *testing.T) string {
+	t.Helper()
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+	resetTutorialProgressSingleton(t)
+	return filepath.Join(xdg, "bv", "tutorial-progress.json")
+}
+
+func resetTutorialProgressSingleton(t *testing.T) {
+	t.Helper()
+	progressManager = nil
+	progressManagerOnce = sync.Once{}
+	t.Cleanup(func() {
+		progressManager = nil
+		progressManagerOnce = sync.Once{}
+	})
+}
+
+func newTutorialTestModel(t *testing.T) *Model {
+	t.Helper()
+	m := NewModel([]model.Issue{{ID: "tp-1", Title: "Tutorial persistence", Status: model.StatusOpen}}, nil, "")
+	t.Cleanup(m.Stop)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	return updated.(*Model)
+}
+
+func pressTutorialKey(t *testing.T, m *Model, key string) *Model {
+	t.Helper()
+	var msg tea.KeyMsg
+	switch key {
+	case "esc":
+		msg = tea.KeyMsg{Type: tea.KeyEsc}
+	default:
+		msg = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)}
+	}
+	updated, _ := m.Update(msg)
+	return updated.(*Model)
+}
+
+func TestTutorial_ProgressRoundTrip(t *testing.T) {
+	progressPath := isolatedTutorialProgress(t)
+
+	m := newTutorialTestModel(t)
+	m = pressTutorialKey(t, m, "`") // open tutorial
+	if !m.showTutorial || m.focused != focusTutorial {
+		t.Fatalf("expected tutorial open, showTutorial=%v focus=%v", m.showTutorial, m.focused)
+	}
+	pages := m.tutorialModel.pages
+	if len(pages) < 4 {
+		t.Fatalf("tutorial fixture too small: %d pages", len(pages))
+	}
+
+	m = pressTutorialKey(t, m, "l") // page 2
+	m = pressTutorialKey(t, m, "l") // page 3
+	if got := m.tutorialModel.currentPage; got != 2 {
+		t.Fatalf("after two next-page presses currentPage=%d, want 2", got)
+	}
+	if _, err := os.Stat(progressPath); !os.IsNotExist(err) {
+		t.Fatalf("progress must not be written before the tutorial closes (stat err=%v)", err)
+	}
+
+	m = pressTutorialKey(t, m, "q") // close -> SaveProgress
+	if m.showTutorial || m.focused != focusList {
+		t.Fatalf("expected tutorial closed and list focused, showTutorial=%v focus=%v", m.showTutorial, m.focused)
+	}
+	if got := m.tutorialModel.currentPage; got != 2 {
+		t.Fatalf("closing must keep the tutorial instance (currentPage=%d, want 2)", got)
+	}
+
+	data, err := os.ReadFile(progressPath)
+	if err != nil {
+		t.Fatalf("progress file not written on close: %v", err)
+	}
+	var saved TutorialProgress
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatalf("progress file is not valid JSON: %v\n%s", err, data)
+	}
+	for _, idx := range []int{0, 1, 2} {
+		if !saved.ViewedPages[pages[idx].ID] {
+			t.Errorf("page %d (%s) should be persisted as viewed; got %v", idx, pages[idx].ID, saved.ViewedPages)
+		}
+	}
+	if saved.ViewedPages[pages[3].ID] {
+		t.Errorf("page 3 (%s) was never shown and must not be persisted as viewed", pages[3].ID)
+	}
+	if saved.LastPageID != pages[2].ID {
+		t.Errorf("last_page_id=%q, want %q", saved.LastPageID, pages[2].ID)
+	}
+
+	// Same process, reopening: resumes on the page we left, in place.
+	m = pressTutorialKey(t, m, "`")
+	if got := m.tutorialModel.currentPage; got != 2 {
+		t.Fatalf("reopen in-session: currentPage=%d, want 2", got)
+	}
+	m = pressTutorialKey(t, m, "q")
+
+	// Fresh process (new singleton, new model): progress and resume point survive.
+	resetTutorialProgressSingleton(t)
+	m2 := newTutorialTestModel(t)
+	if got := m2.tutorialModel.currentPage; got != 2 {
+		t.Fatalf("new model should resume at page index 2, got %d", got)
+	}
+	for _, idx := range []int{0, 1, 2} {
+		if !m2.tutorialModel.progress[pages[idx].ID] {
+			t.Errorf("new model: page %d should be marked viewed for the TOC", idx)
+		}
+	}
+	m2 = pressTutorialKey(t, m2, "`")
+	m2 = pressTutorialKey(t, m2, "t") // show TOC with viewed marks
+	view := m2.tutorialModel.View()
+	if !strings.Contains(view, "Page 3/") {
+		t.Errorf("header should show real page numbers, got:\n%s", view)
+	}
+	if !strings.Contains(view, "✓") {
+		t.Errorf("TOC should mark viewed pages with ✓, got:\n%s", view)
+	}
+	wantPct := (3 * 100) / len(pages)
+	if !strings.Contains(view, fmt.Sprintf("· %d%%", wantPct)) {
+		t.Errorf("header should show %d%% viewed, got:\n%s", wantPct, view)
+	}
+}
+
+func TestTutorial_ResumesLastPage(t *testing.T) {
+	isolatedTutorialProgress(t)
+	pages := defaultTutorialPages()
+	if len(pages) < 7 {
+		t.Fatalf("tutorial fixture too small: %d pages", len(pages))
+	}
+
+	// Simulate an earlier session that read pages 0..5 and stopped on page 5.
+	pm := GetTutorialProgressManager()
+	for i := 0; i <= 5; i++ {
+		pm.MarkPageViewed(pages[i].ID)
+	}
+	if err := pm.Save(); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+	resetTutorialProgressSingleton(t)
+
+	m := newTutorialTestModel(t)
+	if got := m.tutorialModel.currentPage; got != 5 {
+		t.Fatalf("expected resume at page index 5, got %d", got)
+	}
+
+	// Going back to an already-viewed page moves the resume point too.
+	m = pressTutorialKey(t, m, "`")
+	m = pressTutorialKey(t, m, "h") // page 4
+	m = pressTutorialKey(t, m, "esc")
+	resetTutorialProgressSingleton(t)
+	m2 := newTutorialTestModel(t)
+	if got := m2.tutorialModel.currentPage; got != 4 {
+		t.Fatalf("resume point should follow backwards navigation: got %d, want 4", got)
+	}
+
+	// A stale resume id that no longer matches any page falls back to page 0.
+	pm = GetTutorialProgressManager()
+	pm.MarkPageViewed("page-that-no-longer-exists")
+	if err := pm.Save(); err != nil {
+		t.Fatalf("save stale id: %v", err)
+	}
+	resetTutorialProgressSingleton(t)
+	m3 := newTutorialTestModel(t)
+	if got := m3.tutorialModel.currentPage; got != 0 {
+		t.Fatalf("unknown last page id should fall back to page 0, got %d", got)
+	}
+}
+
+func TestTutorial_CorruptProgressIgnored(t *testing.T) {
+	progressPath := isolatedTutorialProgress(t)
+	if err := os.MkdirAll(filepath.Dir(progressPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(progressPath, []byte("{\"viewed_pages\": [garbage"), 0o644); err != nil {
+		t.Fatalf("write corrupt file: %v", err)
+	}
+
+	m := newTutorialTestModel(t) // must not panic
+	if got := m.tutorialModel.currentPage; got != 0 {
+		t.Fatalf("corrupt progress should yield defaults, currentPage=%d", got)
+	}
+	if len(m.tutorialModel.progress) != 0 {
+		t.Fatalf("corrupt progress should yield an empty viewed map, got %v", m.tutorialModel.progress)
+	}
+
+	// Using the tutorial afterwards replaces the corrupt file with valid JSON.
+	m = pressTutorialKey(t, m, "`")
+	m = pressTutorialKey(t, m, "l")
+	m = pressTutorialKey(t, m, "q")
+	data, err := os.ReadFile(progressPath)
+	if err != nil {
+		t.Fatalf("read rewritten progress: %v", err)
+	}
+	var saved TutorialProgress
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatalf("rewritten progress is not valid JSON: %v\n%s", err, data)
+	}
+	if saved.LastPageID != m.tutorialModel.pages[1].ID {
+		t.Fatalf("last_page_id=%q, want %q", saved.LastPageID, m.tutorialModel.pages[1].ID)
+	}
+}
+
+func TestTutorial_NoSavedConfigWritesNothing(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	t.Setenv("BV_NO_SAVED_CONFIG", "1")
+	resetTutorialProgressSingleton(t)
+
+	// Seed a real progress file: with persistence disabled it must be ignored.
+	seedDir := filepath.Join(xdg, "bv")
+	if err := os.MkdirAll(seedDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	pages := defaultTutorialPages()
+	seed := TutorialProgress{ViewedPages: map[string]bool{pages[3].ID: true}, LastPageID: pages[3].ID}
+	seedBytes, _ := json.Marshal(seed)
+	if err := os.WriteFile(filepath.Join(seedDir, "tutorial-progress.json"), seedBytes, 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	before := dirListing(t, seedDir)
+
+	m := newTutorialTestModel(t)
+	if got := m.tutorialModel.currentPage; got != 0 {
+		t.Fatalf("BV_NO_SAVED_CONFIG must not resume from disk, currentPage=%d", got)
+	}
+	m = pressTutorialKey(t, m, "`")
+	m = pressTutorialKey(t, m, "l")
+	m = pressTutorialKey(t, m, "l")
+	m = pressTutorialKey(t, m, "q")
+
+	after := dirListing(t, seedDir)
+	if len(before) != len(after) {
+		t.Fatalf("directory listing changed: before=%v after=%v", before, after)
+	}
+	for i := range before {
+		if before[i] != after[i] {
+			t.Fatalf("directory listing changed: before=%v after=%v", before, after)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(seedDir, "tutorial-progress.json"))
+	if err != nil {
+		t.Fatalf("read seed: %v", err)
+	}
+	if string(data) != string(seedBytes) {
+		t.Fatalf("seed file was rewritten under BV_NO_SAVED_CONFIG:\n%s", data)
+	}
+}
+
+// dirListing returns "name:size:mtime" entries so any write shows up.
+func dirListing(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir %s: %v", dir, err)
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			t.Fatalf("stat %s: %v", e.Name(), err)
+		}
+		out = append(out, fmt.Sprintf("%s:%d:%s", e.Name(), info.Size(), info.ModTime().Format(time.RFC3339Nano)))
+	}
+	return out
 }

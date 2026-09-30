@@ -1,10 +1,97 @@
 package export
 
 import (
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/charmbracelet/huh"
 )
+
+func TestReadWizardInputTimeoutDoesNotKeepConsumingPipe(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	_, err = readWizardInput(reader, 20*time.Millisecond)
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("readWizardInput error = %v, want deadline exceeded", err)
+	}
+
+	// SAFETY: after the timeout there must be no abandoned reader goroutine.
+	// Data written now must remain available to this caller, and clearing the
+	// helper's deadline must make the pipe reusable.
+	want := "input after timeout\n"
+	if _, err := io.WriteString(writer, want); err != nil {
+		t.Fatalf("write after timeout: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read after timeout: %v", err)
+	}
+	if string(got) != want {
+		t.Fatalf("read after timeout = %q, want %q", got, want)
+	}
+}
+
+func TestReadWizardInputReadsClosedPipe(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+
+	want := "local\nProject Issues\n"
+	if _, err := io.WriteString(writer, want); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	got, err := readWizardInput(reader, time.Second)
+	if err != nil {
+		t.Fatalf("readWizardInput: %v", err)
+	}
+	if string(got) != want {
+		t.Fatalf("readWizardInput = %q, want %q", got, want)
+	}
+}
+
+func TestWizardNewFormUsesBufferedInput(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	wizard := NewWizard("/tmp/test")
+	wizard.input = &wizardInputReader{data: []byte("y\nn\n")}
+
+	first := false
+	second := true
+	form := wizard.newForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title("First?").
+			Value(&first),
+		huh.NewConfirm().
+			Title("Second?").
+			Value(&second),
+	))
+	if err := form.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !first || second {
+		t.Fatalf("buffered answers = (%t, %t), want (true, false)", first, second)
+	}
+}
 
 func TestNewWizard(t *testing.T) {
 	wizard := NewWizard("/tmp/test")

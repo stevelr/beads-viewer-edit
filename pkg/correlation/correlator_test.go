@@ -1,8 +1,17 @@
 package correlation
 
 import (
+	"context"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
+
+	json "github.com/goccy/go-json"
 )
 
 func TestBuildHistories_Empty(t *testing.T) {
@@ -86,6 +95,17 @@ func TestBuildCommitIndex(t *testing.T) {
 	// abc123 should reference both beads
 	if len(index["abc123"]) != 2 {
 		t.Errorf("expected abc123 to reference 2 beads, got %d", len(index["abc123"]))
+	}
+	if got := index["abc123"]; got[0] != "bv-1" || got[1] != "bv-2" {
+		t.Fatalf("expected sorted abc123 bead IDs, got %v", got)
+	}
+
+	// Duplicate history entries must not produce duplicate reverse links.
+	history := histories["bv-2"]
+	history.Commits = append(history.Commits, CorrelatedCommit{SHA: "abc123"})
+	histories["bv-2"] = history
+	if got := BuildCommitIndex(histories)["abc123"]; len(got) != 2 {
+		t.Fatalf("expected duplicate commit link to collapse, got %v", got)
 	}
 }
 
@@ -396,5 +416,275 @@ func TestDescribeGitRange_Combined(t *testing.T) {
 
 	if result != "since 2024-01-01, until 2024-12-31, limit 100 commits" {
 		t.Errorf("unexpected result: %s", result)
+	}
+}
+
+// TestAssembleReport_AppliesFeedback proves the feedback loop changes report
+// output (C4): a rejected (commit, bead) pair disappears from the bead's
+// commits and the commit index, a confirmed pair is pinned to confidence 1.0,
+// untouched pairs and other beads are unchanged, and the cached artifact the
+// report was assembled from is never mutated.
+func TestAssembleReport_AppliesFeedback(t *testing.T) {
+	store := NewFeedbackStore(t.TempDir())
+	if err := store.Load(); err != nil {
+		t.Fatalf("load empty store: %v", err)
+	}
+	if err := store.Reject("aaa", "bv-9", "tester", 0.9, "unrelated refactor"); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+	if err := store.Confirm("bbb", "bv-9", "tester", 0.5, ""); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	// Feedback about a pair the report does not contain must be ignored, not
+	// invented into the output.
+	if err := store.Confirm("zzz", "bv-9", "tester", 0.5, ""); err != nil {
+		t.Fatalf("confirm stray: %v", err)
+	}
+
+	art := &historyArtifact{
+		Commits: []CorrelatedCommit{
+			{SHA: "aaa", BeadID: "bv-9", Method: "explicit", Confidence: 0.9, Author: "a"},
+			{SHA: "bbb", BeadID: "bv-9", Method: "temporal", Confidence: 0.5, Author: "b"},
+			{SHA: "ccc", BeadID: "bv-9", Method: "cocommit", Confidence: 0.7, Author: "c"},
+			{SHA: "aaa", BeadID: "bv-10", Method: "explicit", Confidence: 0.9, Author: "a"},
+		},
+	}
+	beads := []BeadInfo{{ID: "bv-9", Title: "nine", Status: "open"}, {ID: "bv-10", Title: "ten", Status: "open"}}
+
+	withStore := (&Correlator{}).WithFeedbackStore(store)
+	report := withStore.assembleReport(beads, CorrelatorOptions{}, art)
+
+	nine := report.Histories["bv-9"]
+	if len(nine.Commits) != 2 {
+		t.Fatalf("bv-9 commits after feedback = %d (%+v); want 2 (aaa rejected)", len(nine.Commits), nine.Commits)
+	}
+	for _, c := range nine.Commits {
+		switch c.SHA {
+		case "aaa":
+			t.Fatalf("rejected commit aaa still listed for bv-9: %+v", c)
+		case "bbb":
+			if c.Confidence != 1.0 || !c.Confirmed {
+				t.Fatalf("confirmed commit bbb: confidence=%v confirmed=%v; want 1.0/true", c.Confidence, c.Confirmed)
+			}
+			if !strings.Contains(c.Reason, "confirmed by feedback (tester)") {
+				t.Fatalf("confirmed commit reason should say so: %q", c.Reason)
+			}
+		case "ccc":
+			if c.Confidence != 0.7 || c.Confirmed {
+				t.Fatalf("untouched commit ccc changed: %+v", c)
+			}
+		}
+	}
+	if beadsForAAA := report.CommitIndex["aaa"]; len(beadsForAAA) != 1 || beadsForAAA[0] != "bv-10" {
+		t.Fatalf("commit_index[aaa]=%v; want only bv-10 (bv-9 rejected, bv-10 untouched)", beadsForAAA)
+	}
+	if ten := report.Histories["bv-10"]; len(ten.Commits) != 1 || ten.Commits[0].Confidence != 0.9 {
+		t.Fatalf("bv-10 must be unaffected by bv-9 feedback: %+v", ten.Commits)
+	}
+	if fa := report.Stats.FeedbackApplied; fa == nil || fa.Confirmed != 1 || fa.Rejected != 1 || fa.Ignored != 0 {
+		t.Fatalf("stats.feedback_applied=%+v; want confirmed=1 rejected=1 ignored=0", fa)
+	}
+
+	// The artifact (what the disk/HEAD caches hold) is untouched, so feedback
+	// never needs a cache invalidation of the git walk.
+	if len(art.Commits) != 4 || art.Commits[0].Confidence != 0.9 || art.Commits[1].Confidence != 0.5 {
+		t.Fatalf("assembleReport mutated the artifact: %+v", art.Commits)
+	}
+
+	// Without a store nothing is applied and the payload says so (nil).
+	plain := (&Correlator{}).assembleReport(beads, CorrelatorOptions{}, art)
+	if plain.Stats.FeedbackApplied != nil {
+		t.Fatalf("no store attached: feedback_applied should be nil, got %+v", plain.Stats.FeedbackApplied)
+	}
+	if len(plain.Histories["bv-9"].Commits) != 3 {
+		t.Fatalf("no store attached: bv-9 should keep all 3 commits, got %d", len(plain.Histories["bv-9"].Commits))
+	}
+}
+
+// multiStrategyRepo builds a git fixture where one code commit is found by
+// two strategies at once (it changes the beads file AND names the bead in
+// its subject), another is explicit-only, and a third is temporal-only
+// (same author, inside the bead's active window, no bead reference).
+func multiStrategyRepo(t *testing.T) (repo, jsonl string, shas map[string]string) {
+	t.Helper()
+	repo = t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	runGit(t, repo, "init")
+	runGit(t, repo, "config", "user.email", "dev@example.com")
+	runGit(t, repo, "config", "user.name", "Dev")
+	jsonl = filepath.Join(beadsDir, "issues.jsonl")
+	writeBead := func(status, assignee string) {
+		t.Helper()
+		line := `{"id":"bv-1","title":"One","status":"` + status + `","priority":1,"issue_type":"task","assignee":"` + assignee + `"}` + "\n"
+		if err := os.WriteFile(jsonl, []byte(line), 0o644); err != nil {
+			t.Fatalf("write issues.jsonl: %v", err)
+		}
+	}
+	writeCode := func(name string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(repo, name), []byte("package x\n// "+name+"\n"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	head := func() string {
+		t.Helper()
+		cmd := exec.Command("git", "rev-parse", "HEAD")
+		cmd.Dir = repo
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("rev-parse: %v", err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	shas = map[string]string{}
+
+	writeBead("open", "")
+	runGit(t, repo, "add", ".beads/issues.jsonl")
+	runGit(t, repo, "commit", "-m", "seed tracker")
+
+	writeBead("in_progress", "dev@example.com") // claim
+	writeCode("a.go")
+	runGit(t, repo, "add", ".beads/issues.jsonl", "a.go")
+	runGit(t, repo, "commit", "-m", "feat(bv-1): start work") // co-commit + explicit
+	shas["both"] = head()
+
+	writeCode("b.go")
+	runGit(t, repo, "add", "b.go")
+	runGit(t, repo, "commit", "-m", "wip: same author, no reference") // temporal only
+	shas["temporal"] = head()
+
+	writeCode("c.go")
+	runGit(t, repo, "add", "c.go")
+	runGit(t, repo, "commit", "-m", "fix bv-1 follow-up") // explicit only (temporal may also match)
+	shas["explicit"] = head()
+
+	writeBead("closed", "dev@example.com")
+	runGit(t, repo, "add", ".beads/issues.jsonl")
+	runGit(t, repo, "commit", "-m", "chore: close bv-1")
+	return repo, jsonl, shas
+}
+
+func reportFor(t *testing.T, repo, jsonl string) *HistoryReport {
+	t.Helper()
+	report, err := NewCorrelator(repo, jsonl).GenerateReport([]BeadInfo{{ID: "bv-1", Title: "One", Status: "closed"}}, CorrelatorOptions{Limit: 100})
+	if err != nil {
+		t.Fatalf("GenerateReport: %v", err)
+	}
+	return report
+}
+
+// TestCorrelator_MergeTwoStrategiesOneCommit (D5): a commit matched by two
+// strategies appears once, lists both methods, keeps the stronger one as the
+// primary, and its combined confidence sits between the strongest single
+// score and 1.0.
+func TestCorrelator_MergeTwoStrategiesOneCommit(t *testing.T) {
+	repo, jsonl, shas := multiStrategyRepo(t)
+	report := reportFor(t, repo, jsonl)
+	history := report.Histories["bv-1"]
+	t.Logf("repo=%s shas=%v methods=%v", repo, shas, report.Stats.MethodDistribution)
+
+	seen := map[string]int{}
+	var both *CorrelatedCommit
+	for i := range history.Commits {
+		c := &history.Commits[i]
+		seen[c.SHA]++
+		if c.SHA == shas["both"] {
+			both = c
+		}
+	}
+	for sha, n := range seen {
+		if n != 1 {
+			t.Fatalf("commit %s listed %d times; strategies must merge, not duplicate", sha[:7], n)
+		}
+	}
+	if both == nil {
+		t.Fatalf("the co-commit+explicit commit %s is missing: %+v", shas["both"][:7], history.Commits)
+	}
+	methods := strings.Join(both.Methods, ",")
+	if !strings.Contains(methods, "co_committed") || !strings.Contains(methods, "explicit_id") {
+		t.Fatalf("merged commit should list both strategies, got methods=%v", both.Methods)
+	}
+	if both.Confidence > 1.0 || both.Confidence < 0.85 {
+		t.Fatalf("combined confidence %.2f must stay within [strongest single, 1.0]", both.Confidence)
+	}
+	if both.Method != MethodCoCommitted && both.Method != MethodExplicitID {
+		t.Fatalf("primary method should be one of the matched strategies, got %s", both.Method)
+	}
+	if _, ok := seen[shas["temporal"]]; !ok {
+		t.Fatalf("temporal-only commit %s (same author, in window) missing: %+v", shas["temporal"][:7], history.Commits)
+	}
+	if _, ok := seen[shas["explicit"]]; !ok {
+		t.Fatalf("explicit-only commit %s missing", shas["explicit"][:7])
+	}
+	dist := report.Stats.MethodDistribution
+	if dist["co_committed"] == 0 || dist["explicit_id"] == 0 || dist["temporal_author"] == 0 {
+		t.Fatalf("every strategy should contribute on this fixture: %v", dist)
+	}
+	if len(report.Stats.Strategies) != 3 {
+		t.Fatalf("stats.strategies should record the three runs, got %+v", report.Stats.Strategies)
+	}
+}
+
+// TestCorrelator_ReportIsDeterministic (D5): three runs over the same fixture
+// produce byte-identical JSON once the wall-clock fields (generated_at and
+// per-strategy durations) are blanked.
+func TestCorrelator_ReportIsDeterministic(t *testing.T) {
+	repo, jsonl, _ := multiStrategyRepo(t)
+	normalize := func(r *HistoryReport) []byte {
+		t.Helper()
+		r.GeneratedAt = time.Time{}
+		for i := range r.Stats.Strategies {
+			r.Stats.Strategies[i].DurationMS = 0
+		}
+		b, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return b
+	}
+	first := normalize(reportFor(t, repo, jsonl))
+	for run := 2; run <= 3; run++ {
+		if got := normalize(reportFor(t, repo, jsonl)); string(got) != string(first) {
+			t.Fatalf("run %d differs from run 1:\n%s\n---\n%s", run, first, got)
+		}
+	}
+}
+
+// TestCorrelator_CancelledContextReturnsFast (D5): a cancelled context stops
+// report generation promptly with the context error and leaves no goroutines
+// behind.
+func TestCorrelator_CancelledContextReturnsFast(t *testing.T) {
+	repo, jsonl, _ := multiStrategyRepo(t)
+	settle := func() int {
+		n := runtime.NumGoroutine()
+		for i := 0; i < 20; i++ {
+			time.Sleep(10 * time.Millisecond)
+			if m := runtime.NumGoroutine(); m <= n {
+				n = m
+			}
+		}
+		return n
+	}
+	before := settle()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	_, err := NewCorrelator(repo, jsonl).WithContext(ctx).GenerateReport([]BeadInfo{{ID: "bv-1", Title: "One", Status: "closed"}}, CorrelatorOptions{Limit: 100})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("cancelled context should fail report generation")
+	}
+	if !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("error should carry the context cancellation, got %v", err)
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("cancelled report took %s; want under 200ms", elapsed)
+	}
+	if after := settle(); after > before {
+		t.Fatalf("goroutines leaked after cancellation: before=%d after=%d", before, after)
 	}
 }

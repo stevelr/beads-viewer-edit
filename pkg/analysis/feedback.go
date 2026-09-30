@@ -303,6 +303,27 @@ func (f *FeedbackData) getAdjustedWeightsLocked() map[string]float64 {
 	return weights
 }
 
+// MinFeedbackSamples is the number of accept/ignore events required before the
+// adjusted weights are applied to scoring. Below it the adjustments are still
+// tracked and reported, but scoring uses the defaults so one stray click cannot
+// reorder a project's triage.
+const MinFeedbackSamples = 3
+
+// Applies reports whether enough feedback exists for the adjusted weights to
+// be used in scoring.
+func (f *FeedbackData) Applies() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return len(f.Events) >= MinFeedbackSamples
+}
+
+// Weights returns the effective (adjusted, normalized) factor weights as the
+// struct an Analyzer accepts via SetWeights. It does not check Applies; callers
+// decide whether the sample size justifies using them.
+func (f *FeedbackData) Weights() Weights {
+	return WeightsFromMap(f.GetEffectiveWeights()).Normalized()
+}
+
 // GetEffectiveWeights returns the original weights multiplied by adjustments
 func (f *FeedbackData) GetEffectiveWeights() map[string]float64 {
 	f.mu.RLock()
@@ -378,7 +399,11 @@ func (f *FeedbackData) Summary() string {
 
 // FeedbackJSON returns the feedback data formatted for robot output
 type FeedbackJSON struct {
-	Enabled           bool               `json:"enabled"`
+	Enabled bool `json:"enabled"`
+	// Applied is true when TotalEvents >= MinFeedbackSamples, i.e. the
+	// effective weights below were actually used to score this output.
+	Applied           bool               `json:"applied"`
+	MinSamples        int                `json:"min_samples"`
 	TotalEvents       int                `json:"total_events"`
 	AcceptedCount     int                `json:"accepted_count"`
 	IgnoredCount      int                `json:"ignored_count"`
@@ -396,6 +421,8 @@ func (f *FeedbackData) ToJSON() FeedbackJSON {
 
 	return FeedbackJSON{
 		Enabled:           len(f.Events) > 0,
+		Applied:           len(f.Events) >= MinFeedbackSamples,
+		MinSamples:        MinFeedbackSamples,
 		TotalEvents:       len(f.Events),
 		AcceptedCount:     f.Stats.TotalAccepted,
 		IgnoredCount:      f.Stats.TotalIgnored,

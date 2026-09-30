@@ -1,3 +1,6 @@
+> **Status (2026-09-02): partially implemented design**
+> Only the hash (FNV-1a keyword feature) embedder exists; the Python sentence-transformers and OpenAI providers described here are reserved names that fail with "not implemented" (decision recorded in tracker item I3). README "Semantic Search" describes what ships.
+
 # Semantic Search — Embedding Approach (bv-9gf.1)
 
 This document records the embedding-generation decision for `bv-9gf` (Semantic Vector Search).

@@ -1009,6 +1009,37 @@ func TestBuildCoChangeMatrix(t *testing.T) {
 	}
 }
 
+func TestBuildCoChangeMatrixSamplesUseFullSHA(t *testing.T) {
+	shaA := "abcdefg" + strings.Repeat("1", 33)
+	shaB := "abcdefg" + strings.Repeat("2", 33)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-1": {
+			BeadID: "bv-1",
+			Commits: []CorrelatedCommit{
+				{SHA: shaA, ShortSHA: shaA[:7], Files: []FileChange{{Path: "source.go"}, {Path: "related.go"}}},
+				{SHA: shaB, ShortSHA: shaB[:7], Files: []FileChange{{Path: "source.go"}, {Path: "related.go"}}},
+			},
+		},
+	}}
+
+	matrix := BuildCoChangeMatrix(report)
+	if len(matrix.CommitFiles) != 2 {
+		t.Fatalf("CommitFiles has %d entries, want 2 distinct full SHAs: %#v", len(matrix.CommitFiles), matrix.CommitFiles)
+	}
+	if _, exists := matrix.CommitFiles[shaA[:7]]; exists {
+		t.Fatalf("CommitFiles retained colliding short-SHA key %q", shaA[:7])
+	}
+
+	result := matrix.GetRelatedFiles("source.go", 0.5, 10)
+	if len(result.RelatedFiles) != 1 {
+		t.Fatalf("related files = %#v, want one entry", result.RelatedFiles)
+	}
+	got := result.RelatedFiles[0].SampleCommits
+	if len(got) != 2 || got[0] != shaA || got[1] != shaB {
+		t.Fatalf("sample commits = %#v, want sorted full SHAs [%q %q]", got, shaA, shaB)
+	}
+}
+
 func TestCoChangeMatrixNil(t *testing.T) {
 	matrix := BuildCoChangeMatrix(nil)
 

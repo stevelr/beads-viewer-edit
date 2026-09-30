@@ -6,6 +6,7 @@ import (
 	"unicode"
 
 	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -31,7 +32,6 @@ func NewLabelPickerModel(labels []string, counts map[string]int, theme Theme) La
 	ti.Placeholder = "type to filter..."
 	ti.CharLimit = 50
 	ti.Width = 30
-	ti.Focus()
 
 	return LabelPickerModel{
 		allLabels:     sorted,
@@ -41,6 +41,16 @@ func NewLabelPickerModel(labels []string, counts map[string]int, theme Theme) La
 		selectedIndex: 0,
 		theme:         theme,
 	}
+}
+
+// Focus activates the picker input and returns its initial cursor command.
+func (m *LabelPickerModel) Focus() tea.Cmd {
+	return m.input.Focus()
+}
+
+// Blur deactivates the picker input.
+func (m *LabelPickerModel) Blur() {
+	m.input.Blur()
 }
 
 // sortLabelsByCountDesc sorts labels by count descending, then alphabetically for ties
@@ -93,10 +103,13 @@ func (m *LabelPickerModel) SelectedLabel() string {
 	return m.filtered[m.selectedIndex]
 }
 
-// UpdateInput processes a key message for the text input
-func (m *LabelPickerModel) UpdateInput(msg interface{}) {
-	m.input, _ = m.input.Update(msg)
+// UpdateInput processes a key message for the text input and returns any
+// follow-up command (for example, an asynchronous clipboard paste).
+func (m *LabelPickerModel) UpdateInput(msg tea.Msg) tea.Cmd {
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
 	m.filterLabels()
+	return cmd
 }
 
 // Reset clears the input and resets selection

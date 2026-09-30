@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // createCorrelationRepo seeds a git repo with multiple beads and commits that
@@ -309,12 +310,19 @@ func TestCorrelationRobotOrphans(t *testing.T) {
 	}
 
 	var payload struct {
+		Window struct {
+			Commits int    `json:"commits"`
+			Limit   int    `json:"limit"`
+			Source  string `json:"source"`
+		} `json:"window"`
 		Stats struct {
-			TotalCommits    int     `json:"total_commits"`
-			CorrelatedCount int     `json:"correlated_count"`
-			OrphanCount     int     `json:"orphan_count"`
-			OrphanRatio     float64 `json:"orphan_ratio"`
+			TotalCommits     int     `json:"total_commits"`
+			CorrelatedCount  int     `json:"correlated_count"`
+			OrphanCount      int     `json:"orphan_count"`
+			BeadsOnlyCommits int     `json:"beads_only_commits"`
+			OrphanRatio      float64 `json:"orphan_ratio"`
 		} `json:"stats"`
+		UsageHints []string `json:"usage_hints"`
 		Candidates []struct {
 			SHA           string `json:"sha"`
 			Message       string `json:"message"`
@@ -333,6 +341,21 @@ func TestCorrelationRobotOrphans(t *testing.T) {
 	// Should have some commits
 	if payload.Stats.TotalCommits == 0 {
 		t.Error("expected total_commits > 0")
+	}
+
+	// D4: the scan window is the correlation index's window and the payload
+	// accounts for every commit in it.
+	if payload.Window.Source != "history_index" || payload.Window.Commits == 0 {
+		t.Errorf("window=%+v; want source=history_index with commits > 0", payload.Window)
+	}
+	if got := payload.Stats.TotalCommits + payload.Stats.BeadsOnlyCommits; got != payload.Window.Commits {
+		t.Errorf("total_commits+beads_only_commits=%d; want window.commits=%d", got, payload.Window.Commits)
+	}
+	if payload.Stats.BeadsOnlyCommits == 0 {
+		t.Errorf("fixture's final beads-only commit should be counted in beads_only_commits: %+v", payload.Stats)
+	}
+	if len(payload.UsageHints) == 0 {
+		t.Error("expected usage_hints explaining the window and scores")
 	}
 
 	// Should have some correlated commits (from explicit mentions)
@@ -659,5 +682,124 @@ func TestCorrelationManyBeads(t *testing.T) {
 
 	if payload.Stats.TotalBeads != 50 {
 		t.Errorf("expected 50 total_beads, got %d", payload.Stats.TotalBeads)
+	}
+}
+
+// TestCorrelationOnThisRepository_StrategyCounts (D5) runs the real
+// correlator over a frozen slice of this repository's real history: every strategy must
+// contribute, the orphan scan must report its window, and explaining an
+// explicit-id commit must list the explicit_id signal. Runtime is bounded so
+// a regression that makes the multi-strategy walk slow shows up here.
+func TestCorrelationOnThisRepository_StrategyCounts(t *testing.T) {
+	repo, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".beads", "issues.jsonl")); err != nil {
+		t.Skip("repository tracker not present")
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".git")); err != nil {
+		t.Skip("not a git checkout")
+	}
+	bv := buildBvBinary(t)
+	// The default window walks 500 commits. Advancing HEAD must not age known
+	// explicit-ID matches out of this fixture and silently change its oracle.
+	// Build the current CLI above, then run it over the original passing input.
+	// historyRef must be reachable from origin/main (a local, later-rewritten
+	// commit turns this test into a checkout failure on every other clone); it
+	// is a commit whose `git log --no-merges -n500` window ends at boundarySHA.
+	const historyRef = "347134f1f5e2b63183a90934deda5c88fe9e41c3"
+	const boundarySHA = "be8adac10bd28922249fec8e7eb1d2f4371d1b80"
+	const boundaryBead = "bv-142"
+	fixture := t.TempDir()
+	clone := exec.Command("git", "clone", "--quiet", "--shared", "--no-checkout", repo, fixture)
+	if out, err := clone.CombinedOutput(); err != nil {
+		t.Fatalf("clone real correlation fixture: %v\n%s", err, out)
+	}
+	checkout := exec.Command("git", "-C", fixture, "checkout", "--quiet", "--detach", historyRef)
+	if out, err := checkout.CombinedOutput(); err != nil {
+		t.Fatalf("check out required correlation history %s (full Git history required): %v\n%s", historyRef, err, out)
+	}
+	run := func(args ...string) []byte {
+		t.Helper()
+		cmd := exec.Command(bv, args...)
+		cmd.Dir = fixture
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("%v failed: %v\n%s", args, err, stderr.String())
+		}
+		return out
+	}
+
+	start := time.Now()
+	var history struct {
+		Stats struct {
+			MethodDistribution map[string]int `json:"method_distribution"`
+			Strategies         []struct {
+				Name       string `json:"name"`
+				Ran        bool   `json:"ran"`
+				Candidates int    `json:"candidates"`
+			} `json:"strategies"`
+		} `json:"stats"`
+		Window *struct {
+			Commits int `json:"commits"`
+		} `json:"window"`
+		Histories map[string]struct {
+			Commits []struct {
+				SHA     string   `json:"sha"`
+				Methods []string `json:"methods"`
+			} `json:"commits"`
+		} `json:"histories"`
+	}
+	if err := json.Unmarshal(run("--robot-history"), &history); err != nil {
+		t.Fatalf("history decode: %v", err)
+	}
+	dist := history.Stats.MethodDistribution
+	t.Logf("method_distribution=%v strategies=%+v window=%+v elapsed=%s", dist, history.Stats.Strategies, history.Window, time.Since(start))
+	if dist["explicit_id"] < 6 || dist["co_committed"] < 500 || dist["temporal_author"] < 1 {
+		t.Fatalf("expected explicit_id>=6, co_committed>=500, temporal_author>=1 on this repository, got %v", dist)
+	}
+	if len(history.Stats.Strategies) != 3 {
+		t.Fatalf("stats.strategies should record three runs: %+v", history.Stats.Strategies)
+	}
+	if history.Window == nil || history.Window.Commits != 500 {
+		t.Fatalf("history should report the frozen 500-commit window, got %+v", history.Window)
+	}
+
+	var orphans struct {
+		Window struct {
+			Source  string `json:"source"`
+			Commits int    `json:"commits"`
+		} `json:"window"`
+	}
+	if err := json.Unmarshal(run("--robot-orphans"), &orphans); err != nil {
+		t.Fatalf("orphans decode: %v", err)
+	}
+	if orphans.Window.Source != "history_index" || orphans.Window.Commits != history.Window.Commits {
+		t.Fatalf("orphan window %+v should be the history index window (%d commits)", orphans.Window, history.Window.Commits)
+	}
+
+	// The oldest commit in the window must still contribute its explicit pair.
+	foundBoundary := false
+	for _, c := range history.Histories[boundaryBead].Commits {
+		if c.SHA == boundarySHA {
+			for _, method := range c.Methods {
+				if method == "explicit_id" {
+					foundBoundary = true
+				}
+			}
+		}
+	}
+	if !foundBoundary {
+		t.Fatalf("500th commit %s must explicitly correlate with %s", boundarySHA, boundaryBead)
+	}
+	explain := run("--robot-explain-correlation", boundarySHA+":"+boundaryBead)
+	if !strings.Contains(string(explain), "explicit_id") {
+		t.Fatalf("explain for %s:%s should list the explicit_id signal:\n%s", boundarySHA[:7], boundaryBead, explain)
+	}
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Fatalf("correlation e2e on this repository took %s; want under 15s", elapsed)
 	}
 }

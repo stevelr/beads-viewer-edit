@@ -83,61 +83,89 @@ type OrphanReport struct {
 	GeneratedAt time.Time           `json:"generated_at"`
 	GitRange    string              `json:"git_range"` // e.g., "last 30 days"
 	DataHash    string              `json:"data_hash"` // Beads content hash
+	Window      OrphanWindow        `json:"window"`    // Commit window scanned (aligned with the correlation index)
 	Stats       OrphanReportStats   `json:"stats"`
 	Candidates  []OrphanCandidate   `json:"candidates"`
 	ByBead      map[string][]string `json:"by_bead,omitempty"` // BeadID -> []commit SHAs
+	UsageHints  []string            `json:"usage_hints"`
+}
+
+// orphanUsageHints documents how the payload is computed so an agent can read
+// suspicion_score and orphan_ratio without consulting the source.
+var orphanUsageHints = []string{
+	"window: the non-merge commits scanned; source=history_index means the same bounded walk the correlation index (co_committed, explicit_id, temporal_author) covered, so an orphan is a code commit in that window no strategy linked",
+	"stats.total_commits counts window commits that changed something outside .beads/; stats.beads_only_commits are the bookkeeping commits (e.g. `br sync`) skipped as neither orphans nor correlated, so window.commits = total_commits + beads_only_commits",
+	"a high orphan_ratio usually means code and tracker updates land in separate commits; only explicit bead ids in messages, temporal author overlap, or confirm feedback can link those code commits",
+	"suspicion_score (0-100, capped) sums signal weights: timing=30 per bead whose claimed→closed window contains the commit, files=25 per (file, bead) pair where a linked bead touched the same path, message<=35 for bead-like patterns in the subject, author=15 per bead the same author worked on within +/-7 days",
+	"probable_beads.confidence adds 35 when the message names the bead id; the top 3 beads are kept; candidates below --orphans-min-score are dropped",
+	"link a candidate with --robot-confirm-correlation SHA:BEAD (or exclude a false link with --robot-reject-correlation); both shape later history reports",
 }
 
 // OrphanReportStats provides aggregate statistics.
 type OrphanReportStats struct {
-	TotalCommits    int     `json:"total_commits"`
-	CorrelatedCount int     `json:"correlated_count"`
-	OrphanCount     int     `json:"orphan_count"`
-	CandidateCount  int     `json:"candidate_count"` // Orphans with probable beads
-	OrphanRatio     float64 `json:"orphan_ratio"`
-	AvgSuspicion    float64 `json:"avg_suspicion_score"`
+	TotalCommits     int     `json:"total_commits"`
+	CorrelatedCount  int     `json:"correlated_count"`
+	OrphanCount      int     `json:"orphan_count"`
+	BeadsOnlyCommits int     `json:"beads_only_commits"` // Window commits skipped because they changed nothing outside .beads/
+	CandidateCount   int     `json:"candidate_count"`    // Orphans with probable beads
+	OrphanRatio      float64 `json:"orphan_ratio"`
+	AvgSuspicion     float64 `json:"avg_suspicion_score"`
 }
 
 // OrphanDetector finds commits that probably should be linked to beads.
 type OrphanDetector struct {
 	repoPath    string
+	dataHash    string
 	lookup      *ReverseLookup
 	fileLookup  *FileLookup
 	beadWindows map[string]TemporalWindow // BeadID -> active time window
 	authorBeads map[string][]string       // Author email -> BeadIDs they worked on
+	now         time.Time
+	window      *HistoryWindow // The correlation index's commit window, when the report carries one
 }
 
 // NewOrphanDetector creates a detector from a history report.
 func NewOrphanDetector(report *HistoryReport, repoPath string) *OrphanDetector {
-	return newOrphanDetector(report, repoPath)
+	return NewOrphanDetectorAt(report, repoPath, time.Now())
+}
+
+// NewOrphanDetectorAt creates a detector with a caller-owned reference instant
+// for open activity windows and serialized report metadata. The zero instant is
+// valid and is preserved (SOURCE_DATE_EPOCH can legitimately map to it).
+func NewOrphanDetectorAt(report *HistoryReport, repoPath string, now time.Time) *OrphanDetector {
+	return newOrphanDetector(report, repoPath, now)
 }
 
 // NewSmartOrphanDetector is an alias for NewOrphanDetector for compatibility.
 func NewSmartOrphanDetector(report *HistoryReport, repoPath string) *OrphanDetector {
-	return newOrphanDetector(report, repoPath)
+	return NewOrphanDetector(report, repoPath)
 }
 
 // newOrphanDetector is the internal constructor.
-func newOrphanDetector(report *HistoryReport, repoPath string) *OrphanDetector {
+func newOrphanDetector(report *HistoryReport, repoPath string, now time.Time) *OrphanDetector {
 	od := &OrphanDetector{
 		repoPath:    repoPath,
+		dataHash:    report.DataHash,
 		lookup:      NewReverseLookupWithRepo(report, repoPath),
 		fileLookup:  NewFileLookup(report),
 		beadWindows: make(map[string]TemporalWindow),
 		authorBeads: make(map[string][]string),
+		now:         now,
+		window:      report.Window,
 	}
 
 	// Build temporal windows for each bead
 	for beadID, history := range report.Histories {
 		if history.Milestones.Claimed != nil {
-			end := time.Now()
-			if history.Milestones.Closed != nil {
-				end = history.Milestones.Closed.Timestamp
+			start := history.Milestones.Claimed.Timestamp
+			end := orphanActivityWindowEnd(history, now)
+			if !isClosedHistoryStatus(history.Status) && history.Milestones.Reopened != nil && history.Milestones.Reopened.Timestamp.After(start) {
+				start = history.Milestones.Reopened.Timestamp
 			}
 			od.beadWindows[beadID] = TemporalWindow{
 				BeadID: beadID,
 				Title:  history.Title,
-				Start:  history.Milestones.Claimed.Timestamp,
+				Start:  start,
 				End:    end,
 			}
 		}
@@ -152,23 +180,53 @@ func newOrphanDetector(report *HistoryReport, repoPath string) *OrphanDetector {
 			}
 		}
 	}
+	for author := range od.authorBeads {
+		sort.Strings(od.authorBeads[author])
+	}
 
 	return od
 }
 
-// DetectOrphans finds orphan commits with smart detection.
+func isClosedHistoryStatus(status string) bool {
+	normalized := normalizeStatus(status)
+	return normalized == "closed" || normalized == "tombstone"
+}
+
+func orphanActivityWindowEnd(history BeadHistory, now time.Time) time.Time {
+	if isClosedHistoryStatus(history.Status) && history.Milestones.Closed != nil {
+		return history.Milestones.Closed.Timestamp
+	}
+	return now
+}
+
+// DetectOrphans finds orphan commits with smart detection. When the history
+// report the detector was built from records the window its correlation index
+// covers, that window is scanned (and reported with source "history_index")
+// regardless of opts: an orphan is meaningful only relative to the commits the
+// index actually had a chance to correlate. opts is used as-is only for
+// reports assembled without a walk.
 func (od *OrphanDetector) DetectOrphans(opts ExtractOptions) (*OrphanReport, error) {
+	source := "options"
+	if od.window != nil {
+		opts = ExtractOptions{Revision: od.window.Revision, Limit: od.window.Limit, Since: od.window.Since, Until: od.window.Until}
+		source = "history_index"
+	}
+
 	// Get basic orphans first
 	orphans, stats, err := od.lookup.FindOrphanCommits(opts)
 	if err != nil {
 		return nil, fmt.Errorf("finding orphan commits: %w", err)
 	}
+	stats.Window.Source = source
 
 	report := &OrphanReport{
-		GeneratedAt: time.Now(),
+		GeneratedAt: od.now,
 		GitRange:    formatGitRange(opts),
+		DataHash:    od.dataHash,
+		Window:      stats.Window,
 		Candidates:  make([]OrphanCandidate, 0, len(orphans)),
 		ByBead:      make(map[string][]string),
+		UsageHints:  append([]string(nil), orphanUsageHints...),
 	}
 
 	// Analyze each orphan
@@ -176,7 +234,10 @@ func (od *OrphanDetector) DetectOrphans(opts ExtractOptions) (*OrphanReport, err
 	candidateCount := 0
 
 	for _, orphan := range orphans {
-		candidate := od.analyzeOrphan(orphan)
+		candidate, err := od.analyzeOrphan(orphan)
+		if err != nil {
+			return nil, fmt.Errorf("analyzing orphan commit %s: %w", orphan.SHA, err)
+		}
 
 		if candidate.SuspicionScore > 0 {
 			report.Candidates = append(report.Candidates, candidate)
@@ -185,7 +246,7 @@ func (od *OrphanDetector) DetectOrphans(opts ExtractOptions) (*OrphanReport, err
 				candidateCount++
 				// Index by probable bead
 				for _, pb := range candidate.ProbableBeads {
-					report.ByBead[pb.BeadID] = append(report.ByBead[pb.BeadID], candidate.ShortSHA)
+					report.ByBead[pb.BeadID] = append(report.ByBead[pb.BeadID], candidate.SHA)
 				}
 			}
 		}
@@ -193,16 +254,20 @@ func (od *OrphanDetector) DetectOrphans(opts ExtractOptions) (*OrphanReport, err
 
 	// Sort by suspicion score (highest first)
 	sort.Slice(report.Candidates, func(i, j int) bool {
-		return report.Candidates[i].SuspicionScore > report.Candidates[j].SuspicionScore
+		if report.Candidates[i].SuspicionScore != report.Candidates[j].SuspicionScore {
+			return report.Candidates[i].SuspicionScore > report.Candidates[j].SuspicionScore
+		}
+		return report.Candidates[i].SHA < report.Candidates[j].SHA
 	})
 
 	// Calculate stats
 	report.Stats = OrphanReportStats{
-		TotalCommits:    stats.TotalCommits,
-		CorrelatedCount: stats.CorrelatedCmts,
-		OrphanCount:     stats.OrphanCommits,
-		CandidateCount:  candidateCount,
-		OrphanRatio:     stats.OrphanRatio,
+		TotalCommits:     stats.TotalCommits,
+		CorrelatedCount:  stats.CorrelatedCmts,
+		OrphanCount:      stats.OrphanCommits,
+		BeadsOnlyCommits: stats.BeadsOnlyCommits,
+		CandidateCount:   candidateCount,
+		OrphanRatio:      stats.OrphanRatio,
 	}
 	if len(report.Candidates) > 0 {
 		report.Stats.AvgSuspicion = float64(totalSuspicion) / float64(len(report.Candidates))
@@ -212,7 +277,7 @@ func (od *OrphanDetector) DetectOrphans(opts ExtractOptions) (*OrphanReport, err
 }
 
 // analyzeOrphan applies heuristics to an orphan commit.
-func (od *OrphanDetector) analyzeOrphan(orphan OrphanCommit) OrphanCandidate {
+func (od *OrphanDetector) analyzeOrphan(orphan OrphanCommit) (OrphanCandidate, error) {
 	candidate := OrphanCandidate{
 		SHA:           orphan.SHA,
 		ShortSHA:      orphan.ShortSHA,
@@ -224,9 +289,16 @@ func (od *OrphanDetector) analyzeOrphan(orphan OrphanCommit) OrphanCandidate {
 		ProbableBeads: make([]ProbableBead, 0),
 	}
 
-	// Get files changed in this commit
-	if od.repoPath != "" {
-		candidate.Files = od.getCommitFiles(orphan.SHA)
+	// Files changed in this commit: FindOrphanCommits already carries them from
+	// the walk (no per-commit git show); an orphan built without them falls
+	// back to asking git.
+	candidate.Files = orphan.Files
+	if candidate.Files == nil && od.repoPath != "" {
+		files, err := od.getCommitFiles(orphan.SHA)
+		if err != nil {
+			return OrphanCandidate{}, err
+		}
+		candidate.Files = files
 	}
 
 	// Track probable beads with scores
@@ -259,7 +331,22 @@ func (od *OrphanDetector) analyzeOrphan(orphan OrphanCommit) OrphanCandidate {
 
 	// Sort probable beads by confidence
 	sort.Slice(candidate.ProbableBeads, func(i, j int) bool {
-		return candidate.ProbableBeads[i].Confidence > candidate.ProbableBeads[j].Confidence
+		if candidate.ProbableBeads[i].Confidence != candidate.ProbableBeads[j].Confidence {
+			return candidate.ProbableBeads[i].Confidence > candidate.ProbableBeads[j].Confidence
+		}
+		return candidate.ProbableBeads[i].BeadID < candidate.ProbableBeads[j].BeadID
+	})
+	for i := range candidate.ProbableBeads {
+		sort.Strings(candidate.ProbableBeads[i].Reasons)
+	}
+	sort.Slice(candidate.Signals, func(i, j int) bool {
+		if candidate.Signals[i].Signal != candidate.Signals[j].Signal {
+			return candidate.Signals[i].Signal < candidate.Signals[j].Signal
+		}
+		if candidate.Signals[i].Details != candidate.Signals[j].Details {
+			return candidate.Signals[i].Details < candidate.Signals[j].Details
+		}
+		return candidate.Signals[i].Weight < candidate.Signals[j].Weight
 	})
 
 	// Limit to top 3 probable beads
@@ -273,7 +360,7 @@ func (od *OrphanDetector) analyzeOrphan(orphan OrphanCommit) OrphanCandidate {
 	}
 	candidate.SuspicionScore = minInt(candidate.SuspicionScore, 100)
 
-	return candidate
+	return candidate, nil
 }
 
 // probableBeadBuilder accumulates evidence for a probable bead match.
@@ -405,22 +492,21 @@ func (od *OrphanDetector) checkMessage(candidate *OrphanCandidate, beadScores ma
 }
 
 // scoreMentionedBead credits a bead whose ID appears in a commit message.
-// Lookup is case-insensitive; unknown IDs are ignored.
+// Lookup is case-insensitive; unknown IDs and ambiguous case-colliding IDs are
+// ignored. Even an exact-case key is rejected when another key is EqualFold:
+// callers such as checkMessage intentionally perform case-insensitive matching.
 func (od *OrphanDetector) scoreMentionedBead(beadScores map[string]*probableBeadBuilder, beadID string) {
-	history, ok := od.lookup.beads[beadID]
-	if !ok {
-		for id, h := range od.lookup.beads {
-			if strings.EqualFold(id, beadID) {
-				beadID = id
-				history = h
-				ok = true
-				break
-			}
+	matches := make([]string, 0, 1)
+	for id := range od.lookup.beads {
+		if strings.EqualFold(id, beadID) {
+			matches = append(matches, id)
 		}
 	}
-	if !ok {
+	if len(matches) != 1 {
 		return
 	}
+	beadID = matches[0]
+	history := od.lookup.beads[beadID]
 	if _, exists := beadScores[beadID]; !exists {
 		beadScores[beadID] = &probableBeadBuilder{
 			title:  history.Title,
@@ -482,27 +568,30 @@ func (od *OrphanDetector) checkAuthor(candidate *OrphanCandidate, beadScores map
 }
 
 // getCommitFiles returns files changed in a commit.
-func (od *OrphanDetector) getCommitFiles(sha string) []string {
+func (od *OrphanDetector) getCommitFiles(sha string) ([]string, error) {
 	cocommit := &CoCommitExtractor{repoPath: od.repoPath}
 	fileChanges, err := cocommit.getFilesChanged(sha)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("get files changed: %w", err)
 	}
 
 	var result []string
 	for _, fc := range fileChanges {
 		result = append(result, fc.Path)
 	}
-	return result
+	return result, nil
 }
 
 // formatGitRange formats the extraction options as a human-readable string.
 func formatGitRange(opts ExtractOptions) string {
-	if opts.Since == nil && opts.Until == nil && opts.Limit == 0 {
+	if opts.Revision == "" && opts.Since == nil && opts.Until == nil && opts.Limit == 0 {
 		return "all history"
 	}
 
 	parts := []string{}
+	if opts.Revision != "" {
+		parts = append(parts, "at "+opts.Revision)
+	}
 	if opts.Since != nil {
 		parts = append(parts, fmt.Sprintf("since %s", opts.Since.Format("2006-01-02")))
 	}

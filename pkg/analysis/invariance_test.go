@@ -73,9 +73,9 @@ func TestUnblocksInvariance_MixedStatuses(t *testing.T) {
 	an := NewAnalyzer(issues)
 	unblocks := an.ComputeUnblocks("blocker")
 
-	// Closed issues should NOT appear in unblocks (they're already done)
-	// All non-closed dependents should become actionable
-	expected := []string{"blocked1", "in_progress1", "open1"}
+	// Dependency completion can release open/ongoing work, but cannot change
+	// an explicitly parked blocked status or reopen completed work.
+	expected := []string{"in_progress1", "open1"}
 	if !stringSlicesEqual(unblocks, expected) {
 		t.Errorf("expected blocker to unblock %v, got %v", expected, unblocks)
 	}
@@ -109,7 +109,7 @@ func TestUnblocksInvariance_BlockingVsNonBlocking(t *testing.T) {
 }
 
 // TestUnblocksInvariance_MissingDependencyIDs tests that missing blocker IDs
-// are handled gracefully (don't block).
+// withhold readiness because the dependency cannot be proven satisfied.
 func TestUnblocksInvariance_MissingDependencyIDs(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "has_missing_dep", Status: model.StatusOpen, Dependencies: []*model.Dependency{
@@ -123,7 +123,7 @@ func TestUnblocksInvariance_MissingDependencyIDs(t *testing.T) {
 
 	an := NewAnalyzer(issues)
 
-	// has_missing_dep is actionable (missing blocker doesn't block)
+	// has_missing_dep remains unavailable until the missing record is known.
 	actionable := an.GetActionableIssues()
 	actionableIDs := make([]string, len(actionable))
 	for i, iss := range actionable {
@@ -131,8 +131,7 @@ func TestUnblocksInvariance_MissingDependencyIDs(t *testing.T) {
 	}
 	sort.Strings(actionableIDs)
 
-	// blocker and has_missing_dep should be actionable
-	expected := []string{"blocker", "has_missing_dep"}
+	expected := []string{"blocker"}
 	if !stringSlicesEqual(actionableIDs, expected) {
 		t.Errorf("expected actionable %v, got %v", expected, actionableIDs)
 	}
@@ -379,6 +378,68 @@ func TestUnblocksInvariance_NonexistentID(t *testing.T) {
 	unblocks := an.ComputeUnblocks("nonexistent")
 	if unblocks != nil && len(unblocks) != 0 {
 		t.Errorf("nonexistent: expected nil or empty, got %v", unblocks)
+	}
+}
+
+func TestUnblocksInvariance_AlreadyClosedBlockerChangesNothing(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "done", Status: model.StatusClosed},
+		{ID: "ready", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "done", Type: model.DepBlocks},
+		}},
+	}
+
+	an := NewAnalyzer(issues)
+	if unblocks := an.ComputeUnblocks("done"); len(unblocks) != 0 {
+		t.Fatalf("an already-closed blocker cannot change readiness, got %v", unblocks)
+	}
+}
+
+func TestUnblocksInvariance_SelfDependencyDoesNotUnblockItself(t *testing.T) {
+	issues := []model.Issue{{
+		ID:     "self",
+		Status: model.StatusOpen,
+		Dependencies: []*model.Dependency{
+			{DependsOnID: "self", Type: model.DepBlocks},
+		},
+	}}
+
+	an := NewAnalyzer(issues)
+	if unblocks := an.ComputeUnblocks("self"); len(unblocks) != 0 {
+		t.Fatalf("a completed issue cannot become its own actionable successor, got %v", unblocks)
+	}
+	if count := an.countTransitiveUnblocks("self"); count != 0 {
+		t.Fatalf("a self-cycle cannot create a transitive unblock, got %d", count)
+	}
+}
+
+func TestUnblocksInvariance_DeferredAndParentBlockedRemainUnactionable(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	issues := []model.Issue{
+		{ID: "blocker", Status: model.StatusOpen},
+		{ID: "parent-blocker", Status: model.StatusOpen},
+		{ID: "parent", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "parent-blocker", Type: model.DepBlocks},
+		}},
+		{ID: "deferred", Status: model.StatusOpen, DeferUntil: &future, Dependencies: []*model.Dependency{
+			{DependsOnID: "blocker", Type: model.DepBlocks},
+		}},
+		{ID: "parent-gated", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "blocker", Type: model.DepBlocks},
+			{DependsOnID: "parent", Type: model.DepParentChild},
+		}},
+	}
+
+	an := NewAnalyzer(issues)
+	an.SetNow(now)
+	if unblocks := an.ComputeUnblocks("blocker"); len(unblocks) != 0 {
+		t.Fatalf("deferred and parent-gated successors must remain unactionable, got %v", unblocks)
+	}
+
+	an.SetNow(future)
+	if unblocks := an.ComputeUnblocks("blocker"); !stringSlicesEqual(unblocks, []string{"deferred"}) {
+		t.Fatalf("only elapsed deferral should become actionable, got %v", unblocks)
 	}
 }
 

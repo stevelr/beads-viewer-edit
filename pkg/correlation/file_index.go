@@ -125,11 +125,15 @@ func BuildFileIndex(report *HistoryReport) *FileBeadIndex {
 	for filePath, beadMap := range fileBeadMap {
 		refs := make([]BeadReference, 0, len(beadMap))
 		for _, ref := range beadMap {
+			sort.Strings(ref.CommitSHAs)
 			refs = append(refs, *ref)
 		}
 
 		// Sort by last touch time (most recent first)
 		sort.Slice(refs, func(i, j int) bool {
+			if refs[i].LastTouch.Equal(refs[j].LastTouch) {
+				return refs[i].BeadID < refs[j].BeadID
+			}
 			return refs[i].LastTouch.After(refs[j].LastTouch)
 		})
 
@@ -384,7 +388,7 @@ type CoChangeEntry struct {
 	CoChangeCount int      `json:"co_change_count"` // Number of commits where both files changed
 	TotalCommits  int      `json:"total_commits"`   // Total commits touching the source file
 	Correlation   float64  `json:"correlation"`     // co_change_count / total_commits (0.0 - 1.0)
-	SampleCommits []string `json:"sample_commits"`  // Up to 3 sample commit SHAs
+	SampleCommits []string `json:"sample_commits"`  // Up to 3 sample full commit SHAs
 }
 
 // CoChangeResult is the result of looking up files that co-change with a given file.
@@ -402,7 +406,7 @@ type CoChangeMatrix struct {
 	Matrix map[string]map[string]int `json:"matrix"`
 	// FileCommitCounts maps file -> total commits touching that file
 	FileCommitCounts map[string]int `json:"file_commit_counts"`
-	// CommitFiles maps commit SHA -> files changed in that commit (for sampling)
+	// CommitFiles maps full commit SHA -> files changed in that commit (for sampling)
 	CommitFiles map[string][]string `json:"-"` // Not serialized, internal use
 }
 
@@ -432,15 +436,22 @@ func BuildCoChangeMatrix(report *HistoryReport) *CoChangeMatrix {
 
 			// Normalize all file paths in this commit
 			var files []string
+			seenFiles := make(map[string]struct{}, len(commit.Files))
 			for _, fc := range commit.Files {
 				normalized := normalizePath(fc.Path)
 				if normalized != "" {
+					if _, exists := seenFiles[normalized]; exists {
+						continue
+					}
+					seenFiles[normalized] = struct{}{}
 					files = append(files, normalized)
 				}
 			}
+			sort.Strings(files)
 
-			// Store files for this commit (for sampling later)
-			matrix.CommitFiles[commit.ShortSHA] = files
+			// Store files by immutable full SHA. Seven-character prefixes are not
+			// unique and can otherwise overwrite one another in long histories.
+			matrix.CommitFiles[commit.SHA] = files
 
 			// Update file commit counts
 			for _, file := range files {
@@ -507,12 +518,11 @@ func (m *CoChangeMatrix) GetRelatedFiles(filePath string, threshold float64, lim
 				SampleCommits: []string{},
 			}
 
-			// Find sample commits where both files changed together
-			sampleCount := 0
+			// Find sample commits where both files changed together. Collect then
+			// sort: taking the first three directly from a map made robot output
+			// vary from process to process.
+			var sampleCommits []string
 			for sha, files := range m.CommitFiles {
-				if sampleCount >= 3 {
-					break
-				}
 				hasSource, hasRelated := false, false
 				for _, f := range files {
 					if f == normalizedPath {
@@ -523,10 +533,14 @@ func (m *CoChangeMatrix) GetRelatedFiles(filePath string, threshold float64, lim
 					}
 				}
 				if hasSource && hasRelated {
-					entry.SampleCommits = append(entry.SampleCommits, sha)
-					sampleCount++
+					sampleCommits = append(sampleCommits, sha)
 				}
 			}
+			sort.Strings(sampleCommits)
+			if len(sampleCommits) > 3 {
+				sampleCommits = sampleCommits[:3]
+			}
+			entry.SampleCommits = sampleCommits
 
 			entries = append(entries, entry)
 		}
@@ -534,7 +548,10 @@ func (m *CoChangeMatrix) GetRelatedFiles(filePath string, threshold float64, lim
 
 	// Sort by correlation descending
 	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Correlation > entries[j].Correlation
+		if entries[i].Correlation != entries[j].Correlation {
+			return entries[i].Correlation > entries[j].Correlation
+		}
+		return entries[i].FilePath < entries[j].FilePath
 	})
 
 	// Apply limit
@@ -570,6 +587,12 @@ type AffectedBead struct {
 
 // ImpactAnalysis analyzes what beads might be affected if the given files are modified.
 func (fl *FileLookup) ImpactAnalysis(files []string) *ImpactResult {
+	return fl.ImpactAnalysisAt(files, time.Now())
+}
+
+// ImpactAnalysisAt is ImpactAnalysis evaluated at a caller-owned instant. It
+// keeps recency inclusion and relevance deterministic for robot callers.
+func (fl *FileLookup) ImpactAnalysisAt(files []string, now time.Time) *ImpactResult {
 	result := &ImpactResult{
 		Files:         []string{},
 		AffectedBeads: []AffectedBead{},
@@ -604,7 +627,7 @@ func (fl *FileLookup) ImpactAnalysis(files []string) *ImpactResult {
 
 	result.Files = normalizedFiles
 	beadMap := make(map[string]*AffectedBead)
-	now := time.Now()
+	now = now.UTC()
 
 	for _, filePath := range normalizedFiles {
 		lookup := fl.LookupByFile(filePath)
@@ -662,6 +685,8 @@ func (fl *FileLookup) ImpactAnalysis(files []string) *ImpactResult {
 		recencyScore := 1.0 - (daysSince / 7.0)
 		if recencyScore < 0 {
 			recencyScore = 0
+		} else if recencyScore > 1 {
+			recencyScore = 1
 		}
 		overlapScore := float64(ab.OverlapCount) / float64(len(normalizedFiles))
 		statusMultiplier := 0.5
@@ -679,12 +704,14 @@ func (fl *FileLookup) ImpactAnalysis(files []string) *ImpactResult {
 	}
 
 	sort.Slice(result.AffectedBeads, func(i, j int) bool {
-		statusPriority := map[string]int{"in_progress": 0, "open": 1, "closed": 2}
-		pi, pj := statusPriority[result.AffectedBeads[i].Status], statusPriority[result.AffectedBeads[j].Status]
+		pi, pj := affectedBeadStatusPriority(result.AffectedBeads[i].Status), affectedBeadStatusPriority(result.AffectedBeads[j].Status)
 		if pi != pj {
 			return pi < pj
 		}
-		return result.AffectedBeads[i].Relevance > result.AffectedBeads[j].Relevance
+		if result.AffectedBeads[i].Relevance != result.AffectedBeads[j].Relevance {
+			return result.AffectedBeads[i].Relevance > result.AffectedBeads[j].Relevance
+		}
+		return result.AffectedBeads[i].BeadID < result.AffectedBeads[j].BeadID
 	})
 
 	result.RiskScore = float64(inProgressCount)*0.4 + float64(openCount)*0.2 + float64(recentClosedCount)*0.05
@@ -765,6 +792,17 @@ func classifyBeadStatus(status string) (bucket string, skip bool) {
 	}
 }
 
+func affectedBeadStatusPriority(status string) int {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "in_progress":
+		return 0
+	case "closed":
+		return 2
+	default:
+		return 1
+	}
+}
+
 func sortBeadRefs(refs []BeadReference) {
 	sort.Slice(refs, func(i, j int) bool {
 		if refs[i].LastTouch.Equal(refs[j].LastTouch) {
@@ -801,6 +839,7 @@ func accumulateBeadReference(refs map[string]BeadReference, ref BeadReference) {
 func beadReferencesFromMap(refs map[string]BeadReference) []BeadReference {
 	out := make([]BeadReference, 0, len(refs))
 	for _, ref := range refs {
+		sort.Strings(ref.CommitSHAs)
 		out = append(out, ref)
 	}
 	return out

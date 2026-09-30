@@ -47,7 +47,9 @@ type TutorialModel struct {
 	tocCursor   int           // Cursor position in TOC when focused
 }
 
-// NewTutorialModel creates a new tutorial model with default pages.
+// NewTutorialModel creates a new tutorial model with default pages. Unless
+// BV_NO_SAVED_CONFIG is set it restores the persisted progress (viewed pages
+// for the TOC check marks) and resumes at the page the user last left.
 func NewTutorialModel(theme Theme) TutorialModel {
 	// Calculate initial content width for markdown renderer
 	contentWidth := 80 - 6 // default width minus padding
@@ -55,7 +57,7 @@ func NewTutorialModel(theme Theme) TutorialModel {
 		contentWidth = 40
 	}
 
-	return TutorialModel{
+	m := TutorialModel{
 		pages:            defaultTutorialPages(),
 		currentPage:      0,
 		scrollOffset:     0,
@@ -71,6 +73,11 @@ func NewTutorialModel(theme Theme) TutorialModel {
 		shouldClose:      false,
 		tocCursor:        0,
 	}
+	if !savedConfigDisabled() {
+		m.LoadProgress()
+		m.ResumeLastPage()
+	}
+	return m
 }
 
 // Init initializes the tutorial model.
@@ -298,21 +305,21 @@ func (m TutorialModel) renderHeader(page TutorialPage, totalPages int) string {
 		Bold(true).
 		Foreground(m.theme.Primary)
 
-	// Progress indicator: [2/15] ███░░░
+	// Progress indicator: "Page 3/30 · 10%" followed by a bar. The percentage
+	// is the share of pages viewed (persisted across sessions), not the
+	// position, so it keeps growing as the user explores out of order.
 	pageNum := m.currentPage + 1
+	viewedPercent := m.viewedPercent()
 	progressText := r.NewStyle().
 		Foreground(m.theme.Subtext).
-		Render(fmt.Sprintf("[%d/%d]", pageNum, totalPages))
+		Render(fmt.Sprintf("Page %d/%d · %d%%", pageNum, totalPages, viewedPercent))
 
 	// Visual progress bar
 	barWidth := 10
-	filledWidth := 0
-	if totalPages > 0 {
-		filledWidth = (pageNum * barWidth) / totalPages
-		// Ensure at least 1 filled bar when on any page
-		if filledWidth < 1 && pageNum > 0 {
-			filledWidth = 1
-		}
+	filledWidth := (viewedPercent * barWidth) / 100
+	// Ensure at least 1 filled bar when on any page
+	if filledWidth < 1 && pageNum > 0 {
+		filledWidth = 1
 	}
 	if filledWidth > barWidth {
 		filledWidth = barWidth
@@ -331,6 +338,22 @@ func (m TutorialModel) renderHeader(page TutorialPage, totalPages int) string {
 	headerContent := title + "  " + progressText + " " + progressBar
 
 	return headerContent
+}
+
+// viewedPercent returns the share (0-100) of visible pages the user has
+// viewed, counting the current page.
+func (m TutorialModel) viewedPercent() int {
+	pages := m.visiblePages()
+	if len(pages) == 0 {
+		return 0
+	}
+	viewed := 0
+	for i, page := range pages {
+		if m.progress[page.ID] || i == m.currentPage {
+			viewed++
+		}
+	}
+	return (viewed * 100) / len(pages)
 }
 
 // renderContent renders the page content with native lipgloss components or Glamour markdown.
@@ -611,6 +634,7 @@ func (m *TutorialModel) NextPage() {
 	if m.currentPage < len(pages)-1 {
 		m.currentPage++
 		m.scrollOffset = 0
+		m.markCurrentPageViewed()
 	}
 }
 
@@ -619,6 +643,7 @@ func (m *TutorialModel) PrevPage() {
 	if m.currentPage > 0 {
 		m.currentPage--
 		m.scrollOffset = 0
+		m.markCurrentPageViewed()
 	}
 }
 
@@ -628,6 +653,7 @@ func (m *TutorialModel) JumpToPage(index int) {
 	if index >= 0 && index < len(pages) {
 		m.currentPage = index
 		m.scrollOffset = 0
+		m.markCurrentPageViewed()
 	}
 }
 
@@ -638,6 +664,7 @@ func (m *TutorialModel) JumpToSection(sectionID string) {
 		if page.ID == sectionID || page.Section == sectionID {
 			m.currentPage = i
 			m.scrollOffset = 0
+			m.markCurrentPageViewed()
 			return
 		}
 	}

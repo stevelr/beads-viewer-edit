@@ -17,41 +17,42 @@ import (
 // ShouldRefresh returns true if a cached value should be refreshed early.
 //
 // Parameters:
-//   - lastCompute: when the cached value was last computed
+//   - expiresAt: when the cached value expires (creation time plus its TTL)
 //   - computeDuration: how long the last computation took (used for gap estimation)
 //   - beta: scaling factor (1.0 is standard; higher = more aggressive early refresh)
-//   - now: current time (allows deterministic testing)
+//   - now: current time
 //
-// The probability of returning true increases as (now - lastCompute) approaches computeDuration.
-// This ensures some clients start refreshing before all cached copies expire.
-func ShouldRefresh(lastCompute time.Time, computeDuration time.Duration, beta float64, now time.Time) bool {
+// Refresh probability increases as now approaches expiresAt. The computation
+// duration sets the early-refresh window, not the lifetime of the cache entry.
+func ShouldRefresh(expiresAt time.Time, computeDuration time.Duration, beta float64, now time.Time) bool {
+	// Float64 returns [0,1); reflection gives (0,1] without clamping log(0)
+	// to an arbitrary tail cutoff.
+	return shouldRefresh(expiresAt, computeDuration, beta, now, 1-rand.Float64())
+}
+
+// shouldRefresh accepts an explicit uniform draw so the expiry policy can be
+// checked against fixed quantiles without random or wall-clock test failures.
+func shouldRefresh(expiresAt time.Time, computeDuration time.Duration, beta float64, now time.Time, uniform float64) bool {
 	if computeDuration <= 0 || beta <= 0 || math.IsNaN(beta) || math.IsInf(beta, 0) {
 		return false
 	}
-
-	// XFetch formula: refresh if now > lastCompute + duration * beta * -ln(rand)
-	// Since ln(rand) is negative for rand in (0,1), we use -ln(rand) which is positive
-	//
-	// Intuition: as time passes, (now - lastCompute) grows. The threshold
-	// computeDuration * beta * -ln(rand) is a random positive value. Higher beta
-	// or longer computeDuration means higher threshold, so less likely to refresh early.
-	// As cache ages, eventually now exceeds the threshold.
-
-	r := rand.Float64()
-	if r <= 0 {
-		r = 1e-10 // Avoid log(0)
-	}
-
-	product := float64(computeDuration) * beta * -math.Log(r)
-	if product > float64(math.MaxInt64) || math.IsInf(product, 0) || math.IsNaN(product) {
-		// Duration would overflow int64 — definitely should refresh
+	if !now.Before(expiresAt) {
 		return true
 	}
-	threshold := lastCompute.Add(time.Duration(product))
-	return now.After(threshold)
+	if uniform == 1 {
+		return false // A zero gap cannot reach a future expiry, even for huge beta.
+	}
+
+	// Figure 3: now - duration * beta * log(uniform) >= expiry.
+	// Compare the remaining lifetime with the sampled gap in floating point;
+	// converting a large gap to time.Duration could overflow and reverse it.
+	// Normalize first so even an overflowing duration*beta and log(1)==0
+	// cannot produce Inf*0 (NaN).
+	remaining := float64(expiresAt.Sub(now)) / float64(computeDuration) / beta
+	return remaining <= -math.Log(uniform)
 }
 
 // ShouldRefreshWithDefault is a convenience wrapper using time.Now() and beta=1.0.
-func ShouldRefreshWithDefault(lastCompute time.Time, computeDuration time.Duration) bool {
-	return ShouldRefresh(lastCompute, computeDuration, 1.0, time.Now())
+func ShouldRefreshWithDefault(expiresAt time.Time, computeDuration time.Duration) bool {
+	return ShouldRefresh(expiresAt, computeDuration, 1.0, time.Now())
 }

@@ -13,21 +13,18 @@
   <meta name="theme-color" content="#0ea5e9" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#1f2937" media="(prefers-color-scheme: dark)">
 
-  <!-- Early theme detection - MUST be first to prevent flash -->
-  <script>
-    (function() {
-      const stored = localStorage.getItem('darkMode');
-      // Default to dark mode when no preference is stored
-      if (stored === 'true' || stored === null) {
-        document.documentElement.classList.add('dark');
-      }
-    })();
-  </script>
+  <!-- Early theme detection, tailwind.config and the COI bootstrap live in
+       head_init.js (loaded below, still inside the head): the CSP forbids
+       inline scripts so an injected script element can never run. -->
 
-  <!-- Security: Content Security Policy - fully self-contained for offline use -->
+  <!-- Security: Content Security Policy - fully self-contained for offline use.
+       script-src has no 'unsafe-inline': every script is a same-origin file.
+       'unsafe-eval' remains because the vendored Alpine build evaluates
+       x-* expressions with Function(); 'wasm-unsafe-eval' covers sql.js and
+       bv_graph_bg.wasm once 'unsafe-eval' can be dropped. -->
   <meta http-equiv="Content-Security-Policy" content="
     default-src 'self';
-    script-src 'self' 'unsafe-eval' 'unsafe-inline';
+    script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval';
     style-src 'self' 'unsafe-inline';
     font-src 'self';
     img-src 'self' data: blob:;
@@ -45,33 +42,8 @@
 
   <!-- Tailwind CSS (bundled locally for COEP compatibility) -->
   <script src="vendor/tailwindcss.js"></script>
-  <script>
-    tailwind.config = {
-      darkMode: 'class',
-      theme: {
-        extend: {
-          fontFamily: {
-            sans: ['Inter', 'system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'sans-serif'],
-            mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
-          },
-          colors: {
-            beads: {
-              50: '#f0f9ff',
-              100: '#e0f2fe',
-              200: '#bae6fd',
-              300: '#7dd3fc',
-              400: '#38bdf8',
-              500: '#0ea5e9',
-              600: '#0284c7',
-              700: '#0369a1',
-              800: '#075985',
-              900: '#0c4a6e',
-            }
-          }
-        }
-      }
-    }
-  </script>
+  <!-- Theme default, tailwind.config, and the COI service-worker bootstrap -->
+  <script src="head_init.js"></script>
 
   <!-- Custom styles -->
   <link rel="stylesheet" href="styles.css">
@@ -202,53 +174,8 @@
   </style>
 </head>
 <body class="bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100 min-h-screen">
-  <!-- COOP/COEP check for SharedArrayBuffer (required for sql.js WASM) -->
-  <script>
-    // Cross-origin isolation via service worker for GitHub Pages
-    // Uses controller check (not sessionStorage) to prevent infinite reload loops
-    // iOS Safari doesn't support COI via SW - this safely handles that case
-    (function() {
-      // Already cross-origin isolated - nothing to do
-      if (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated) {
-        console.log('[COI] Already cross-origin isolated');
-        return;
-      }
-
-      // Service workers not supported - can't enable COI
-      if (!('serviceWorker' in navigator)) {
-        console.log('[COI] Service workers not supported');
-        return;
-      }
-
-      // KEY CHECK: If a service worker is already controlling this page,
-      // but we're STILL not cross-origin isolated, then this browser
-      // doesn't support COI via service worker (e.g., iOS Safari).
-      // We must NOT reload again - that would cause infinite loop!
-      if (navigator.serviceWorker.controller) {
-        console.log('[COI] SW is controlling but not cross-origin isolated');
-        console.log('[COI] Browser limitation (iOS Safari?). Using degraded mode.');
-        return;
-      }
-
-      // No controller yet - register SW and reload
-      // After reload, SW will be controller, and above check prevents loop
-      console.log('[COI] Registering service worker for cross-origin isolation...');
-      navigator.serviceWorker.register('./coi-serviceworker.js')
-        .then(reg => {
-          console.log('[COI] Service worker registered');
-          // Wait for the SW to be ready and controlling the page
-          return navigator.serviceWorker.ready;
-        })
-        .then(() => {
-          console.log('[COI] Service worker ready, reloading...');
-          // Give SW time to claim clients before reloading
-          setTimeout(() => window.location.reload(), 200);
-        })
-        .catch(err => {
-          console.warn('[COI] Service worker registration failed:', err);
-        });
-    })();
-  </script>
+  <!-- COOP/COEP bootstrap for SharedArrayBuffer (required for sql.js WASM)
+       runs from head_init.js; see the [COI] console messages. -->
 
   <!-- Alpine automatically invokes the init() method returned by beadsApp(). -->
   <div x-data="beadsApp()" x-cloak>
@@ -339,7 +266,7 @@
             </div>
 
             <!-- Mobile search button (shows on mobile) - larger touch target -->
-            <button @click="mobileSearchOpen = !mobileSearchOpen" class="sm:hidden p-3 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 active:bg-gray-200 dark:active:bg-gray-600">
+            <button @click="mobileSearchOpen = !mobileSearchOpen" aria-label="Search issues" class="sm:hidden p-3 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 active:bg-gray-200 dark:active:bg-gray-600">
               <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
               </svg>
@@ -633,7 +560,7 @@
               <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 font-medium">Blocked</p>
             </div>
             <!-- Actionable -->
-            <div @click="filters.hasBlockers = false; filters.status = ['open']; view = 'issues'; applyFilters()"
+            <div @click="filters.hasBlockers = false; filters.status = ['open', 'in_progress']; view = 'issues'; applyFilters()"
                  class="stat-card-mobile flex-shrink-0 w-[130px] scroll-snap-start touch-btn haptic-light border-emerald-200 dark:border-emerald-800">
               <div class="w-9 h-9 bg-emerald-100 dark:bg-emerald-900/50 rounded-xl flex items-center justify-center mb-3">
                 <svg class="w-5 h-5 text-emerald-600 dark:text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -710,7 +637,7 @@
             </div>
           </div>
 
-          <div @click="filters.hasBlockers = false; filters.status = ['open']; view = 'issues'; applyFilters()"
+          <div @click="filters.hasBlockers = false; filters.status = ['open', 'in_progress']; view = 'issues'; applyFilters()"
                class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-5 cursor-pointer card-lift focus-ring group">
             <div class="flex items-center justify-between">
               <div>
@@ -876,7 +803,7 @@
                   <span class="w-20 text-sm text-gray-600 dark:text-gray-400 capitalize" x-text="item.type || 'unknown'"></span>
                   <div class="flex-1 mx-3 h-4 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
                     <div class="h-full bg-beads-500 rounded-full transition-all duration-500"
-                         :style="'width: ' + (stats.total ? Math.round(item.count / (stats.open + stats.in_progress) * 100) : 0) + '%'"></div>
+                         :style="'width: ' + (stats.active ? Math.round(item.count / stats.active * 100) : 0) + '%'"></div>
                   </div>
                   <span class="w-8 text-sm font-medium text-right" x-text="item.count"></span>
                 </div>
@@ -907,7 +834,7 @@
                            'bg-blue-500': item.priority === 2,
                            'bg-gray-400': item.priority >= 3
                          }"
-                         :style="'width: ' + (stats.total ? Math.round(item.count / (stats.open + stats.in_progress) * 100) : 0) + '%'"></div>
+                         :style="'width: ' + (stats.active ? Math.round(item.count / stats.active * 100) : 0) + '%'"></div>
                   </div>
                   <span class="w-8 text-sm font-medium text-right" x-text="item.count"></span>
                 </div>
@@ -1047,7 +974,7 @@
           <!-- Filter header with toggle for mobile -->
           <div class="flex items-center justify-between md:mb-4"
                :class="{ 'mb-4': filtersExpanded }">
-            <button @click="filtersExpanded = !filtersExpanded" class="md:hidden flex items-center space-x-2">
+            <button @click="filtersExpanded = !filtersExpanded" aria-label="Toggle filters" class="md:hidden flex items-center space-x-2">
               <svg class="w-4 h-4 transition-transform" :class="{ 'rotate-90': filtersExpanded }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
               </svg>
@@ -1178,6 +1105,7 @@
           <p class="text-xs sm:text-sm text-gray-600 dark:text-gray-400">
             Showing <span class="font-medium" x-text="issues.length"></span> of
             <span class="font-medium" x-text="totalIssues"></span> issues
+            <span x-show="searchQuery && searchBackend === 'substring'" class="ml-2 text-gray-500" title="This browser SQLite engine does not include FTS5. Graph ranking still applies in Hybrid mode.">· Substring text matching</span>
           </p>
           <div class="text-xs sm:text-sm text-gray-500">
             Page <span x-text="page"></span> of <span x-text="Math.ceil(totalIssues / pageSize) || 1"></span>
@@ -1316,7 +1244,7 @@
                   <path stroke-linecap="round" stroke-width="2" d="M12 2v4m0 12v4M2 12h4m12 0h4"/>
                 </svg>
               </div>
-              <p class="text-2xl font-bold text-gray-900 dark:text-white" x-text="graphReady ? (stats.open + stats.in_progress + stats.blocked) : '-'"></p>
+              <p class="text-2xl font-bold text-gray-900 dark:text-white" x-text="graphReady ? stats.active : '-'"></p>
               <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 font-medium">Active Nodes</p>
             </div>
             <!-- Graph Status -->
@@ -1376,7 +1304,7 @@
                 </svg>
               </div>
               <div>
-                <p class="text-2xl font-bold" x-text="graphReady ? (stats.open + stats.in_progress + stats.blocked) : '-'"></p>
+                <p class="text-2xl font-bold" x-text="graphReady ? stats.active : '-'"></p>
                 <p class="text-xs text-gray-500 dark:text-gray-400 font-medium">Active Nodes</p>
               </div>
             </div>
@@ -1449,7 +1377,7 @@
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"/>
                 </svg>
                 <span class="text-sm font-semibold text-purple-700 dark:text-purple-300">
-                  <span x-text="topKSet?.total_unblocked || 0"></span> potential unblocks
+                  <span x-text="topKSet?.total_gain || 0"></span> potential unblocks
                 </span>
               </div>
             </div>
@@ -1473,7 +1401,7 @@
                     <div class="flex flex-wrap items-center gap-2">
                       <span class="text-[10px] sm:text-xs font-mono text-purple-600 dark:text-purple-400 bg-purple-100 dark:bg-purple-900/50 px-1.5 py-0.5 rounded" x-text="item.issueId"></span>
                       <span class="px-2 py-0.5 text-[10px] sm:text-xs font-semibold bg-gradient-to-r from-green-100 to-emerald-100 dark:from-green-900/50 dark:to-emerald-900/50 text-green-700 dark:text-green-300 rounded-full border border-green-200 dark:border-green-700">
-                        +<span x-text="item.marginal_unblocked"></span> unblock
+                        +<span x-text="item.marginal_gain"></span> unblock
                       </span>
                     </div>
                     <h3 class="text-sm sm:text-base font-medium text-gray-900 dark:text-gray-100 mt-1 line-clamp-2 group-hover:text-purple-700 dark:group-hover:text-purple-300 transition-colors" x-text="getIssue(item.issueId)?.title || item.issueId" :title="getIssue(item.issueId)?.title || item.issueId"></h3>
@@ -1524,8 +1452,8 @@
                       <h3 class="text-sm font-medium text-gray-900 dark:text-gray-100 mt-1 line-clamp-2 group-hover:text-cyan-700 dark:group-hover:text-cyan-300 transition-colors" x-text="getIssue(item.issueId)?.title || item.issueId" :title="getIssue(item.issueId)?.title || item.issueId"></h3>
                     </div>
                     <span class="shrink-0 px-2 py-1 text-[10px] sm:text-xs font-bold bg-gradient-to-r from-cyan-100 to-sky-100 dark:from-cyan-900/50 dark:to-sky-900/50 text-cyan-700 dark:text-cyan-300 rounded-lg border border-cyan-200 dark:border-cyan-700">
-                      <span x-text="item.result?.cascade_depth || item.result?.total_unblocked || '?'"></span>
-                      <span x-text="item.result?.total_unblocked ? '↑' : '⬇'"></span>
+                      <span x-text="item.result?.transitive_unblocks || 0"></span>
+                      <span x-text="item.result?.transitive_unblocks ? '↑' : '—'"></span>
                     </span>
                   </div>
                 </div>
@@ -3080,7 +3008,7 @@
             <span class="text-[10px] text-gray-500 dark:text-gray-400 uppercase tracking-wider font-medium block mb-3">Description</span>
             <div id="graph-detail-content"
                  class="prose prose-sm dark:prose-invert max-w-none bg-gray-50/50 dark:bg-gray-900/30 rounded-lg p-4 border border-gray-100 dark:border-gray-700/50"
-                 x-html="graphDetailNode?.description ? (typeof marked !== 'undefined' ? marked.parse(graphDetailNode.description) : graphDetailNode.description) : '<p class=\'text-gray-400 dark:text-gray-500 italic\'>No description available</p>'">
+                 x-html="graphDetailNode?.description ? renderMarkdown(graphDetailNode.description) : '<p class=\'text-gray-400 dark:text-gray-500 italic\'>No description available</p>'">
             </div>
           </div>
         </div>
@@ -3334,7 +3262,7 @@
               <div class="bg-white dark:bg-gray-800 border-b border-gray-100 dark:border-gray-700/50 px-6 py-4 shrink-0">
                 <div class="flex items-start justify-between">
                   <div class="flex-1 min-w-0">
-                    <div class="flex items-center gap-3 mb-2">
+                    <div class="flex flex-wrap items-center gap-3 mb-2">
                       <a :href="'#/issue/' + encodeURIComponent(selectedIssue.id)"
                          class="font-mono text-sm font-medium text-beads-600 dark:text-beads-400 hover:underline bg-beads-50 dark:bg-beads-900/20 px-2 py-0.5 rounded"
                          x-text="selectedIssue.id"></a>
@@ -3349,6 +3277,8 @@
                             x-text="'P' + selectedIssue.priority"></span>
                     </div>
                     <h2 class="text-lg font-semibold text-gray-900 dark:text-white leading-snug" x-text="selectedIssue.title"></h2>
+                    <button @click="copyIssueLink()" class="mt-2 px-3 py-2 text-sm rounded-lg bg-beads-100 dark:bg-beads-900 text-beads-700 dark:text-beads-200">Copy link</button>
+                    <p class="mt-1 text-xs break-words" role="status" aria-live="polite" x-text="copyLinkMessage"></p>
                   </div>
                   <button @click="closeIssue()" class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg shrink-0 ml-4 transition-colors">
                     <svg class="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -3538,7 +3468,7 @@
               </div>
 
               <!-- What-If Impact Section (if graph engine ready) -->
-              <div x-show="graphReady && selectedIssue.status !== 'closed'" class="mt-6 pt-6 border-t border-gray-200 dark:border-gray-700">
+              <div x-show="graphReady && !['closed', 'tombstone'].includes(selectedIssue.status)" class="mt-6 pt-6 border-t border-gray-200 dark:border-gray-700">
                 <div class="flex items-center justify-between mb-3">
                   <h3 class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">What-If Analysis</h3>
                   <button @click="computeWhatIf(selectedIssue.id)"
@@ -3548,8 +3478,8 @@
                 </div>
                 <div x-show="whatIfResult" class="bg-emerald-50 dark:bg-emerald-900/20 rounded-lg p-4 border border-emerald-100 dark:border-emerald-800/30">
                   <p class="text-sm text-emerald-700 dark:text-emerald-300">
-                    Closing this issue would unblock <span class="font-bold" x-text="whatIfResult?.newly_unblocked || 0"></span> issue(s)
-                    and enable <span class="font-bold" x-text="whatIfResult?.cascade_count || 0"></span> downstream item(s).
+                    Closing this issue would unblock <span class="font-bold" x-text="whatIfResult?.direct_unblocks || 0"></span> issue(s)
+                    and enable <span class="font-bold" x-text="whatIfResult?.transitive_unblocks || 0"></span> downstream item(s) as the unblocked work is completed.
                   </p>
                   <div x-show="whatIfResult?.cascade_issue_ids?.length" class="mt-3">
                     <span class="text-xs font-medium text-emerald-600 dark:text-emerald-400">Cascade:</span>
@@ -4122,58 +4052,8 @@
 
   <!-- Mermaid.js for dependency graphs - vendored for offline use -->
   <script src="vendor/mermaid.min.js"></script>
-  <script>
-    // Initialize Mermaid with theme based on dark mode state
-    // Uses Dracula-inspired colors for dark mode, GitHub-inspired for light mode
-    function getMermaidConfig() {
-      const dark = document.documentElement.classList.contains('dark');
-      return {
-        startOnLoad: false,
-        theme: dark ? 'dark' : 'neutral',
-        flowchart: { curve: 'basis', padding: 10 },
-        securityLevel: 'strict',
-        themeVariables: dark ? {
-          // Dracula-inspired dark theme
-          primaryColor: '#bd93f9',      // Purple
-          primaryTextColor: '#f8f8f2',  // Foreground
-          primaryBorderColor: '#ff79c6', // Pink
-          lineColor: '#6272a4',         // Muted (comment)
-          secondaryColor: '#44475a',    // Background secondary
-          tertiaryColor: '#282a36',     // Background
-          background: '#282a36',
-          mainBkg: '#282a36',
-          nodeBorder: '#bd93f9',
-          clusterBkg: '#44475a',
-          clusterBorder: '#6272a4',
-          titleColor: '#f8f8f2',
-          edgeLabelBackground: '#44475a',
-          nodeTextColor: '#f8f8f2'
-        } : {
-          // GitHub-inspired light theme
-          primaryColor: '#8250df',      // Purple
-          primaryTextColor: '#24292f',  // Foreground
-          primaryBorderColor: '#bf3989', // Pink
-          lineColor: '#57606a',         // Muted
-          secondaryColor: '#f6f8fa',    // Background secondary
-          tertiaryColor: '#ffffff',     // Background
-          background: '#ffffff',
-          mainBkg: '#ffffff',
-          nodeBorder: '#8250df',
-          clusterBkg: '#f6f8fa',
-          clusterBorder: '#d0d7de',
-          titleColor: '#24292f',
-          edgeLabelBackground: '#f6f8fa',
-          nodeTextColor: '#24292f'
-        }
-      };
-    }
-    mermaid.initialize(getMermaidConfig());
-
-    // Expose for theme toggle re-initialization
-    window.reinitializeMermaid = function() {
-      mermaid.initialize(getMermaidConfig());
-    };
-  </script>
+  <!-- Mermaid is initialised (theme-aware) at the top of viewer.js, which
+       loads below after the vendored mermaid.min.js. -->
 
   <!-- Force-Graph dependencies (Graph view) - vendored for offline use -->
   <script src="vendor/force-graph.min.js"></script>

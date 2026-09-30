@@ -40,6 +40,25 @@ func TestMain(m *testing.M) {
 	e2eHomeDir = homeDir
 	os.Setenv("HOME", homeDir)
 	os.Setenv("XDG_CONFIG_HOME", filepath.Join(homeDir, ".config"))
+	// Nix shells export SOURCE_DATE_EPOCH (1980-01-01), which pins bv's robot
+	// clock. Tests that need a pinned clock set it explicitly.
+	os.Unsetenv("SOURCE_DATE_EPOCH")
+
+	// Some RCH workers run as a different uid from the copied checkout owner.
+	// Keep VCS stamping enabled and trust only this checkout in the test HOME.
+	repoDir, err := filepath.Abs(filepath.Join("..", ".."))
+	if err == nil {
+		repoDir, err = filepath.EvalSymlinks(repoDir)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to resolve test checkout: %v\n", err)
+		os.Exit(1)
+	}
+	gitConfig := exec.Command("git", "config", "--file", filepath.Join(homeDir, ".gitconfig"), "--add", "safe.directory", repoDir)
+	if out, err := gitConfig.CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to configure isolated checkout trust: %v\n%s", err, out)
+		os.Exit(1)
+	}
 
 	// Build the binary once for all tests
 	if err := buildBvOnce(); err != nil {
@@ -521,28 +540,38 @@ func (f *TestFixture) AddIssueWithLabels(title, status string, priority int, iss
 	return id
 }
 
-// Write writes all issues to the .beads/beads.jsonl file.
+// Write creates a current-br issue export plus its source-routing metadata.
 func (f *TestFixture) Write() error {
 	f.t.Helper()
 
-	beadsPath := filepath.Join(f.Dir, ".beads", "beads.jsonl")
+	beadsDir := filepath.Join(f.Dir, ".beads")
+	beadsPath := filepath.Join(beadsDir, "issues.jsonl")
 	file, err := os.Create(beadsPath)
 	if err != nil {
-		return fmt.Errorf("create beads.jsonl: %w", err)
+		return fmt.Errorf("create issues.jsonl: %w", err)
 	}
-	defer file.Close()
 
 	for _, issue := range f.beads {
 		data, err := json.Marshal(issue)
 		if err != nil {
+			_ = file.Close()
 			return fmt.Errorf("marshal issue %s: %w", issue.ID, err)
 		}
 		if _, err := file.Write(data); err != nil {
+			_ = file.Close()
 			return fmt.Errorf("write issue %s: %w", issue.ID, err)
 		}
 		if _, err := file.WriteString("\n"); err != nil {
+			_ = file.Close()
 			return fmt.Errorf("write newline: %w", err)
 		}
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close issues.jsonl: %w", err)
+	}
+	metadata := []byte("{\"database\":\"beads.db\",\"jsonl_export\":\"issues.jsonl\"}\n")
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0o644); err != nil {
+		return fmt.Errorf("write metadata.json: %w", err)
 	}
 
 	return nil

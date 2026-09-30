@@ -520,16 +520,23 @@ func TestOffline_CrossOriginIsolation(t *testing.T) {
 		t.Fatalf("--export-pages failed: %v\n%s", err, out)
 	}
 
-	// Read index.html and check for COI service worker registration
+	// The registration lives in head_init.js because the dashboard CSP forbids
+	// inline scripts: index.html must load it, and it must register the worker.
 	indexBytes, err := os.ReadFile(filepath.Join(exportDir, "index.html"))
 	if err != nil {
 		t.Fatalf("read index.html: %v", err)
 	}
-	html := string(indexBytes)
-
-	// Check for service worker registration
-	if !strings.Contains(html, "coi-serviceworker") {
-		t.Error("index.html should reference coi-serviceworker for cross-origin isolation")
+	if !strings.Contains(string(indexBytes), `src="head_init.js`) {
+		t.Error("index.html should load head_init.js for cross-origin isolation")
+	}
+	headInit, err := os.ReadFile(filepath.Join(exportDir, "head_init.js"))
+	if err != nil {
+		t.Fatalf("read head_init.js: %v", err)
+	}
+	// Static contract coverage; actual browser control/offline behavior is
+	// exercised separately rather than requiring a browser for this Go suite.
+	if !strings.Contains(string(headInit), "serviceWorker.register('./coi-serviceworker.js', { updateViaCache: 'none' })") {
+		t.Error("head_init.js should register coi-serviceworker.js with updateViaCache none for cross-origin isolation")
 	}
 }
 

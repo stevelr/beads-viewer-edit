@@ -146,7 +146,7 @@ func TestLiveReloadMiddleware_NonHTML(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 
 	body := rr.Body.String()
-	if strings.Contains(body, "EventSource") {
+	if strings.Contains(body, LiveReloadScriptTag) {
 		t.Errorf("Non-HTML response should not contain injected script")
 	}
 }
@@ -168,7 +168,7 @@ func TestLiveReloadMiddleware_HTML(t *testing.T) {
 	}
 
 	body := rr.Body.String()
-	if !strings.Contains(body, "EventSource") {
+	if !strings.Contains(body, LiveReloadScriptTag) {
 		t.Errorf("HTML response should contain injected script, got: %s", body)
 	}
 	if !strings.Contains(body, "</body>") {
@@ -192,7 +192,7 @@ func TestLiveReloadMiddleware_RemovesStaleContentLength(t *testing.T) {
 		t.Fatalf("Content-Length = %q, want empty after script injection", got)
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, "EventSource") {
+	if !strings.Contains(body, LiveReloadScriptTag) {
 		t.Fatalf("Expected injected live reload script, got: %s", body)
 	}
 	if len(body) <= len(html) {
@@ -211,11 +211,44 @@ func TestLiveReloadMiddleware_HTMLWithoutBody(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 
 	body := rr.Body.String()
-	if !strings.Contains(body, "EventSource") {
+	if !strings.Contains(body, LiveReloadScriptTag) {
 		t.Fatalf("HTML without </body> should still receive injected script, got: %s", body)
 	}
-	if strings.Index(body, "EventSource") > strings.Index(body, "</html>") {
+	if strings.Index(body, LiveReloadScriptTag) > strings.Index(body, "</html>") {
 		t.Fatalf("Expected script before </html>, got: %s", body)
+	}
+}
+
+// TestLiveReloadScriptHandler_ServesScriptAsFile: the dashboard's CSP has no
+// 'unsafe-inline' for scripts, so live reload must be a same-origin file the
+// injected tag points at, never an inline block.
+func TestLiveReloadScriptHandler_ServesScriptAsFile(t *testing.T) {
+	if strings.Contains(LiveReloadScript, "<script") {
+		t.Fatalf("LiveReloadScript must be plain JavaScript, got: %s", LiveReloadScript)
+	}
+	if LiveReloadScriptTag != `<script src="`+LiveReloadScriptPath+`"></script>` {
+		t.Fatalf("injected tag must reference %s, got %s", LiveReloadScriptPath, LiveReloadScriptTag)
+	}
+
+	req := httptest.NewRequest("GET", LiveReloadScriptPath, nil)
+	rr := httptest.NewRecorder()
+	liveReloadScriptHandler(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/javascript") {
+		t.Fatalf("Content-Type = %q, want application/javascript", ct)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "new EventSource('/__preview__/events')") {
+		t.Fatalf("served script must subscribe to the SSE endpoint, got: %s", body)
+	}
+
+	post := httptest.NewRequest("POST", LiveReloadScriptPath, nil)
+	rr = httptest.NewRecorder()
+	liveReloadScriptHandler(rr, post)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST status = %d, want 405", rr.Code)
 	}
 }
 

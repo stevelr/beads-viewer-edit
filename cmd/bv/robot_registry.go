@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"reflect"
 	"sort"
@@ -12,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Dicklesworthstone/beads_viewer/internal/datasource"
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
@@ -49,17 +51,34 @@ type RobotContext struct {
 	AsOfCommit            string
 	LabelScope            string
 	LabelContext          *analysis.LabelHealth
-	Stdout                io.Writer
-	Stderr                io.Writer
-	FinalizeBeforeExit    func()
-	WorkDir               string
-	ProjectDir            string
-	BaselinePath          string
-	EnvRobot              bool
-	SearchOutput          *robotSearchOutput
-	Diff                  *analysis.SnapshotDiff
-	DiffHistoricalIssues  []model.Issue
-	DiffResolvedRevision  string
+	Readiness             *model.ReadinessIndex
+	CandidateIDs          map[string]bool
+	// Command is the normalized robot flag being dispatched (set by
+	// DispatchFlag) so Envelope can declare which scoping flags this command
+	// cannot honour.
+	Command string
+	// SourcePath / SourceKind describe where Issues came from: the JSONL or
+	// SQLite file selected by discovery, "<file>@<rev>" for --as-of, or the
+	// workspace config. Every payload carries them so a consumer can see when a
+	// different file than expected was analysed.
+	SourcePath      string
+	SourceKind      string
+	SourceAuthority *RobotSourceAuthority
+	// Recipe and Repo mirror the --recipe and --repo scoping already applied to
+	// Issues (LabelScope covers --label).
+	Recipe               string
+	Repo                 string
+	Stdout               io.Writer
+	Stderr               io.Writer
+	FinalizeBeforeExit   func()
+	WorkDir              string
+	ProjectDir           string
+	BaselinePath         string
+	EnvRobot             bool
+	SearchOutput         *robotSearchOutput
+	Diff                 *analysis.SnapshotDiff
+	DiffHistoricalIssues []model.Issue
+	DiffResolvedRevision string
 }
 
 type RobotRegistry struct {
@@ -164,6 +183,8 @@ type phaseThreeRobotHandlerConfig struct {
 	OrphansMinScore         *int
 	RobotFileBeadsFlag      *string
 	FileBeadsLimit          *int
+	RobotFileHotspotsFlag   *bool
+	HotspotsLimit           *int
 	RobotImpactFlag         *string
 	ForceFullAnalysis       *bool
 	HistoryLimit            *int
@@ -197,6 +218,138 @@ type phaseThreeRobotHandlerConfig struct {
 
 func newRobotRegistry() RobotRegistry {
 	return RobotRegistry{}
+}
+
+// Analyzer uses the visible graph for metrics and the retained full source for
+// readiness. Every registry handler must keep these two scopes distinct.
+func (ctx RobotContext) Analyzer() *analysis.Analyzer {
+	analyzer := analysis.NewAnalyzer(ctx.Issues)
+	analyzer.SetReadinessScope(ctx.Readiness, ctx.CandidateIDs)
+	analyzer.SetNow(robotNow())
+	return analyzer
+}
+
+// Envelope builds the shared robot payload header for this dispatch: data
+// hash, source, time-travel metadata, and active scoping.
+func (ctx RobotContext) Envelope() RobotEnvelope {
+	return ctx.EnvelopeWithHash(ctx.DataHash)
+}
+
+// EnvelopeWithHash is Envelope for handlers whose payload hashes a derived
+// issue set (a history report, a scoped subgraph) rather than ctx.Issues.
+func (ctx RobotContext) EnvelopeWithHash(dataHash string) RobotEnvelope {
+	env := NewRobotEnvelope(dataHash)
+	env.SourcePath = ctx.SourcePath
+	env.SourceKind = ctx.SourceKind
+	env.SourceAuthority = ctx.SourceAuthority
+	if env.SourceAuthority == nil {
+		env.SourceAuthority = newRobotSourceAuthority(nil)
+	}
+	env.AuthorityHash = robotAuthorityHash(env.SourceAuthority)
+	env.LoadStats = robotLoadStats(ctx.SourceAuthority)
+	ids := make([]string, 0, len(ctx.Issues))
+	for _, issue := range ctx.Issues {
+		if ctx.CandidateIDs == nil || ctx.CandidateIDs[issue.ID] {
+			ids = append(ids, issue.ID)
+		}
+	}
+	sort.Strings(ids)
+	env.ScopeHash = robotScopeHash(ctx.LabelScope, ctx.Recipe, ctx.Repo, dataHash, ids)
+	env.AsOf = ctx.AsOf
+	env.AsOfCommit = ctx.AsOfCommit
+	unsupported := unsupportedScopeFor(ctx.Command, ctx)
+	if ctx.LabelScope != "" || ctx.Recipe != "" || ctx.Repo != "" || len(unsupported) > 0 {
+		env.Scope = &RobotScope{
+			Label:       ctx.LabelScope,
+			Recipe:      ctx.Recipe,
+			Repo:        ctx.Repo,
+			Unsupported: unsupported,
+		}
+	}
+	return env
+}
+
+func (ctx RobotContext) claimsProven() bool {
+	return ctx.SourceAuthority != nil && ctx.SourceAuthority.ClaimSafe
+}
+
+func suppressUnprovenTriageClaims(triage *analysis.TriageResult) {
+	triage.Commands.ClaimTop = ""
+	triage.QuickRef.TopPicks = []analysis.TopPick{}
+	triage.QuickWins = []analysis.QuickWin{}
+	suppressRecommendations := func(recs []analysis.Recommendation) {
+		for i := range recs {
+			recs[i].Claimable = false
+			recs[i].Actions.Claim = nil
+			recs[i].Actions.UnavailableReason = "source authority is incomplete or stale"
+			recs[i].Action = "Inspect source diagnostics before claiming work"
+		}
+	}
+	suppressRecommendations(triage.Recommendations)
+	for i := range triage.BlockersToClear {
+		triage.BlockersToClear[i].Actionable = false
+	}
+	for i := range triage.RecommendationsByTrack {
+		group := &triage.RecommendationsByTrack[i]
+		group.TopPick, group.ClaimCommand = nil, ""
+		suppressRecommendations(group.Recommendations)
+	}
+	for i := range triage.RecommendationsByLabel {
+		group := &triage.RecommendationsByLabel[i]
+		group.TopPick, group.ClaimCommand = nil, ""
+		suppressRecommendations(group.Recommendations)
+	}
+}
+
+// withEnvelope overlays the shared envelope onto a payload that already
+// defines some of the same top-level keys (generated_at, data_hash) — for
+// example the correlation package's result structs. Embedding both would make
+// encoding/json drop the colliding keys silently; overlaying keeps every
+// payload key and lets the envelope supply source, scope, and as_of metadata.
+func withEnvelope(env RobotEnvelope, payload any) (map[string]json.RawMessage, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encoding payload: %w", err)
+	}
+	merged := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(raw, &merged); err != nil {
+		return nil, fmt.Errorf("payload is not a JSON object: %w", err)
+	}
+	envRaw, err := json.Marshal(env)
+	if err != nil {
+		return nil, fmt.Errorf("encoding envelope: %w", err)
+	}
+	var envFields map[string]json.RawMessage
+	if err := json.Unmarshal(envRaw, &envFields); err != nil {
+		return nil, fmt.Errorf("envelope is not a JSON object: %w", err)
+	}
+	for k, v := range envFields {
+		merged[k] = v
+	}
+	return merged, nil
+}
+
+// unsupportedScopeFor lists the scoping flags a command cannot honour for the
+// given context. Commands that walk live git history or read sprint files from
+// disk cannot be time-travelled with --as-of; declaring that beats silently
+// answering from the wrong point in time.
+func unsupportedScopeFor(command string, ctx RobotContext) []string {
+	if ctx.AsOf == "" {
+		return nil
+	}
+	switch normalizeRobotFlagName(command) {
+	case "robot-history", "robot-orphans", "robot-file-beads", "robot-file-hotspots",
+		"robot-file-relations", "robot-impact-network", "robot-related",
+		"robot-explain-correlation", "robot-confirm-correlation", "robot-reject-correlation",
+		"robot-correlation-stats", "robot-impact",
+		"robot-sprint-list", "robot-sprint-show", "robot-burndown":
+		return []string{"as_of"}
+	case "robot-causality":
+		if ctx.AsOfCommit == "" {
+			return []string{"as_of"}
+		}
+	}
+	return nil
 }
 
 func (ctx RobotContext) StdoutOrDefault() io.Writer {
@@ -303,6 +456,7 @@ func (r *RobotRegistry) DispatchFlag(flagName string, ctx RobotContext) (bool, e
 		if cmd.Handler == nil {
 			return true, fmt.Errorf("robot command %q has no handler", cmd.Name)
 		}
+		ctx.Command = normalized
 		return true, cmd.Handler(ctx)
 	}
 
@@ -371,7 +525,20 @@ func newReportedRobotHandlerExit(exitCode int) error {
 }
 
 // writeRobotHelp outputs the robot help documentation.
+// robotHelpRegistries holds every populated registry so --robot-help can list
+// all commands. main sets it right after registering the phase handlers; a nil
+// slice (unit tests, early failures) still renders the intro and key bindings.
+var robotHelpRegistries []*RobotRegistry
+
 func writeRobotHelp(out io.Writer) error {
+	return writeRobotHelpFromRegistries(out, robotHelpRegistries...)
+}
+
+// writeRobotHelpFromRegistries renders --robot-help. The command list is
+// generated from the registries so a new robot command is documented the
+// moment it is registered; the hand-written list it replaced covered six of
+// forty commands.
+func writeRobotHelpFromRegistries(out io.Writer, registries ...*RobotRegistry) error {
 	if out == nil {
 		out = os.Stdout
 	}
@@ -394,17 +561,67 @@ func writeRobotHelp(out io.Writer) error {
 Use --robot-* flags for deterministic automation output.
 Bare bv launches the interactive TUI.
 
-Core commands:
-  --robot-triage    Unified triage output (recommended entry point)
-  --robot-next      Single top recommendation
-  --robot-plan      Dependency-respecting execution tracks
-  --robot-insights  Graph metrics and structural analysis
+Start here:
+  --robot-triage        Unified triage output (recommended entry point)
+  --robot-next          Single top recommendation
   --robot-capabilities  Machine-readable command/contract manifest
-  --robot-schema    JSON Schema definitions for robot outputs
+  --robot-schema        JSON Schema definitions for robot outputs
+  --robot-docs <topic>  Long-form agent documentation
+
+Every payload carries: generated_at, data_hash, source_path, source_kind,
+as_of/as_of_commit (with --as-of), scope (with --label/--recipe/--repo, plus
+scope.unsupported for flags a command cannot honour), load_stats (when records
+were dropped during load).
+Issue-backed responses also carry source_authority, authority_hash, and
+scope_hash. Partial or stale sources retain exploratory output with provisional
+readiness; source_authority.claim_safe must be true before claiming work.
 
 `)
 	if err != nil {
 		return fmt.Errorf("writing robot help intro: %w", err)
+	}
+
+	// Every registered command, generated so the list cannot drift from the
+	// registry. Modifiers (flags that only adjust another command) are listed
+	// under their own heading.
+	if err := writeln("All robot commands:"); err != nil {
+		return fmt.Errorf("writing robot help commands heading: %w", err)
+	}
+	if err := writeln("-------------------"); err != nil {
+		return fmt.Errorf("writing robot help commands divider: %w", err)
+	}
+	var modifiers []RobotCommand
+	seen := make(map[string]bool)
+	for _, reg := range registries {
+		if reg == nil {
+			continue
+		}
+		for _, cmd := range reg.commands {
+			if seen[cmd.FlagName] {
+				continue
+			}
+			seen[cmd.FlagName] = true
+			if cmd.IsModifier {
+				modifiers = append(modifiers, cmd)
+				continue
+			}
+			if err := writef("  %-28s %s\n", formatRobotFlag(cmd.FlagName), cmd.Description); err != nil {
+				return fmt.Errorf("writing robot help command %q: %w", cmd.FlagName, err)
+			}
+		}
+	}
+	if len(modifiers) > 0 {
+		if err := writeln("\nModifiers (combine with a command above):"); err != nil {
+			return fmt.Errorf("writing robot help modifiers heading: %w", err)
+		}
+		for _, cmd := range modifiers {
+			if err := writef("  %-28s %s\n", formatRobotFlag(cmd.FlagName), cmd.Description); err != nil {
+				return fmt.Errorf("writing robot help modifier %q: %w", cmd.FlagName, err)
+			}
+		}
+	}
+	if err := writeln(); err != nil {
+		return fmt.Errorf("writing robot help commands spacer: %w", err)
 	}
 
 	// Key bindings table (bv-xl6g)
@@ -519,7 +736,7 @@ func registerPhaseOneRobotHandlers(registry *RobotRegistry, cfg phaseOneRobotHan
 				Version      string                 `json:"version,omitempty"`
 				Recipes      []recipe.RecipeSummary `json:"recipes"`
 			}{
-				GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+				GeneratedAt:  robotNow().Format(time.RFC3339),
 				OutputFormat: robotOutputFormat,
 				Version:      version.Version,
 				Recipes:      summaries,
@@ -589,7 +806,7 @@ func registerPhaseOneRobotHandlers(registry *RobotRegistry, cfg phaseOneRobotHan
 				Cache  []metrics.CacheStats  `json:"cache,omitempty"`
 				Memory metrics.MemoryStats   `json:"memory"`
 			}{
-				RobotEnvelope: NewRobotEnvelope(ctx.DataHash),
+				RobotEnvelope: ctx.Envelope(),
 				Timing:        snapshot.Timing,
 				Cache:         snapshot.Cache,
 				Memory:        snapshot.Memory,
@@ -634,7 +851,8 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 		FlagPtr:     cfg.RobotPlanFlag,
 		Description: "Output dependency-respecting execution plan",
 		Handler: func(ctx RobotContext) error {
-			analyzer := analysis.NewAnalyzer(ctx.Issues)
+			analyzer := ctx.Analyzer()
+			analyzer.SetNow(robotNow())
 			if ctx.DataHashMatchesIssues {
 				analyzer.SeedDataHash(ctx.DataHash)
 			}
@@ -661,10 +879,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			stats.WaitForPhase2()
 
 			output := struct {
-				GeneratedAt    string                  `json:"generated_at"`
-				DataHash       string                  `json:"data_hash"`
-				AsOf           string                  `json:"as_of,omitempty"`
-				AsOfCommit     string                  `json:"as_of_commit,omitempty"`
+				RobotEnvelope
 				AnalysisConfig analysis.AnalysisConfig `json:"analysis_config"`
 				Status         analysis.MetricStatus   `json:"status"`
 				LabelScope     string                  `json:"label_scope,omitempty"`
@@ -672,12 +887,9 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				Plan           analysis.ExecutionPlan  `json:"plan"`
 				UsageHints     []string                `json:"usage_hints"`
 			}{
-				GeneratedAt:    time.Now().UTC().Format(time.RFC3339),
-				DataHash:       ctx.DataHash,
-				AsOf:           ctx.AsOf,
-				AsOfCommit:     ctx.AsOfCommit,
+				RobotEnvelope:  ctx.Envelope(),
 				AnalysisConfig: config,
-				Status:         stats.Status(),
+				Status:         stabilizeRobotMetricStatusForPinnedClock(stats.Status()),
 				LabelScope:     ctx.LabelScope,
 				LabelContext:   ctx.LabelContext,
 				Plan:           plan,
@@ -703,7 +915,11 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 		FlagPtr:     cfg.RobotPriorityFlag,
 		Description: "Output enhanced priority recommendations",
 		Handler: func(ctx RobotContext) error {
-			analyzer := analysis.NewAnalyzer(ctx.Issues)
+			analyzer := ctx.Analyzer()
+			analyzer.SetNow(robotNow())
+			if _, w := loadRobotFeedback(); w != nil {
+				analyzer.SetWeights(*w)
+			}
 			if ctx.DataHashMatchesIssues {
 				analyzer.SeedDataHash(ctx.DataHash)
 			}
@@ -767,10 +983,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 
 			output := struct {
-				GeneratedAt       string                                    `json:"generated_at"`
-				DataHash          string                                    `json:"data_hash"`
-				AsOf              string                                    `json:"as_of,omitempty"`
-				AsOfCommit        string                                    `json:"as_of_commit,omitempty"`
+				RobotEnvelope
 				AnalysisConfig    analysis.AnalysisConfig                   `json:"analysis_config"`
 				Status            analysis.MetricStatus                     `json:"status"`
 				LabelScope        string                                    `json:"label_scope,omitempty"`
@@ -790,12 +1003,9 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				} `json:"summary"`
 				Usage []string `json:"usage_hints"`
 			}{
-				GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
-				DataHash:          ctx.DataHash,
-				AsOf:              ctx.AsOf,
-				AsOfCommit:        ctx.AsOfCommit,
+				RobotEnvelope:     ctx.Envelope(),
 				AnalysisConfig:    config,
-				Status:            stats.Status(),
+				Status:            stabilizeRobotMetricStatusForPinnedClock(stats.Status()),
 				LabelScope:        ctx.LabelScope,
 				LabelContext:      ctx.LabelContext,
 				Recommendations:   recommendations,
@@ -833,7 +1043,8 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 		FlagPtr:     cfg.RobotGraphFlag,
 		Description: "Output dependency graph in JSON, DOT, or Mermaid",
 		Handler: func(ctx RobotContext) error {
-			analyzer := analysis.NewAnalyzer(ctx.Issues)
+			analyzer := ctx.Analyzer()
+			analyzer.SetNow(robotNow())
 			stats := analyzer.Analyze()
 
 			format := export.GraphFormatJSON
@@ -848,7 +1059,6 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 
 			config := export.GraphExportConfig{
 				Format:   format,
-				Label:    ctx.LabelScope,
 				DataHash: ctx.DataHash,
 			}
 			if cfg.GraphRoot != nil {
@@ -862,7 +1072,37 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			if err != nil {
 				return fmt.Errorf("exporting graph: %w", err)
 			}
-			if err := ctx.EncoderOrDefault().Encode(result); err != nil {
+			// The loader already selected the label subgraph, including direct
+			// dependency context. Filtering by label again would erase its edges.
+			if ctx.LabelScope != "" {
+				if result.FiltersApplied == nil {
+					result.FiltersApplied = make(map[string]string)
+				}
+				result.FiltersApplied["label"] = ctx.LabelScope
+			}
+			// Same keys as before plus the shared envelope (source, scope,
+			// as_of). GraphExportResult carries its own data_hash, so copy
+			// fields instead of embedding two structs that both define it.
+			output := struct {
+				RobotEnvelope
+				Format         string                  `json:"format"`
+				Graph          string                  `json:"graph,omitempty"`
+				Nodes          int                     `json:"nodes"`
+				Edges          int                     `json:"edges"`
+				FiltersApplied map[string]string       `json:"filters_applied,omitempty"`
+				Explanation    export.GraphExplanation `json:"explanation"`
+				Adjacency      *export.AdjacencyGraph  `json:"adjacency,omitempty"`
+			}{
+				RobotEnvelope:  ctx.Envelope(),
+				Format:         result.Format,
+				Graph:          result.Graph,
+				Nodes:          result.Nodes,
+				Edges:          result.Edges,
+				FiltersApplied: result.FiltersApplied,
+				Explanation:    result.Explanation,
+				Adjacency:      result.Adjacency,
+			}
+			if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 				return fmt.Errorf("encoding graph: %w", err)
 			}
 			return nil
@@ -889,7 +1129,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				return fmt.Errorf("loading drift config: %w", err)
 			}
 
-			analyzer := analysis.NewAnalyzer(ctx.Issues)
+			analyzer := ctx.Analyzer()
 			stats := analyzer.Analyze()
 
 			openCount, closedCount, blockedCount := 0, 0, 0
@@ -903,7 +1143,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 					openCount++
 				}
 			}
-			actionableCount := len(analyzer.GetActionableIssues())
+			actionableCount := analyzer.CountActionableIssues()
 			cycles := stats.Cycles()
 			curStats := baseline.GraphStats{
 				NodeCount:       stats.NodeCount,
@@ -938,7 +1178,11 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 
 			calc := drift.NewCalculator(bl, cur, driftConfig)
+			calc.SetNow(analyzer.Now())
 			calc.SetIssues(ctx.Issues)
+			if !calc.ReuseAnalyzer(analyzer) {
+				return fmt.Errorf("preparing alerts: issue rows do not match the scoped analyzer")
+			}
 			driftResult := calc.Calculate()
 
 			filtered := driftResult.Alerts[:0]
@@ -950,14 +1194,26 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 					continue
 				}
 				if cfg.AlertLabel != nil && strings.TrimSpace(*cfg.AlertLabel) != "" {
+					want := strings.ToLower(strings.TrimSpace(*cfg.AlertLabel))
 					found := false
-					for _, detail := range alert.Details {
-						if strings.Contains(strings.ToLower(detail), strings.ToLower(*cfg.AlertLabel)) {
+					for _, label := range alert.Labels {
+						if strings.ToLower(label) == want {
 							found = true
 							break
 						}
 					}
-					if !found && alert.Label != "" && !strings.Contains(strings.ToLower(alert.Label), strings.ToLower(*cfg.AlertLabel)) {
+					if !found && alert.Label != "" && strings.ToLower(alert.Label) == want {
+						found = true
+					}
+					if !found {
+						for _, detail := range alert.Details {
+							if strings.Contains(strings.ToLower(detail), want) {
+								found = true
+								break
+							}
+						}
+					}
+					if !found {
 						continue
 					}
 				}
@@ -974,14 +1230,20 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 					Warning  int `json:"warning"`
 					Info     int `json:"info"`
 				} `json:"summary"`
-				UsageHints []string `json:"usage_hints"`
+				SkippedChecks []drift.SkippedCheck `json:"skipped_checks,omitempty"`
+				UsageHints    []string             `json:"usage_hints"`
 			}{
-				RobotEnvelope: NewRobotEnvelope(ctx.DataHash),
+				RobotEnvelope: ctx.Envelope(),
 				Alerts:        driftResult.Alerts,
+				SkippedChecks: driftResult.SkippedChecks,
 				UsageHints: []string{
 					"--severity=warning --alert-type=stale_issue   # stale warnings only",
 					"--alert-type=blocking_cascade                 # high-unblock opportunities",
-					"jq '.alerts | map(.issue_id)'                # list impacted issues",
+					"--alert-type=high_impact_unblock|abandoned_claim|potential_duplicate|priority_mismatch|velocity_drop   # proactive checks (no baseline needed)",
+					"--alert-type=new_cycle|density_growth|node_count_change|edge_count_change|scope_creep|blocked_increase|actionable_change|pagerank_change   # drift vs saved baseline (bv --save-baseline)",
+					"--alert-label=backend                        # only alerts on issues carrying that label",
+					"jq '.alerts | map({issue_id, type, suggested_action})'   # what to do about each",
+					"thresholds: .bv/drift.yaml; every key and its default is listed in the README 'Alerts System' table",
 				},
 			}
 			for _, alert := range driftResult.Alerts {
@@ -1036,7 +1298,32 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				return newReportedRobotHandlerExit(1)
 			}
 
-			output := analysis.GenerateRobotSuggestOutput(ctx.Issues, config, ctx.DataHash)
+			suggest := analysis.GenerateRobotSuggestOutputAt(ctx.Issues, config, ctx.DataHash, robotNow())
+			if !ctx.claimsProven() || ctx.AsOf != "" {
+				reason := "source authority is incomplete or unknown"
+				if ctx.AsOf != "" {
+					reason = "historical snapshots cannot authorize tracker mutations"
+				}
+				for i, suggestion := range suggest.Set.Suggestions {
+					suggest.Set.Suggestions[i] = suggestion.WithAction(nil).WithMetadata("action_unavailable_reason", reason)
+				}
+				suggest.Set = analysis.NewSuggestionSetAt(suggest.Set.Suggestions, suggest.Set.DataHash, suggest.Set.GeneratedAt)
+			}
+			// Re-host the payload under the shared envelope (same top-level
+			// keys plus source/scope metadata). Embedding the analysis struct
+			// directly would collide on generated_at/data_hash, which
+			// encoding/json resolves by dropping both.
+			output := struct {
+				RobotEnvelope
+				Filters    analysis.SuggestFilter `json:"filters"`
+				Set        analysis.SuggestionSet `json:"suggestions"`
+				UsageHints []string               `json:"usage_hints"`
+			}{
+				RobotEnvelope: ctx.Envelope(),
+				Filters:       suggest.Filters,
+				Set:           suggest.Set,
+				UsageHints:    suggest.UsageHints,
+			}
 			if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 				return fmt.Errorf("encoding suggestions: %w", err)
 			}
@@ -1064,7 +1351,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				SprintCount int            `json:"sprint_count"`
 				Sprints     []model.Sprint `json:"sprints"`
 			}{
-				RobotEnvelope: NewRobotEnvelope(analysis.ComputeDataHash(ctx.Issues)),
+				RobotEnvelope: ctx.EnvelopeWithHash(analysis.ComputeDataHash(ctx.Issues)),
 				SprintCount:   len(sprints),
 				Sprints:       sprints,
 			}
@@ -1120,15 +1407,17 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				}
 			}
 
-			now := time.Now()
+			now := robotNow()
 			burndown := calculateBurndownAt(targetSprint, ctx.Issues, now)
-			burndown.RobotEnvelope = NewRobotEnvelope(analysis.ComputeDataHash(ctx.Issues))
+			burndown.RobotEnvelope = ctx.EnvelopeWithHash(analysis.ComputeDataHash(ctx.Issues))
 			issueMap := make(map[string]model.Issue, len(ctx.Issues))
 			for _, issue := range ctx.Issues {
 				issueMap[issue.ID] = issue
 			}
 			if scopeChanges, err := computeSprintScopeChanges(workDir, targetSprint, issueMap, now); err == nil && len(scopeChanges) > 0 {
 				burndown.ScopeChanges = scopeChanges
+				// Re-linearize the ideal trajectory at each scope change.
+				burndown.IdealLine = generateIdealLineScoped(targetSprint, burndown.TotalIssues, scopeChanges)
 			}
 
 			if err := ctx.EncoderOrDefault().Encode(burndown); err != nil {
@@ -1149,7 +1438,8 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				return fmt.Errorf("getting current directory: %w", err)
 			}
 
-			analyzer := analysis.NewAnalyzer(ctx.Issues)
+			analyzer := ctx.Analyzer()
+			analyzer.SetNow(robotNow())
 			graphStats := analyzer.Analyze()
 
 			targetIssues := make([]model.Issue, 0, len(ctx.Issues))
@@ -1174,6 +1464,9 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 
 			for _, issue := range ctx.Issues {
+				if !analyzer.IsCandidate(issue.ID) {
+					continue
+				}
 				if cfg.ForecastLabel != nil && strings.TrimSpace(*cfg.ForecastLabel) != "" {
 					hasLabel := false
 					for _, label := range issue.Labels {
@@ -1192,7 +1485,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				targetIssues = append(targetIssues, issue)
 			}
 
-			now := time.Now()
+			now := robotNow()
 			agents := 1
 			if cfg.ForecastAgents != nil && *cfg.ForecastAgents > 0 {
 				agents = *cfg.ForecastAgents
@@ -1232,6 +1525,17 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 					forecasts = append(forecasts, eta)
 				}
 			} else {
+				selected := false
+				for _, issue := range targetIssues {
+					if issue.ID == forecastTarget {
+						selected = true
+						break
+					}
+				}
+				if !selected {
+					fmt.Fprintf(ctx.StderrOrDefault(), "Issue not found in selected forecast scope: %s\n", forecastTarget)
+					return newReportedRobotHandlerExit(1)
+				}
 				eta, err := analysis.EstimateETAForIssue(ctx.Issues, &graphStats, forecastTarget, agents, now)
 				if err != nil {
 					fmt.Fprintf(ctx.StderrOrDefault(), "Error: %v\n", err)
@@ -1274,7 +1578,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 
 			output := ForecastOutput{
-				RobotEnvelope: NewRobotEnvelope(analysis.ComputeDataHash(ctx.Issues)),
+				RobotEnvelope: ctx.EnvelopeWithHash(analysis.ComputeDataHash(ctx.Issues)),
 				Agents:        agents,
 				ForecastCount: len(forecasts),
 				Forecasts:     forecasts,
@@ -1295,7 +1599,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 		Name:        "robot-search",
 		FlagName:    "robot-search",
 		FlagPtr:     cfg.RobotSearchFlag,
-		Description: "Output semantic search results as JSON",
+		Description: "Output keyword or hybrid search results as JSON",
 		Handler: func(ctx RobotContext) error {
 			if ctx.SearchOutput == nil {
 				return fmt.Errorf("robot search output not initialized")
@@ -1316,22 +1620,23 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			if ctx.Diff == nil {
 				return fmt.Errorf("diff output not initialized")
 			}
+			// The live-side snapshot is normally created with a wall-clock
+			// timestamp before dispatch. Copy it before normalizing the nested
+			// robot timestamp so reproducible output does not mutate caller state.
+			diff := *ctx.Diff
+			diff.ToTimestamp = robotNow()
 			output := struct {
-				GeneratedAt      string                 `json:"generated_at"`
+				RobotEnvelope
 				ResolvedRevision string                 `json:"resolved_revision"`
-				AsOf             string                 `json:"as_of,omitempty"`
-				AsOfCommit       string                 `json:"as_of_commit,omitempty"`
 				FromDataHash     string                 `json:"from_data_hash"`
 				ToDataHash       string                 `json:"to_data_hash"`
 				Diff             *analysis.SnapshotDiff `json:"diff"`
 			}{
-				GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
+				RobotEnvelope:    ctx.Envelope(),
 				ResolvedRevision: ctx.DiffResolvedRevision,
-				AsOf:             ctx.AsOf,
-				AsOfCommit:       ctx.AsOfCommit,
 				FromDataHash:     analysis.ComputeDataHash(ctx.DiffHistoricalIssues),
 				ToDataHash:       ctx.DataHash,
-				Diff:             ctx.Diff,
+				Diff:             &diff,
 			}
 
 			if err := ctx.EncoderOrDefault().Encode(output); err != nil {
@@ -1361,7 +1666,7 @@ func registerPhaseThreeRobotHandlers(registry *RobotRegistry, cfg phaseThreeRobo
 		return handleRobotInsights(ctx, cfg)
 	})
 	register("robot-next", cfg.RobotNextFlag, "Output only the single top recommendation", func(ctx RobotContext) error {
-		return handleRobotTriage(ctx, cfg)
+		return handleRobotNext(ctx, cfg)
 	})
 	register("robot-triage", cfg.RobotTriageFlag, "Output unified triage as JSON", func(ctx RobotContext) error {
 		return handleRobotTriage(ctx, cfg)
@@ -1401,6 +1706,9 @@ func registerPhaseThreeRobotHandlers(registry *RobotRegistry, cfg phaseThreeRobo
 	register("robot-file-beads", cfg.RobotFileBeadsFlag, "Output beads that touched a file path as JSON", func(ctx RobotContext) error {
 		return handleRobotFileBeads(ctx, cfg)
 	})
+	register("robot-file-hotspots", cfg.RobotFileHotspotsFlag, "Output files touched by most beads as JSON", func(ctx RobotContext) error {
+		return handleRobotFileHotspots(ctx, cfg)
+	})
 	register("robot-impact", cfg.RobotImpactFlag, "Analyze impact of modifying files", func(ctx RobotContext) error {
 		return handleRobotImpact(ctx, cfg)
 	})
@@ -1429,17 +1737,15 @@ func registerPhaseThreeRobotHandlers(registry *RobotRegistry, cfg phaseThreeRobo
 
 func handleRobotLabelHealth(ctx RobotContext) error {
 	cfg := analysis.DefaultLabelHealthConfig()
-	results := analysis.ComputeAllLabelHealth(ctx.Issues, cfg, time.Now().UTC(), nil)
+	results := analysis.ComputeAllLabelHealth(ctx.Issues, cfg, robotNow(), nil)
 
 	output := struct {
-		GeneratedAt    string                       `json:"generated_at"`
-		DataHash       string                       `json:"data_hash"`
+		RobotEnvelope
 		AnalysisConfig analysis.LabelHealthConfig   `json:"analysis_config"`
 		Results        analysis.LabelAnalysisResult `json:"results"`
 		UsageHints     []string                     `json:"usage_hints"`
 	}{
-		GeneratedAt:    time.Now().UTC().Format(time.RFC3339),
-		DataHash:       ctx.DataHash,
+		RobotEnvelope:  ctx.Envelope(),
 		AnalysisConfig: cfg,
 		Results:        results,
 		UsageHints: []string{
@@ -1459,18 +1765,14 @@ func handleRobotLabelFlow(ctx RobotContext) error {
 	cfg := analysis.DefaultLabelHealthConfig()
 	flow := analysis.ComputeCrossLabelFlow(ctx.Issues, cfg)
 	output := struct {
-		GeneratedAt string                     `json:"generated_at"`
-		DataHash    string                     `json:"data_hash"`
-		LoadStats   *RobotLoadStats            `json:"load_stats,omitempty"` // Present when records were dropped during load (#190)
-		Flow        analysis.CrossLabelFlow    `json:"flow"`
-		Config      analysis.LabelHealthConfig `json:"analysis_config"`
-		UsageHints  []string                   `json:"usage_hints"`
+		RobotEnvelope
+		Flow       analysis.CrossLabelFlow    `json:"flow"`
+		Config     analysis.LabelHealthConfig `json:"analysis_config"`
+		UsageHints []string                   `json:"usage_hints"`
 	}{
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-		DataHash:    ctx.DataHash,
-		LoadStats:   robotLoadStatsFromLastLoad(),
-		Flow:        flow,
-		Config:      cfg,
+		RobotEnvelope: ctx.Envelope(),
+		Flow:          flow,
+		Config:        cfg,
 		UsageHints: []string{
 			"jq '.flow.bottleneck_labels' - labels blocking the most others",
 			"jq '.flow.dependencies[] | select(.issue_count > 0) | {from:.from_label,to:.to_label,count:.issue_count}'",
@@ -1484,7 +1786,7 @@ func handleRobotLabelFlow(ctx RobotContext) error {
 }
 
 func handleRobotLabelAttention(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
-	result := analysis.ComputeLabelAttentionScores(ctx.Issues, analysis.DefaultLabelHealthConfig(), time.Now().UTC())
+	result := analysis.ComputeLabelAttentionScores(ctx.Issues, analysis.DefaultLabelHealthConfig(), robotNow())
 
 	limit := 5
 	if cfg.AttentionLimit != nil {
@@ -1510,9 +1812,7 @@ func handleRobotLabelAttention(ctx RobotContext, cfg phaseThreeRobotHandlerConfi
 		VelocityFactor  float64 `json:"velocity_factor"`
 	}
 	type attentionOutput struct {
-		GeneratedAt string           `json:"generated_at"`
-		DataHash    string           `json:"data_hash"`
-		LoadStats   *RobotLoadStats  `json:"load_stats,omitempty"` // Present when records were dropped during load (#190)
+		RobotEnvelope
 		Limit       int              `json:"limit"`
 		TotalLabels int              `json:"total_labels"`
 		Labels      []attentionLabel `json:"labels"`
@@ -1520,11 +1820,9 @@ func handleRobotLabelAttention(ctx RobotContext, cfg phaseThreeRobotHandlerConfi
 	}
 
 	output := attentionOutput{
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-		DataHash:    ctx.DataHash,
-		LoadStats:   robotLoadStatsFromLastLoad(),
-		Limit:       limit,
-		TotalLabels: result.TotalLabels,
+		RobotEnvelope: ctx.Envelope(),
+		Limit:         limit,
+		TotalLabels:   result.TotalLabels,
 		UsageHints: []string{
 			"jq '.labels[0]' - top attention label details",
 			"jq '.labels[] | select(.blocked_count > 0)' - labels with blocked issues",
@@ -1555,7 +1853,8 @@ func handleRobotLabelAttention(ctx RobotContext, cfg phaseThreeRobotHandlerConfi
 }
 
 func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
-	analyzer := analysis.NewAnalyzer(ctx.Issues)
+	analyzer := ctx.Analyzer()
+	analyzer.SetNow(robotNow())
 	if ctx.DataHashMatchesIssues {
 		analyzer.SeedDataHash(ctx.DataHash)
 	}
@@ -1566,7 +1865,7 @@ func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 	stats := analyzer.Analyze()
 	insights := stats.GenerateInsights(50)
 
-	if velocity := analysis.ComputeProjectVelocity(ctx.Issues, time.Now(), 8); velocity != nil {
+	if velocity := analysis.ComputeProjectVelocity(ctx.Issues, robotNow(), 8); velocity != nil {
 		snapshot := &analysis.VelocitySnapshot{
 			Closed7:   velocity.ClosedLast7Days,
 			Closed30:  velocity.ClosedLast30Days,
@@ -1640,7 +1939,7 @@ func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 	}
 
 	mapLimit := 200
-	if value := os.Getenv("BV_INSIGHTS_MAP_LIMIT"); value != "" {
+	if value := env.InsightsMapLimit.Get(); value != "" {
 		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
 			mapLimit = parsed
 		}
@@ -1669,11 +1968,7 @@ func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 	}
 
 	output := struct {
-		GeneratedAt    string                  `json:"generated_at"`
-		DataHash       string                  `json:"data_hash"`
-		LoadStats      *RobotLoadStats         `json:"load_stats,omitempty"` // Present when records were dropped during load (#190)
-		AsOf           string                  `json:"as_of,omitempty"`
-		AsOfCommit     string                  `json:"as_of_commit,omitempty"`
+		RobotEnvelope
 		AnalysisConfig analysis.AnalysisConfig `json:"analysis_config"`
 		Status         analysis.MetricStatus   `json:"status"`
 		LabelScope     string                  `json:"label_scope,omitempty"`
@@ -1684,13 +1979,9 @@ func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		AdvancedInsights *analysis.AdvancedInsights `json:"advanced_insights,omitempty"`
 		UsageHints       []string                   `json:"usage_hints"`
 	}{
-		GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
-		DataHash:         ctx.DataHash,
-		LoadStats:        robotLoadStatsFromLastLoad(),
-		AsOf:             ctx.AsOf,
-		AsOfCommit:       ctx.AsOfCommit,
+		RobotEnvelope:    ctx.Envelope(),
 		AnalysisConfig:   stats.Config,
-		Status:           stats.Status(),
+		Status:           stabilizeRobotMetricStatusForPinnedClock(stats.Status()),
 		LabelScope:       ctx.LabelScope,
 		LabelContext:     ctx.LabelContext,
 		Insights:         insights,
@@ -1699,7 +1990,7 @@ func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		AdvancedInsights: analyzer.GenerateAdvancedInsightsFromStats(&stats, analysis.DefaultAdvancedInsightsConfig()),
 		UsageHints: []string{
 			"jq '.Bottlenecks[:5] | map(.ID)' - Top 5 bottleneck IDs",
-			"jq '.CriticalPath[:3]' - Top 3 critical path items",
+			"jq '.Keystones[:3]' - Top 3 critical path scores",
 			"jq '.top_what_ifs[] | select(.delta.direct_unblocks > 2)' - High-impact items",
 			"jq '.full_stats.pagerank | to_entries | sort_by(-.value)[:5]' - Top PageRank",
 			"jq '.full_stats.core_number | to_entries | sort_by(-.value)[:5]' - Strongly embedded nodes (k-core)",
@@ -1709,6 +2000,12 @@ func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 			"jq '.advanced_insights.cycle_break' - Cycle break suggestions (bv-181)",
 			"BV_INSIGHTS_MAP_LIMIT=50 bv --robot-insights - Reduce map sizes",
 		},
+	}
+
+	if sourceDateEpochActive() && output.AdvancedInsights.ParallelGain != nil {
+		// Match the core metric status: measured wall time is not reproducible,
+		// even when the analysis itself runs deterministically to completion.
+		output.AdvancedInsights.ParallelGain.Status.DurationMs = 0
 	}
 
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
@@ -1723,17 +2020,42 @@ func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 // surface, which agents rely on as their single bounded entry point.
 const defaultRobotHistoryTimeout = 10 * time.Second
 
+// robotHistoryShutdownGrace bounds how long a timed-out triage invocation
+// waits for a directly spawned, context-bound git child to be killed and
+// reaped. Returning as soon as the deadline fires can let the short-lived bv
+// process exit before exec.CommandContext's cancellation path finishes.
+const robotHistoryShutdownGrace = 2 * time.Second
+
+const maxRobotHistoryTimeoutMillis = int64(math.MaxInt64) / int64(time.Millisecond)
+
+// robotHistoryTimeoutFromMilliseconds converts a user-supplied millisecond
+// count without allowing duration overflow to turn a very large positive
+// timeout into a negative (and therefore unbounded) duration. Values above
+// time.Duration's range saturate at its largest representable duration.
+func robotHistoryTimeoutFromMilliseconds(ms int64) (time.Duration, bool) {
+	if ms < 0 {
+		return 0, false
+	}
+	if ms > maxRobotHistoryTimeoutMillis {
+		return time.Duration(math.MaxInt64), true
+	}
+	return time.Duration(ms) * time.Millisecond, true
+}
+
 // resolveRobotHistoryTimeout returns the history-prologue budget. Precedence:
 // the --robot-history-timeout-ms flag (when explicitly set, i.e. >= 0), then
 // the BV_ROBOT_HISTORY_TIMEOUT_MS environment variable, then the 10s default.
 // A value of 0 disables the bound entirely (legacy run-to-completion).
 func resolveRobotHistoryTimeout(cfg phaseThreeRobotHandlerConfig) time.Duration {
 	if cfg.HistoryTimeoutMs != nil && *cfg.HistoryTimeoutMs >= 0 {
-		return time.Duration(*cfg.HistoryTimeoutMs) * time.Millisecond
+		timeout, _ := robotHistoryTimeoutFromMilliseconds(int64(*cfg.HistoryTimeoutMs))
+		return timeout
 	}
-	if env := strings.TrimSpace(os.Getenv("BV_ROBOT_HISTORY_TIMEOUT_MS")); env != "" {
-		if ms, err := strconv.Atoi(env); err == nil && ms >= 0 {
-			return time.Duration(ms) * time.Millisecond
+	if envVal := strings.TrimSpace(env.RobotHistoryTimeoutMS.Get()); envVal != "" {
+		if ms, err := strconv.ParseInt(envVal, 10, 64); err == nil {
+			if timeout, ok := robotHistoryTimeoutFromMilliseconds(ms); ok {
+				return timeout
+			}
 		}
 	}
 	return defaultRobotHistoryTimeout
@@ -1750,8 +2072,8 @@ func resolveNotReadyLabels(cfg phaseThreeRobotHandlerConfig) []string {
 	raw := ""
 	if cfg.NotReadyLabels != nil && strings.TrimSpace(*cfg.NotReadyLabels) != "" {
 		raw = *cfg.NotReadyLabels
-	} else if env := strings.TrimSpace(os.Getenv("BV_ROBOT_NOT_READY_LABELS")); env != "" {
-		raw = env
+	} else if envVal := strings.TrimSpace(env.RobotNotReadyLabels.Get()); envVal != "" {
+		raw = envVal
 	}
 	if raw == "" {
 		return nil
@@ -1771,13 +2093,17 @@ func resolveNotReadyLabels(cfg phaseThreeRobotHandlerConfig) []string {
 // The report generation runs in a goroutine while this function selects on
 // the result vs. the budget. On timeout it returns (nil, "timeout") and
 // triage proceeds without history — the already-supported degradation path.
-// Crucially the goroutine does NOT leak unbounded work: the correlator is
-// bound to the timed-out context, so every git subprocess it spawned (or
-// would spawn next) is killed via exec.CommandContext, and the goroutine
-// unblocks and exits promptly.
+// Cancellation is propagated to directly spawned git subprocesses through
+// exec.CommandContext. The shutdown grace below gives a currently running
+// direct child and its cmd.Wait path a bounded chance to finish reaping before
+// this function returns. It does not claim that every internal cache or lock
+// wait is context-aware; this caller stops waiting for those paths when the
+// shutdown grace expires, and their goroutine may finish later.
 //
 // The returned status is "ok", "error", or "timeout"; it is surfaced as
-// meta.history_status in the triage output.
+// meta.history_status in the triage output. The caller uses "skipped" instead
+// when SOURCE_DATE_EPOCH requests reproducible output, because racing a git
+// history walk against a wall-clock deadline cannot produce stable bytes.
 func generateTriageHistoryBounded(workDir, beadsPath string, beadInfos []correlation.BeadInfo, limit int, timeout time.Duration) (*correlation.HistoryReport, string) {
 	histCtx := context.Background()
 	cancel := context.CancelFunc(func() {})
@@ -1786,7 +2112,11 @@ func generateTriageHistoryBounded(workDir, beadsPath string, beadInfos []correla
 	}
 	defer cancel()
 
-	correlator := correlation.NewCorrelator(workDir, beadsPath).WithContext(histCtx)
+	correlator, err := newCorrelatorWithFeedback(workDir, beadsPath)
+	if err != nil {
+		return nil, "error"
+	}
+	correlator = correlator.WithContext(histCtx)
 
 	type historyResult struct {
 		report *correlation.HistoryReport
@@ -1805,15 +2135,22 @@ func generateTriageHistoryBounded(workDir, beadsPath string, beadInfos []correla
 		}
 		return res.report, "ok"
 	case <-histCtx.Done():
+		// Cancel explicitly before the deferred cancellation, then give the
+		// report goroutine a bounded opportunity to finish cmd.Wait and reap a
+		// directly spawned, context-killed git child before this short-lived bv
+		// process exits.
+		cancel()
+		shutdownTimer := time.NewTimer(robotHistoryShutdownGrace)
+		defer shutdownTimer.Stop()
+		select {
+		case <-resCh:
+		case <-shutdownTimer.C:
+		}
 		return nil, "timeout"
 	}
 }
 
 func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
-	if cfg.RobotNextFlag != nil && *cfg.RobotNextFlag {
-		return handleRobotNext(ctx, cfg)
-	}
-
 	var historyReport *correlation.HistoryReport
 	historyStatus := "" // empty = history generation not attempted (#166)
 	hasOpenIssues := false
@@ -1824,7 +2161,9 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 		}
 	}
 
-	if hasOpenIssues {
+	if hasOpenIssues && sourceDateEpochActive() {
+		historyStatus = "skipped"
+	} else if hasOpenIssues {
 		workDir, err := ctx.WorkDirOrDefault()
 		if err == nil {
 			if beadsDir, err := loader.GetBeadsDir(""); err == nil {
@@ -1864,8 +2203,13 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 	if ctx.DataHashMatchesIssues {
 		seedHash = ctx.DataHash
 	}
+	// bv-90: accept/ignore feedback tunes the factor weights once enough
+	// samples exist; the payload's feedback block reports whether it applied.
+	feedbackData, feedbackWeights := loadRobotFeedback()
 	triage := analysis.ComputeTriageWithOptionsAndTime(ctx.Issues, analysis.TriageOptions{
 		GroupByTrack:   cfg.RobotTriageByTrackFlag != nil && *cfg.RobotTriageByTrackFlag,
+		Readiness:      ctx.Readiness,
+		CandidateIDs:   ctx.CandidateIDs,
 		GroupByLabel:   cfg.RobotTriageByLabelFlag != nil && *cfg.RobotTriageByLabelFlag,
 		WaitForPhase2:  true,
 		UseFastConfig:  true,
@@ -1873,9 +2217,13 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 		RootIssueID:    rootIssueID,
 		SeedDataHash:   seedHash,
 		NotReadyLabels: resolveNotReadyLabels(cfg),
+		Weights:        feedbackWeights,
 	}, now)
 	stabilizeRobotTriageForPinnedClock(&triage)
 	triage.Meta.HistoryStatus = historyStatus
+	if !ctx.claimsProven() {
+		suppressUnprovenTriageClaims(&triage)
+	}
 
 	// --brief (#183): emit only the decision-relevant fields agents actually
 	// consume at session start (id/title/status, blockers/unblocks, claim
@@ -1886,30 +2234,20 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 	}
 
 	var feedbackInfo *analysis.FeedbackJSON
-	if beadsDir, err := loader.GetBeadsDir(""); err == nil {
-		if feedbackData, err := analysis.LoadFeedback(beadsDir); err == nil && len(feedbackData.Events) > 0 {
-			info := feedbackData.ToJSON()
-			feedbackInfo = &info
-		}
+	if feedbackData != nil && len(feedbackData.Events) > 0 {
+		info := feedbackData.ToJSON()
+		feedbackInfo = &info
 	}
 
 	output := struct {
-		GeneratedAt string                 `json:"generated_at"`
-		DataHash    string                 `json:"data_hash"`
-		LoadStats   *RobotLoadStats        `json:"load_stats,omitempty"` // Present when records were dropped during load (#190)
-		AsOf        string                 `json:"as_of,omitempty"`
-		AsOfCommit  string                 `json:"as_of_commit,omitempty"`
-		Triage      analysis.TriageResult  `json:"triage"`
-		Feedback    *analysis.FeedbackJSON `json:"feedback,omitempty"`
-		UsageHints  []string               `json:"usage_hints"`
+		RobotEnvelope
+		Triage     analysis.TriageResult  `json:"triage"`
+		Feedback   *analysis.FeedbackJSON `json:"feedback,omitempty"`
+		UsageHints []string               `json:"usage_hints"`
 	}{
-		GeneratedAt: now.Format(time.RFC3339),
-		DataHash:    ctx.DataHash,
-		LoadStats:   robotLoadStatsFromLastLoad(),
-		AsOf:        ctx.AsOf,
-		AsOfCommit:  ctx.AsOfCommit,
-		Triage:      triage,
-		Feedback:    feedbackInfo,
+		RobotEnvelope: ctx.Envelope(),
+		Triage:        triage,
+		Feedback:      feedbackInfo,
 		UsageHints: []string{
 			"jq '.triage.quick_ref.top_picks[:3]' - Top 3 picks for immediate work",
 			"jq '.triage.recommendations[3:10] | map({id,title,score})' - Next candidates after top picks",
@@ -1936,13 +2274,14 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 // briefTriageRecommendation carries only the fields agents use for work
 // selection (#183): identity, claim state, and the dependency edges.
 type briefTriageRecommendation struct {
-	ID        string   `json:"id"`
-	Title     string   `json:"title"`
-	Status    string   `json:"status"`
-	Assignee  string   `json:"assignee,omitempty"`
-	Score     float64  `json:"score"`
-	Unblocks  []string `json:"unblocks,omitempty"`
-	BlockedBy []string `json:"blocked_by,omitempty"`
+	ID        string             `json:"id"`
+	Title     string             `json:"title"`
+	Status    string             `json:"status"`
+	Assignee  string             `json:"assignee,omitempty"`
+	Score     float64            `json:"score"`
+	Unblocks  []string           `json:"unblocks,omitempty"`
+	BlockedBy []string           `json:"blocked_by,omitempty"`
+	Actions   model.IssueActions `json:"actions"`
 }
 
 // briefTriageOutput is the compact --robot-triage --brief payload (#183).
@@ -1951,11 +2290,7 @@ type briefTriageRecommendation struct {
 // recommendation to briefTriageRecommendation. Score breakdowns, project
 // health, commands, feedback, and usage hints are omitted.
 type briefTriageOutput struct {
-	GeneratedAt     string                      `json:"generated_at"`
-	DataHash        string                      `json:"data_hash"`
-	LoadStats       *RobotLoadStats             `json:"load_stats,omitempty"` // Present when records were dropped during load (#190)
-	AsOf            string                      `json:"as_of,omitempty"`
-	AsOfCommit      string                      `json:"as_of_commit,omitempty"`
+	RobotEnvelope
 	Brief           bool                        `json:"brief"`
 	QuickRef        analysis.QuickRef           `json:"quick_ref"`
 	Recommendations []briefTriageRecommendation `json:"recommendations"`
@@ -1974,14 +2309,11 @@ func encodeBriefTriage(ctx RobotContext, triage analysis.TriageResult, now time.
 			Score:     rec.Score,
 			Unblocks:  rec.UnblocksIDs,
 			BlockedBy: rec.BlockedBy,
+			Actions:   rec.Actions,
 		})
 	}
 	output := briefTriageOutput{
-		GeneratedAt:     now.Format(time.RFC3339),
-		DataHash:        ctx.DataHash,
-		LoadStats:       robotLoadStatsFromLastLoad(),
-		AsOf:            ctx.AsOf,
-		AsOfCommit:      ctx.AsOfCommit,
+		RobotEnvelope:   ctx.Envelope(),
 		Brief:           true,
 		QuickRef:        triage.QuickRef,
 		Recommendations: recs,
@@ -2011,8 +2343,6 @@ type robotNextDiagnosticPick struct {
 
 type robotNextOutput struct {
 	RobotEnvelope
-	AsOf              string                   `json:"as_of,omitempty"`
-	AsOfCommit        string                   `json:"as_of_commit,omitempty"`
 	Actionable        bool                     `json:"actionable"`
 	Phase2Ready       bool                     `json:"phase2_ready"`
 	Status            analysis.MetricStatus    `json:"status"`
@@ -2025,6 +2355,7 @@ type robotNextOutput struct {
 	DiagnosticTopPick *robotNextDiagnosticPick `json:"diagnostic_top_pick,omitempty"`
 	ClaimCmd          string                   `json:"claim_command,omitempty"`
 	ShowCmd           string                   `json:"show_command,omitempty"`
+	Actions           *model.IssueActions      `json:"actions,omitempty"`
 	Degraded          []robotNextDegradation   `json:"degraded,omitempty"`
 	UsageHints        []string                 `json:"usage_hints,omitempty"`
 }
@@ -2037,7 +2368,7 @@ func robotNextIssueIndex(issues []model.Issue) map[string]model.Issue {
 	return issueByID
 }
 
-func robotNextClaimabilityReasons(pick analysis.TopPick, issueByID map[string]model.Issue, now time.Time) []string {
+func robotNextClaimabilityReasons(pick analysis.TopPick, issueByID map[string]model.Issue, readiness *model.ReadinessIndex, now time.Time) []string {
 	issue, ok := issueByID[pick.ID]
 	if !ok {
 		return []string{fmt.Sprintf("%s is absent from loaded Beads records", pick.ID)}
@@ -2059,28 +2390,15 @@ func robotNextClaimabilityReasons(pick analysis.TopPick, issueByID map[string]mo
 		reasons = append(reasons, fmt.Sprintf("%s is deferred until %s", pick.ID, issue.DeferUntil.UTC().Format(time.RFC3339)))
 	}
 
-	var openBlockers []string
-	for _, dep := range issue.Dependencies {
-		if dep == nil || !dep.Type.IsBlocking() {
-			continue
-		}
-		blockerID := strings.TrimSpace(dep.DependsOnID)
-		if blockerID == "" {
-			openBlockers = append(openBlockers, "<missing blocker id>")
-			continue
-		}
-		blocker, ok := issueByID[blockerID]
-		if !ok {
-			openBlockers = append(openBlockers, blockerID+" (missing)")
-			continue
-		}
-		if blocker.Status != model.StatusClosed && blocker.Status != model.StatusTombstone {
-			openBlockers = append(openBlockers, blockerID)
-		}
-	}
+	openBlockers := readiness.Blockers(issue.ID)
 	if len(openBlockers) > 0 {
-		sort.Strings(openBlockers)
 		reasons = append(reasons, fmt.Sprintf("%s is blocked by %s", pick.ID, strings.Join(openBlockers, ", ")))
+	}
+	if readiness.DependencyState(issue.ID) == model.DependenciesUnknown {
+		reasons = append(reasons, "dependency authority is missing or unresolved")
+	}
+	if readiness.HasOpenChildren(issue.ID) {
+		reasons = append(reasons, "parent still has open children")
 	}
 
 	return reasons
@@ -2096,16 +2414,19 @@ func robotNextDiagnosticFromPick(pick analysis.TopPick) robotNextDiagnosticPick 
 	}
 }
 
-func robotNextClaimablePick(picks []analysis.TopPick, issues []model.Issue, now time.Time) (analysis.TopPick, *robotNextDiagnosticPick, []string, bool) {
+func robotNextClaimablePick(picks []analysis.TopPick, issues []model.Issue, readiness *model.ReadinessIndex, now time.Time) (analysis.TopPick, *robotNextDiagnosticPick, []string, bool) {
 	if len(picks) == 0 {
 		return analysis.TopPick{}, nil, nil, false
 	}
 
 	issueByID := robotNextIssueIndex(issues)
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(issues)
+	}
 	firstDiagnostic := robotNextDiagnosticFromPick(picks[0])
 	var firstUnsafeReasons []string
 	for _, pick := range picks {
-		reasons := robotNextClaimabilityReasons(pick, issueByID, now)
+		reasons := robotNextClaimabilityReasons(pick, issueByID, readiness, now)
 		if len(reasons) == 0 {
 			return pick, &firstDiagnostic, nil, true
 		}
@@ -2117,6 +2438,28 @@ func robotNextClaimablePick(picks []analysis.TopPick, issues []model.Issue, now 
 	return analysis.TopPick{}, &firstDiagnostic, firstUnsafeReasons, false
 }
 
+// loadRobotFeedback loads .beads/feedback.json for the current workspace and
+// returns it together with the feedback-adjusted factor weights when enough
+// accept/ignore samples exist to apply them (analysis.MinFeedbackSamples).
+// A missing or unreadable file yields (nil, nil) so scoring uses the defaults.
+// Every scoring surface (triage, next, priority, TUI hints) goes through the
+// same rule so an agent's accept/ignore history changes what it is told next.
+func loadRobotFeedback() (*analysis.FeedbackData, *analysis.Weights) {
+	beadsDir, err := loader.GetBeadsDir("")
+	if err != nil {
+		return nil, nil
+	}
+	fb, err := analysis.LoadFeedback(beadsDir)
+	if err != nil || fb == nil {
+		return nil, nil
+	}
+	if !fb.Applies() {
+		return fb, nil
+	}
+	w := fb.Weights()
+	return fb, &w
+}
+
 func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 	var rootIssueID string
 	if cfg.GraphRoot != nil && *cfg.GraphRoot != "" {
@@ -2124,18 +2467,20 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 	}
 
 	now := robotNow()
+	_, feedbackWeights := loadRobotFeedback()
 	triage := analysis.ComputeTriageWithOptionsAndTime(ctx.Issues, analysis.TriageOptions{
 		WaitForPhase2:  true,
+		Readiness:      ctx.Readiness,
+		CandidateIDs:   ctx.CandidateIDs,
 		UseFastConfig:  true,
 		RootIssueID:    rootIssueID,
 		NotReadyLabels: resolveNotReadyLabels(cfg),
+		Weights:        feedbackWeights,
 	}, now)
 	stabilizeRobotTriageForPinnedClock(&triage)
 
 	output := robotNextOutput{
-		RobotEnvelope: NewRobotEnvelope(ctx.DataHash),
-		AsOf:          ctx.AsOf,
-		AsOfCommit:    ctx.AsOfCommit,
+		RobotEnvelope: ctx.Envelope(),
 		Phase2Ready:   triage.Meta.Phase2Ready,
 		Status:        triage.Status,
 		UsageHints: []string{
@@ -2143,6 +2488,20 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 			"No claim_command is emitted unless the item is open, unblocked, unassigned, and triage metrics are ready.",
 			"Inspect .status for skipped, timeout, or pending graph phases.",
 		},
+	}
+	if !ctx.claimsProven() {
+		output.Message = "No claim command emitted because source authority is incomplete or stale"
+		if len(triage.QuickRef.TopPicks) > 0 {
+			diagnostic := robotNextDiagnosticFromPick(triage.QuickRef.TopPicks[0])
+			output.DiagnosticTopPick = &diagnostic
+		}
+		output.Degraded = []robotNextDegradation{{Code: "source_authority_incomplete", Severity: "warning",
+			Message: "Readiness is provisional; inspect source_authority for failed sources, dropped records, or stale fallback.",
+			Repair:  "Restore or refresh the affected sources and rerun the command before claiming work."}}
+		if err := ctx.EncoderOrDefault().Encode(output); err != nil {
+			return fmt.Errorf("encoding robot-next: %w", err)
+		}
+		return nil
 	}
 
 	if len(triage.QuickRef.TopPicks) == 0 {
@@ -2159,7 +2518,7 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 		return nil
 	}
 
-	top, diagnostic, unsafePickReasons, ok := robotNextClaimablePick(triage.QuickRef.TopPicks, ctx.Issues, now)
+	top, diagnostic, unsafePickReasons, ok := robotNextClaimablePick(triage.QuickRef.TopPicks, ctx.Issues, ctx.Readiness, now)
 	if !ok {
 		output.Message = "No claim command emitted because the top recommendation was not claim-safe"
 		output.DiagnosticTopPick = diagnostic
@@ -2190,14 +2549,28 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 		return nil
 	}
 
+	issue := robotNextIssueIndex(ctx.Issues)[top.ID]
+	actions := issue.Actions(true)
+	output.Actions = &actions
+	if actions.Show != nil {
+		output.ShowCmd = actions.Show.Shell
+	}
+	if actions.Claim == nil {
+		output.Message = "No claim command emitted: " + actions.UnavailableReason
+		output.DiagnosticTopPick = diagnostic
+		output.Degraded = []robotNextDegradation{{Code: "live_action_route_unavailable", Severity: "info", Message: actions.UnavailableReason}}
+		if err := ctx.EncoderOrDefault().Encode(output); err != nil {
+			return fmt.Errorf("encoding robot-next: %w", err)
+		}
+		return nil
+	}
 	output.Actionable = true
 	output.ID = top.ID
 	output.Title = top.Title
 	output.Score = top.Score
 	output.Reasons = top.Reasons
 	output.Unblocks = top.Unblocks
-	output.ClaimCmd = fmt.Sprintf("br update %s --status=in_progress", top.ID)
-	output.ShowCmd = fmt.Sprintf("br show %s", top.ID)
+	output.ClaimCmd = actions.Claim.Shell
 
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding robot-next: %w", err)
@@ -2231,7 +2604,7 @@ func handleRobotHistory(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 		opts.Limit = *cfg.HistoryLimit
 	}
 	if cfg.HistorySince != nil && strings.TrimSpace(*cfg.HistorySince) != "" {
-		since, err := recipe.ParseRelativeTime(*cfg.HistorySince, time.Now())
+		since, err := recipe.ParseRelativeTime(*cfg.HistorySince, robotNow())
 		if err != nil {
 			return fmt.Errorf("parsing --history-since: %w", err)
 		}
@@ -2249,20 +2622,20 @@ func handleRobotHistory(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 		}
 	}
 
-	report, err := correlation.NewCorrelator(workDir, beadsPath).GenerateReportCached(beadInfos, opts)
+	correlator, err := newCorrelatorWithFeedback(workDir, beadsPath)
+	if err != nil {
+		return err
+	}
+	report, err := correlator.GenerateReportCached(beadInfos, opts)
 	if err != nil {
 		return fmt.Errorf("generating history report: %w", err)
 	}
+	report.GeneratedAt = robotNow()
 
 	if cfg.MinConfidence != nil && *cfg.MinConfidence > 0 {
 		scorer := correlation.NewScorer()
 		report.Histories = scorer.FilterHistoriesByConfidence(report.Histories, *cfg.MinConfidence)
-		report.CommitIndex = make(correlation.CommitIndex)
-		for beadID, history := range report.Histories {
-			for _, commit := range history.Commits {
-				report.CommitIndex[commit.SHA] = append(report.CommitIndex[commit.SHA], beadID)
-			}
-		}
+		report.CommitIndex = correlation.BuildCommitIndex(report.Histories)
 		report.Stats.BeadsWithCommits = 0
 		for _, history := range report.Histories {
 			if len(history.Commits) > 0 {
@@ -2271,14 +2644,25 @@ func handleRobotHistory(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 		}
 	}
 
+	// Same top-level keys as the report plus the shared envelope (source,
+	// scope, as_of). Copy fields rather than embedding: HistoryReport defines
+	// generated_at and data_hash too, and colliding embedded keys are dropped.
 	output := struct {
-		correlation.HistoryReport
-		OutputFormat string `json:"output_format,omitempty"`
-		Version      string `json:"version,omitempty"`
+		RobotEnvelope
+		GitRange        string                             `json:"git_range"`
+		LatestCommitSHA string                             `json:"latest_commit_sha,omitempty"`
+		Window          *correlation.HistoryWindow         `json:"window,omitempty"`
+		Stats           correlation.HistoryStats           `json:"stats"`
+		Histories       map[string]correlation.BeadHistory `json:"histories"`
+		CommitIndex     correlation.CommitIndex            `json:"commit_index"`
 	}{
-		HistoryReport: *report,
-		OutputFormat:  robotOutputFormat,
-		Version:       version.Version,
+		RobotEnvelope:   ctx.EnvelopeWithHash(report.DataHash),
+		GitRange:        report.GitRange,
+		LatestCommitSHA: report.LatestCommitSHA,
+		Window:          report.Window,
+		Stats:           report.Stats,
+		Histories:       report.Histories,
+		CommitIndex:     report.CommitIndex,
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding history report: %w", err)
@@ -2310,7 +2694,31 @@ func buildCorrelationBeadInfos(issues []model.Issue) []correlation.BeadInfo {
 	return beadInfos
 }
 
+// generateCorrelationReport builds the feedback-aware history report every
+// read path (history, explain, orphans, related, impact network, causality)
+// consumes: stored rejections are absent from it and confirmations are pinned.
 func generateCorrelationReport(workDir string, issues []model.Issue, opts correlation.CorrelatorOptions) (*correlation.HistoryReport, error) {
+	_, beadsPath, err := resolveCorrelationBeadsPath(workDir)
+	if err != nil {
+		return nil, err
+	}
+	correlator, err := newCorrelatorWithFeedback(workDir, beadsPath)
+	if err != nil {
+		return nil, err
+	}
+	report, err := correlator.GenerateReportCached(buildCorrelationBeadInfos(issues), opts)
+	if err != nil {
+		return nil, fmt.Errorf("generating history report: %w", err)
+	}
+	return report, nil
+}
+
+// generateRawCorrelationReport builds the history report WITHOUT applying the
+// feedback store. Only the confirm/reject handler uses it: feedback is a
+// decision about a raw correlation, so the target must still be resolvable
+// after an earlier rejection (letting a rejection be flipped) and orig_conf
+// must record the strategy confidence, not a previously pinned 1.0.
+func generateRawCorrelationReport(workDir string, issues []model.Issue, opts correlation.CorrelatorOptions) (*correlation.HistoryReport, error) {
 	_, beadsPath, err := resolveCorrelationBeadsPath(workDir)
 	if err != nil {
 		return nil, err
@@ -2320,6 +2728,17 @@ func generateCorrelationReport(workDir string, issues []model.Issue, opts correl
 		return nil, fmt.Errorf("generating history report: %w", err)
 	}
 	return report, nil
+}
+
+// newCorrelatorWithFeedback builds the correlator used by every read path, with
+// the correlation feedback store attached so confirm/reject decisions shape
+// histories, the commit index and stats (feedback loop, C4).
+func newCorrelatorWithFeedback(workDir, beadsPath string) (*correlation.Correlator, error) {
+	feedbackStore, err := loadCorrelationFeedbackStore(workDir)
+	if err != nil {
+		return nil, err
+	}
+	return correlation.NewCorrelator(workDir, beadsPath).WithFeedbackStore(feedbackStore), nil
 }
 
 func loadCorrelationFeedbackStore(workDir string) (*correlation.FeedbackStore, error) {
@@ -2404,7 +2823,7 @@ func handleRobotCorrelationStats(ctx RobotContext) error {
 		Version      string `json:"version,omitempty"`
 	}{
 		FeedbackStats: feedbackStore.GetStats(),
-		GeneratedAt:   time.Now().UTC().Format(time.RFC3339),
+		GeneratedAt:   robotNow().Format(time.RFC3339),
 		OutputFormat:  robotOutputFormat,
 		Version:       version.Version,
 	}
@@ -2433,7 +2852,10 @@ func handleRobotExplainCorrelation(ctx RobotContext, cfg phaseThreeRobotHandlerC
 		return err
 	}
 
-	report, err := generateCorrelationReport(workDir, ctx.Issues, correlation.CorrelatorOptions{BeadID: beadID})
+	// Explain the raw strategy score: a rejected pair is removed from the
+	// feedback-applied report, but the user asking "why was this correlated?"
+	// still needs the signals plus the stored decision.
+	report, err := generateRawCorrelationReport(workDir, ctx.Issues, correlation.CorrelatorOptions{BeadID: beadID})
 	if err != nil {
 		return fmt.Errorf("generating report: %w", err)
 	}
@@ -2455,7 +2877,8 @@ func handleRobotExplainCorrelation(ctx RobotContext, cfg phaseThreeRobotHandlerC
 
 	explanation := correlation.NewScorer().BuildExplanation(*targetCommit, beadID)
 	if fb, ok := feedbackStore.Get(targetCommit.SHA, beadID); ok {
-		explanation.Recommendation = fmt.Sprintf("Already has feedback: %s", fb.Type)
+		explanation.Feedback = &fb
+		explanation.Recommendation = describeCorrelationFeedback(fb)
 	}
 	if err := ctx.EncoderOrDefault().Encode(explanation); err != nil {
 		return fmt.Errorf("encoding explanation: %w", err)
@@ -2489,7 +2912,7 @@ func handleRobotCorrelationFeedback(ctx RobotContext, cfg phaseThreeRobotHandler
 		return err
 	}
 
-	report, err := generateCorrelationReport(workDir, ctx.Issues, correlation.CorrelatorOptions{BeadID: beadID})
+	report, err := generateRawCorrelationReport(workDir, ctx.Issues, correlation.CorrelatorOptions{BeadID: beadID})
 	if err != nil {
 		return fmt.Errorf("generating report: %w", err)
 	}
@@ -2552,10 +2975,10 @@ func handleRobotFileRelations(ctx RobotContext, cfg phaseThreeRobotHandlerConfig
 		return err
 	}
 
-	issues, err := datasource.LoadIssues(workDir)
-	if err != nil {
-		return fmt.Errorf("loading beads: %w", err)
-	}
+	// Use the dispatch context's issue set: it already carries --as-of,
+	// --label, --recipe, and --repo scoping. Reloading the working tree here
+	// silently bypassed all four (reality check 2026-09-01, gap 2).
+	issues := ctx.Issues
 	beadsDir, err := loader.GetBeadsDir("")
 	if err != nil {
 		return fmt.Errorf("getting beads directory: %w", err)
@@ -2574,7 +2997,11 @@ func handleRobotFileRelations(ctx RobotContext, cfg phaseThreeRobotHandlerConfig
 	if cfg.HistoryLimit != nil {
 		limit = *cfg.HistoryLimit
 	}
-	report, err := correlation.NewCorrelator(workDir, beadsPath).GenerateReportCached(beadInfos, correlation.CorrelatorOptions{Limit: limit})
+	correlator, err := newCorrelatorWithFeedback(workDir, beadsPath)
+	if err != nil {
+		return err
+	}
+	report, err := correlator.GenerateReportCached(beadInfos, correlation.CorrelatorOptions{Limit: limit})
 	if err != nil {
 		return fmt.Errorf("generating history report: %w", err)
 	}
@@ -2596,7 +3023,7 @@ func handleRobotFileRelations(ctx RobotContext, cfg phaseThreeRobotHandlerConfig
 		Threshold    float64                     `json:"threshold"`
 		RelatedFiles []correlation.CoChangeEntry `json:"related_files"`
 	}{
-		RobotEnvelope: NewRobotEnvelope(report.DataHash),
+		RobotEnvelope: ctx.EnvelopeWithHash(report.DataHash),
 		FilePath:      result.FilePath,
 		TotalCommits:  result.TotalCommits,
 		Threshold:     result.Threshold,
@@ -2626,7 +3053,7 @@ func handleRobotOrphans(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 		return err
 	}
 
-	orphanReport, err := correlation.NewOrphanDetector(report, workDir).DetectOrphans(correlation.ExtractOptions{Limit: limit})
+	orphanReport, err := correlation.NewOrphanDetectorAt(report, workDir, robotNow()).DetectOrphans(correlation.ExtractOptions{Limit: limit})
 	if err != nil {
 		return fmt.Errorf("detecting orphans: %w", err)
 	}
@@ -2637,17 +3064,27 @@ func handleRobotOrphans(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 	}
 	filterOrphanReportByMinScore(orphanReport, minScore)
 
+	// Copy fields rather than embedding: OrphanReport defines generated_at and
+	// data_hash too, and encoding/json drops colliding embedded keys silently.
 	output := struct {
-		*correlation.OrphanReport
-		OutputFormat string `json:"output_format,omitempty"`
-		Version      string `json:"version,omitempty"`
+		RobotEnvelope
+		GitRange   string                        `json:"git_range"`
+		Window     correlation.OrphanWindow      `json:"window"`
+		Stats      correlation.OrphanReportStats `json:"stats"`
+		Candidates []correlation.OrphanCandidate `json:"candidates"`
+		ByBead     map[string][]string           `json:"by_bead,omitempty"`
+		UsageHints []string                      `json:"usage_hints"`
 	}{
-		OrphanReport: orphanReport,
-		OutputFormat: robotOutputFormat,
-		Version:      version.Version,
+		RobotEnvelope: ctx.EnvelopeWithHash(orphanReport.DataHash),
+		GitRange:      orphanReport.GitRange,
+		Window:        orphanReport.Window,
+		Stats:         orphanReport.Stats,
+		Candidates:    orphanReport.Candidates,
+		ByBead:        orphanReport.ByBead,
+		UsageHints:    orphanReport.UsageHints,
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
-		return fmt.Errorf("encoding orphan report: %w", err)
+		return fmt.Errorf("encoding orphans: %w", err)
 	}
 	return nil
 }
@@ -2719,7 +3156,7 @@ func handleRobotFileBeads(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) er
 		OpenBeads   []correlation.BeadReference `json:"open_beads"`
 		ClosedBeads []correlation.BeadReference `json:"closed_beads"`
 	}{
-		RobotEnvelope: NewRobotEnvelope(report.DataHash),
+		RobotEnvelope: ctx.EnvelopeWithHash(report.DataHash),
 		FilePath:      *cfg.RobotFileBeadsFlag,
 		TotalBeads:    result.TotalBeads,
 		OpenBeads:     result.OpenBeads,
@@ -2758,7 +3195,7 @@ func handleRobotImpact(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 	for i := range files {
 		files[i] = strings.TrimSpace(files[i])
 	}
-	impactResult := fileLookup.ImpactAnalysis(files)
+	impactResult := fileLookup.ImpactAnalysisAt(files, robotNow())
 
 	output := struct {
 		RobotEnvelope
@@ -2769,7 +3206,7 @@ func handleRobotImpact(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 		Warnings      []string                   `json:"warnings"`
 		AffectedBeads []correlation.AffectedBead `json:"affected_beads"`
 	}{
-		RobotEnvelope: NewRobotEnvelope(report.DataHash),
+		RobotEnvelope: ctx.EnvelopeWithHash(report.DataHash),
 		Files:         impactResult.Files,
 		RiskLevel:     impactResult.RiskLevel,
 		RiskScore:     impactResult.RiskScore,
@@ -2792,10 +3229,10 @@ func handleRobotRelated(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 		return err
 	}
 
-	issues, err := datasource.LoadIssues(workDir)
-	if err != nil {
-		return fmt.Errorf("loading beads: %w", err)
-	}
+	// Use the dispatch context's issue set: it already carries --as-of,
+	// --label, --recipe, and --repo scoping. Reloading the working tree here
+	// silently bypassed all four (reality check 2026-09-01, gap 2).
+	issues := ctx.Issues
 	beadsDir, err := loader.GetBeadsDir("")
 	if err != nil {
 		return fmt.Errorf("getting beads directory: %w", err)
@@ -2814,7 +3251,11 @@ func handleRobotRelated(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 	if cfg.HistoryLimit != nil {
 		limit = *cfg.HistoryLimit
 	}
-	report, err := correlation.NewCorrelator(workDir, beadsPath).GenerateReportCached(beadInfos, correlation.CorrelatorOptions{Limit: limit})
+	correlator, err := newCorrelatorWithFeedback(workDir, beadsPath)
+	if err != nil {
+		return err
+	}
+	report, err := correlator.GenerateReportCached(beadInfos, correlation.CorrelatorOptions{Limit: limit})
 	if err != nil {
 		return fmt.Errorf("generating history report: %w", err)
 	}
@@ -2843,22 +3284,15 @@ func handleRobotRelated(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 		options.IncludeClosed = *cfg.RelatedIncludeClosed
 	}
 
-	result := report.FindRelatedWork(*cfg.RobotRelatedFlag, options)
+	result := report.FindRelatedWorkAt(*cfg.RobotRelatedFlag, options, robotNow())
 	if result == nil {
 		fmt.Fprintf(ctx.StderrOrDefault(), "Bead not found in history: %s\n", *cfg.RobotRelatedFlag)
 		return newReportedRobotHandlerExit(1)
 	}
 
-	output := struct {
-		*correlation.RelatedWorkResult
-		DataHash     string `json:"data_hash"`
-		OutputFormat string `json:"output_format,omitempty"`
-		Version      string `json:"version,omitempty"`
-	}{
-		RelatedWorkResult: result,
-		DataHash:          report.DataHash,
-		OutputFormat:      robotOutputFormat,
-		Version:           version.Version,
+	output, err := withEnvelope(ctx.EnvelopeWithHash(report.DataHash), result)
+	if err != nil {
+		return fmt.Errorf("related work payload: %w", err)
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding related work: %w", err)
@@ -2867,16 +3301,14 @@ func handleRobotRelated(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 }
 
 func handleRobotBlockerChain(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
-	workDir, err := ctx.WorkDirOrDefault()
-	if err != nil {
-		return fmt.Errorf("getting current directory: %w", err)
-	}
-	issues, err := datasource.LoadIssues(workDir)
-	if err != nil {
-		return fmt.Errorf("loading beads: %w", err)
-	}
+	// Use the dispatch context's issue set: it already carries --as-of,
+	// --label, --recipe, and --repo scoping. Reloading the working tree here
+	// silently bypassed all four (reality check 2026-09-01, gap 2).
+	issues := ctx.Issues
 
-	result := analysis.NewAnalyzer(issues).GetBlockerChain(*cfg.RobotBlockerChainFlag)
+	analyzer := analysis.NewAnalyzer(issues)
+	analyzer.SetNow(robotNow())
+	result := analyzer.GetBlockerChain(*cfg.RobotBlockerChainFlag)
 	if result == nil {
 		fmt.Fprintf(ctx.StderrOrDefault(), "Issue not found: %s\n", *cfg.RobotBlockerChainFlag)
 		return newReportedRobotHandlerExit(1)
@@ -2886,7 +3318,7 @@ func handleRobotBlockerChain(ctx RobotContext, cfg phaseThreeRobotHandlerConfig)
 		RobotEnvelope
 		Result *analysis.BlockerChainResult `json:"result"`
 	}{
-		RobotEnvelope: NewRobotEnvelope(analysis.ComputeDataHash(issues)),
+		RobotEnvelope: ctx.EnvelopeWithHash(analysis.ComputeDataHash(issues)),
 		Result:        result,
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
@@ -2912,10 +3344,10 @@ func handleRobotImpactNetwork(ctx RobotContext, cfg phaseThreeRobotHandlerConfig
 	if err != nil {
 		return fmt.Errorf("finding beads file: %w", err)
 	}
-	issues, err := datasource.LoadIssues(workDir)
-	if err != nil {
-		return fmt.Errorf("loading beads: %w", err)
-	}
+	// Use the dispatch context's issue set: it already carries --as-of,
+	// --label, --recipe, and --repo scoping. Reloading the working tree here
+	// silently bypassed all four (reality check 2026-09-01, gap 2).
+	issues := ctx.Issues
 
 	beadInfos := make([]correlation.BeadInfo, len(issues))
 	for i, issue := range issues {
@@ -2926,12 +3358,16 @@ func handleRobotImpactNetwork(ctx RobotContext, cfg phaseThreeRobotHandlerConfig
 	if cfg.HistoryLimit != nil {
 		limit = *cfg.HistoryLimit
 	}
-	report, err := correlation.NewCorrelator(workDir, beadsPath).GenerateReportCached(beadInfos, correlation.CorrelatorOptions{Limit: limit})
+	correlator, err := newCorrelatorWithFeedback(workDir, beadsPath)
+	if err != nil {
+		return err
+	}
+	report, err := correlator.GenerateReportCached(beadInfos, correlation.CorrelatorOptions{Limit: limit})
 	if err != nil {
 		return fmt.Errorf("generating history report: %w", err)
 	}
 
-	network := correlation.NewNetworkBuilderWithIssues(report, issues).Build()
+	network := correlation.NewNetworkBuilderWithIssues(report, issues).BuildAt(robotNow())
 	beadID := ""
 	if *cfg.RobotImpactNetworkFlag != "all" {
 		beadID = *cfg.RobotImpactNetworkFlag
@@ -2953,14 +3389,9 @@ func handleRobotImpactNetwork(ctx RobotContext, cfg phaseThreeRobotHandlerConfig
 		depth = 3
 	}
 
-	output := struct {
-		*correlation.ImpactNetworkResult
-		OutputFormat string `json:"output_format,omitempty"`
-		Version      string `json:"version,omitempty"`
-	}{
-		ImpactNetworkResult: network.ToResult(beadID, depth),
-		OutputFormat:        robotOutputFormat,
-		Version:             version.Version,
+	output, err := withEnvelope(ctx.EnvelopeWithHash(report.DataHash), network.ToResult(beadID, depth))
+	if err != nil {
+		return fmt.Errorf("impact network payload: %w", err)
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding impact network: %w", err)
@@ -2973,21 +3404,44 @@ func handleRobotCausality(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) er
 	if err != nil {
 		return fmt.Errorf("getting current directory: %w", err)
 	}
-	if err := correlation.ValidateRepository(workDir); err != nil {
-		return err
+	if ctx.AsOfCommit == "" {
+		if err := correlation.ValidateRepository(workDir); err != nil {
+			return err
+		}
 	}
 
-	issues, err := datasource.LoadIssues(workDir)
-	if err != nil {
-		return fmt.Errorf("loading beads: %w", err)
-	}
-	beadsDir, err := loader.GetBeadsDir("")
-	if err != nil {
-		return fmt.Errorf("getting beads directory: %w", err)
-	}
-	beadsPath, err := loader.FindJSONLPath(beadsDir)
-	if err != nil {
-		return fmt.Errorf("finding beads file: %w", err)
+	// Use the dispatch context's issue set: it already carries --as-of,
+	// --label, --recipe, and --repo scoping. Reloading the working tree here
+	// silently bypassed all four (reality check 2026-09-01, gap 2).
+	issues := ctx.Issues
+	var beadsPath string
+	if ctx.AsOfCommit != "" {
+		// The historical loader has already selected the authoritative file at
+		// this revision. Today's preferred filename may not exist there, and
+		// no working-tree beads file is required for a historical query.
+		if ctx.SourceAuthority != nil {
+			for _, source := range ctx.SourceAuthority.Sources {
+				path, matches := strings.CutSuffix(source.SourcePath, "@"+ctx.AsOfCommit)
+				if source.SourceKind == "git" && source.Status == "loaded" && matches && path != "" {
+					if beadsPath != "" {
+						return fmt.Errorf("multiple historical sources for causal analysis")
+					}
+					beadsPath = path
+				}
+			}
+		}
+		if beadsPath == "" {
+			return fmt.Errorf("missing resolved historical source for causal analysis")
+		}
+	} else {
+		beadsDir, err := loader.GetBeadsDir("")
+		if err != nil {
+			return fmt.Errorf("getting beads directory: %w", err)
+		}
+		beadsPath, err = loader.FindJSONLPath(beadsDir)
+		if err != nil {
+			return fmt.Errorf("finding beads file: %w", err)
+		}
 	}
 
 	beadInfos := make([]correlation.BeadInfo, len(issues))
@@ -2999,7 +3453,21 @@ func handleRobotCausality(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) er
 	if cfg.HistoryLimit != nil {
 		limit = *cfg.HistoryLimit
 	}
-	report, err := correlation.NewCorrelator(workDir, beadsPath).GenerateReportCached(beadInfos, correlation.CorrelatorOptions{Limit: limit})
+	correlator, err := newCorrelatorWithFeedback(workDir, beadsPath)
+	if err != nil {
+		return err
+	}
+	opts := correlation.CorrelatorOptions{Limit: limit, CausalityBeadID: *cfg.RobotCausalityFlag, Revision: ctx.AsOfCommit}
+	if cfg.HistorySince != nil && strings.TrimSpace(*cfg.HistorySince) != "" {
+		since, err := recipe.ParseRelativeTime(*cfg.HistorySince, robotNow())
+		if err != nil {
+			return fmt.Errorf("parsing --history-since: %w", err)
+		}
+		if !since.IsZero() {
+			opts.Since = &since
+		}
+	}
+	report, err := correlator.GenerateReportCached(beadInfos, opts)
 	if err != nil {
 		return fmt.Errorf("generating history report: %w", err)
 	}
@@ -3008,23 +3476,18 @@ func handleRobotCausality(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) er
 	for _, issue := range issues {
 		blockerTitles[issue.ID] = issue.Title
 	}
-	result := report.BuildCausalityChain(*cfg.RobotCausalityFlag, correlation.CausalityOptions{
+	result := report.BuildCausalityChainAt(*cfg.RobotCausalityFlag, correlation.CausalityOptions{
 		IncludeCommits: true,
 		BlockerTitles:  blockerTitles,
-	})
+	}, robotNow())
 	if result == nil {
 		fmt.Fprintf(ctx.StderrOrDefault(), "Bead not found: %s\n", *cfg.RobotCausalityFlag)
 		return newReportedRobotHandlerExit(1)
 	}
 
-	output := struct {
-		*correlation.CausalityResult
-		OutputFormat string `json:"output_format,omitempty"`
-		Version      string `json:"version,omitempty"`
-	}{
-		CausalityResult: result,
-		OutputFormat:    robotOutputFormat,
-		Version:         version.Version,
+	output, err := withEnvelope(ctx.EnvelopeWithHash(report.DataHash), result)
+	if err != nil {
+		return fmt.Errorf("causality payload: %w", err)
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding causality result: %w", err)
@@ -3058,7 +3521,7 @@ func handleRobotSprintShow(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) e
 		RobotEnvelope
 		Sprint *model.Sprint `json:"sprint"`
 	}{
-		RobotEnvelope: NewRobotEnvelope(analysis.ComputeDataHash(ctx.Issues)),
+		RobotEnvelope: ctx.EnvelopeWithHash(analysis.ComputeDataHash(ctx.Issues)),
 		Sprint:        found,
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
@@ -3068,32 +3531,41 @@ func handleRobotSprintShow(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) e
 }
 
 func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
-	graphStats := analysis.NewAnalyzer(ctx.Issues).Analyze()
+	analyzer := ctx.Analyzer()
+	analyzer.SetNow(robotNow())
+	graphStats := analyzer.Analyze()
 
-	targetIssues := ctx.Issues
-	if cfg.CapacityLabel != nil && strings.TrimSpace(*cfg.CapacityLabel) != "" {
-		filtered := make([]model.Issue, 0)
-		for _, issue := range ctx.Issues {
+	targetIssues := make([]model.Issue, 0, len(ctx.Issues))
+	for _, issue := range ctx.Issues {
+		if !analyzer.IsCandidate(issue.ID) {
+			continue
+		}
+		if cfg.CapacityLabel != nil && strings.TrimSpace(*cfg.CapacityLabel) != "" {
+			matches := false
 			for _, label := range issue.Labels {
 				if label == *cfg.CapacityLabel {
-					filtered = append(filtered, issue)
+					matches = true
 					break
 				}
 			}
+			if !matches {
+				continue
+			}
 		}
-		targetIssues = filtered
+		targetIssues = append(targetIssues, issue)
 	}
+	sort.Slice(targetIssues, func(i, j int) bool { return targetIssues[i].ID < targetIssues[j].ID })
 
 	openIssues := make([]model.Issue, 0)
 	issueMap := make(map[string]model.Issue, len(targetIssues))
 	for _, issue := range targetIssues {
-		issueMap[issue.ID] = issue
-		if issue.Status != model.StatusClosed {
+		if !issue.Status.IsClosed() && !issue.Status.IsTombstone() {
+			issueMap[issue.ID] = issue
 			openIssues = append(openIssues, issue)
 		}
 	}
 
-	now := time.Now()
+	now := robotNow()
 	agents := 1
 	if cfg.CapacityAgents != nil && *cfg.CapacityAgents > 0 {
 		agents = *cfg.CapacityAgents
@@ -3107,15 +3579,18 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		}
 	}
 
-	blockedBy := make(map[string][]string)
+	// Readiness retains full-source gates; the duration heuristic below uses
+	// only distinct blocking edges within the selected unresolved backlog.
+	readiness := analyzer.Readiness()
 	blocks := make(map[string][]string)
 	for _, issue := range openIssues {
+		seen := make(map[string]bool)
 		for _, dep := range issue.Dependencies {
-			if dep == nil {
+			if dep == nil || !dep.Type.IsBlocking() || seen[dep.DependsOnID] {
 				continue
 			}
 			if _, exists := issueMap[dep.DependsOnID]; exists {
-				blockedBy[issue.ID] = append(blockedBy[issue.ID], dep.DependsOnID)
+				seen[dep.DependsOnID] = true
 				blocks[dep.DependsOnID] = append(blocks[dep.DependsOnID], issue.ID)
 			}
 		}
@@ -3123,40 +3598,12 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 
 	actionable := make([]string, 0)
 	for _, issue := range openIssues {
-		hasOpenBlocker := false
-		for _, depID := range blockedBy[issue.ID] {
-			if dep, ok := issueMap[depID]; ok && dep.Status != model.StatusClosed {
-				hasOpenBlocker = true
-				break
-			}
-		}
-		if !hasOpenBlocker {
+		if readiness.Ready(issue.ID, now) {
 			actionable = append(actionable, issue.ID)
 		}
 	}
 
-	var longestChain []string
-	visited := make(map[string]bool)
-	var dfs func(string, []string)
-	dfs = func(id string, path []string) {
-		if visited[id] {
-			return
-		}
-		visited[id] = true
-		path = append(path, id)
-		if len(path) > len(longestChain) {
-			longestChain = append([]string(nil), path...)
-		}
-		for _, nextID := range blocks[id] {
-			if dep, ok := issueMap[nextID]; ok && dep.Status != model.StatusClosed {
-				dfs(nextID, path)
-			}
-		}
-		visited[id] = false
-	}
-	for _, startID := range actionable {
-		dfs(startID, nil)
-	}
+	longestChain := longestCapacityChain(actionable, blocks)
 
 	serialMinutes := 0
 	for _, id := range longestChain {
@@ -3192,6 +3639,9 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		}
 	}
 	sort.Slice(bottlenecks, func(i, j int) bool {
+		if bottlenecks[i].BlocksCount == bottlenecks[j].BlocksCount {
+			return bottlenecks[i].ID < bottlenecks[j].ID
+		}
 		return bottlenecks[i].BlocksCount > bottlenecks[j].BlocksCount
 	})
 	if len(bottlenecks) > 5 {
@@ -3215,7 +3665,7 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		Actionable        []string     `json:"actionable,omitempty"`
 		Bottlenecks       []bottleneck `json:"bottlenecks,omitempty"`
 	}{
-		RobotEnvelope:     NewRobotEnvelope(analysis.ComputeDataHash(ctx.Issues)),
+		RobotEnvelope:     ctx.EnvelopeWithHash(analysis.ComputeDataHash(ctx.Issues)),
 		Agents:            agents,
 		OpenIssueCount:    len(openIssues),
 		TotalMinutes:      totalMinutes,
@@ -3238,6 +3688,83 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		return fmt.Errorf("encoding capacity: %w", err)
 	}
 	return nil
+}
+
+// longestCapacityChain preserves the first longest path in seed/neighbor order.
+// Acyclic reachable graphs share suffix lengths instead of enumerating paths.
+// Reachable cycles retain the exhaustive simple-path behavior of this heuristic.
+func longestCapacityChain(starts []string, blocks map[string][]string) []string {
+	if len(starts) == 0 {
+		return nil
+	}
+	state := make(map[string]uint8)
+	var postorder []string
+	hasCycle := false
+	var visit func(string)
+	visit = func(id string) {
+		if state[id] == 1 {
+			hasCycle = true
+			return
+		}
+		if state[id] == 2 {
+			return
+		}
+		state[id] = 1
+		for _, nextID := range blocks[id] {
+			visit(nextID)
+		}
+		state[id] = 2
+		postorder = append(postorder, id)
+	}
+	for _, id := range starts {
+		visit(id)
+	}
+	if !hasCycle {
+		length := make(map[string]int, len(postorder))
+		next := make(map[string]string, len(postorder))
+		for _, id := range postorder {
+			length[id] = 1
+			for _, nextID := range blocks[id] {
+				if candidate := 1 + length[nextID]; candidate > length[id] {
+					length[id] = candidate
+					next[id] = nextID
+				}
+			}
+		}
+		start := starts[0]
+		for _, id := range starts[1:] {
+			if length[id] > length[start] {
+				start = id
+			}
+		}
+		path := make([]string, 0, length[start])
+		for id, remaining := start, length[start]; remaining > 0; id, remaining = next[id], remaining-1 {
+			path = append(path, id)
+		}
+		return path
+	}
+
+	var longest []string
+	visited := make(map[string]bool)
+	var dfs func(string, []string)
+	dfs = func(id string, path []string) {
+		if visited[id] {
+			return
+		}
+		visited[id] = true
+		path = append(path, id)
+		if len(path) > len(longest) {
+			longest = append([]string(nil), path...)
+		}
+		for _, nextID := range blocks[id] {
+			dfs(nextID, path)
+		}
+		visited[id] = false
+	}
+	for _, id := range starts {
+		dfs(id, nil)
+	}
+	return longest
 }
 
 func (r *RobotRegistry) Validate() error {
@@ -3364,4 +3891,74 @@ func robotValueActive(value reflect.Value) bool {
 		zero := reflect.Zero(value.Type()).Interface()
 		return !reflect.DeepEqual(value.Interface(), zero)
 	}
+}
+
+// describeCorrelationFeedback renders a stored confirm/reject/ignore decision
+// as the explanation's recommendation line, e.g.
+// "rejected by feedback (cli): touched the file by accident".
+func describeCorrelationFeedback(fb correlation.CorrelationFeedback) string {
+	var verb string
+	switch fb.Type {
+	case correlation.FeedbackConfirm:
+		verb = "confirmed"
+	case correlation.FeedbackReject:
+		verb = "rejected"
+	case correlation.FeedbackIgnore:
+		verb = "ignored"
+	default:
+		verb = string(fb.Type)
+	}
+	s := verb + " by feedback"
+	if by := strings.TrimSpace(fb.FeedbackBy); by != "" {
+		s += " (" + by + ")"
+	}
+	if reason := strings.TrimSpace(fb.Reason); reason != "" {
+		s += ": " + reason
+	}
+	return s
+}
+
+// handleRobotFileHotspots answers "which files do the most beads touch?" from
+// the same shared correlation report as --robot-file-beads and --robot-impact,
+// so the three surfaces never disagree (#184).
+func handleRobotFileHotspots(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
+	if cfg.RobotFileHotspotsFlag == nil {
+		return fmt.Errorf("robot file hotspots flag not configured")
+	}
+
+	workDir, err := ctx.WorkDirOrDefault()
+	if err != nil {
+		return fmt.Errorf("getting current directory: %w", err)
+	}
+	if err := correlation.ValidateRepository(workDir); err != nil {
+		return err
+	}
+
+	limit := 500
+	if cfg.HistoryLimit != nil {
+		limit = *cfg.HistoryLimit
+	}
+	report, err := generateCorrelationReport(workDir, ctx.Issues, correlation.CorrelatorOptions{Limit: limit})
+	if err != nil {
+		return err
+	}
+
+	hotspotsLimit := 10
+	if cfg.HotspotsLimit != nil {
+		hotspotsLimit = *cfg.HotspotsLimit
+	}
+	fileLookup := correlation.NewFileLookup(report)
+	output := struct {
+		RobotEnvelope
+		Hotspots []correlation.FileHotspot  `json:"hotspots"`
+		Stats    correlation.FileIndexStats `json:"stats"`
+	}{
+		RobotEnvelope: ctx.EnvelopeWithHash(report.DataHash),
+		Hotspots:      fileLookup.GetHotspots(hotspotsLimit),
+		Stats:         fileLookup.GetStats(),
+	}
+	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
+		return fmt.Errorf("encoding hotspots: %w", err)
+	}
+	return nil
 }

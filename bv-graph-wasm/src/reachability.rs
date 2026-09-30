@@ -62,29 +62,29 @@ pub fn reachable_to(graph: &DiGraph, target: usize) -> Vec<usize> {
     result
 }
 
-/// Get direct blockers (predecessors) of a node.
+/// Get direct blockers (successors) of a node.
 /// These are issues that must be completed before this node can start.
 pub fn blockers(graph: &DiGraph, node: usize) -> Vec<usize> {
-    graph.predecessors_slice(node).to_vec()
-}
-
-/// Get direct dependents (successors) of a node.
-/// These are issues that depend on this node being completed.
-pub fn dependents(graph: &DiGraph, node: usize) -> Vec<usize> {
     graph.successors_slice(node).to_vec()
 }
 
-/// Check if all predecessors of node are in the closed set.
+/// Get direct dependents (predecessors) of a node.
+/// These are issues that depend on this node being completed.
+pub fn dependents(graph: &DiGraph, node: usize) -> Vec<usize> {
+    graph.predecessors_slice(node).to_vec()
+}
+
+/// Check if all prerequisites (successors) of node are in the closed set.
 /// A node is actionable if all its blockers are closed.
 pub fn is_actionable(graph: &DiGraph, node: usize, closed_set: &[bool]) -> bool {
     graph
-        .predecessors_slice(node)
+        .successors_slice(node)
         .iter()
         .all(|&p| closed_set.get(p).copied().unwrap_or(false))
 }
 
 /// Get all actionable nodes (no open blockers).
-/// An actionable node has all its predecessors in the closed set.
+/// An actionable node has all its prerequisites in the closed set.
 pub fn actionable_nodes(graph: &DiGraph, closed_set: &[bool]) -> Vec<usize> {
     (0..graph.len())
         .filter(|&i| !closed_set.get(i).copied().unwrap_or(false))
@@ -92,10 +92,10 @@ pub fn actionable_nodes(graph: &DiGraph, closed_set: &[bool]) -> Vec<usize> {
         .collect()
 }
 
-/// Get open blockers for a node (predecessors not in closed set).
+/// Get open blockers for a node (successors not in closed set).
 pub fn open_blockers(graph: &DiGraph, node: usize, closed_set: &[bool]) -> Vec<usize> {
     graph
-        .predecessors_slice(node)
+        .successors_slice(node)
         .iter()
         .filter(|&&p| !closed_set.get(p).copied().unwrap_or(false))
         .copied()
@@ -105,7 +105,7 @@ pub fn open_blockers(graph: &DiGraph, node: usize, closed_set: &[bool]) -> Vec<u
 /// Count of open blockers for a node.
 pub fn open_blocker_count(graph: &DiGraph, node: usize, closed_set: &[bool]) -> usize {
     graph
-        .predecessors_slice(node)
+        .successors_slice(node)
         .iter()
         .filter(|&&p| !closed_set.get(p).copied().unwrap_or(false))
         .count()
@@ -241,13 +241,13 @@ mod tests {
 
     #[test]
     fn test_blockers_and_dependents() {
-        // a -> c, b -> c (c has two blockers)
+        // c -> a, c -> b (c has two prerequisites)
         let mut graph = DiGraph::new();
         let a = graph.add_node("a");
         let b = graph.add_node("b");
         let c = graph.add_node("c");
-        graph.add_edge(a, c);
-        graph.add_edge(b, c);
+        graph.add_edge(c, a);
+        graph.add_edge(c, b);
 
         let c_blockers = blockers(&graph, c);
         assert_eq!(c_blockers.len(), 2);
@@ -256,17 +256,19 @@ mod tests {
 
         let a_dependents = dependents(&graph, a);
         assert_eq!(a_dependents, vec![c]);
+        assert!(blockers(&graph, a).is_empty());
+        assert!(dependents(&graph, c).is_empty());
     }
 
     #[test]
     fn test_is_actionable() {
-        // a -> b -> c
+        // a <- b <- c (dependent -> prerequisite)
         let mut graph = DiGraph::new();
         let a = graph.add_node("a");
         let b = graph.add_node("b");
         let c = graph.add_node("c");
-        graph.add_edge(a, b);
-        graph.add_edge(b, c);
+        graph.add_edge(b, a);
+        graph.add_edge(c, b);
 
         // Nothing closed: only a is actionable (no blockers)
         let closed_none = vec![false, false, false];
@@ -286,20 +288,16 @@ mod tests {
 
     #[test]
     fn test_actionable_nodes() {
-        //     a
-        //    / \
-        //   b   c
-        //    \ /
-        //     d
+        // b -> a, c -> a; d depends on both b and c.
         let mut graph = DiGraph::new();
         let a = graph.add_node("a");
         let b = graph.add_node("b");
         let c = graph.add_node("c");
         let d = graph.add_node("d");
-        graph.add_edge(a, b);
-        graph.add_edge(a, c);
-        graph.add_edge(b, d);
-        graph.add_edge(c, d);
+        graph.add_edge(b, a);
+        graph.add_edge(c, a);
+        graph.add_edge(d, b);
+        graph.add_edge(d, c);
 
         // Nothing closed: only a is actionable
         let closed_none = vec![false, false, false, false];
@@ -317,17 +315,19 @@ mod tests {
         let closed_abc = vec![true, true, true, false];
         let actionable = actionable_nodes(&graph, &closed_abc);
         assert_eq!(actionable, vec![d]);
+
+        assert!(actionable_nodes(&graph, &[true; 4]).is_empty());
     }
 
     #[test]
     fn test_open_blockers() {
-        // a -> c, b -> c
+        // c -> a, c -> b
         let mut graph = DiGraph::new();
         let a = graph.add_node("a");
         let b = graph.add_node("b");
         let c = graph.add_node("c");
-        graph.add_edge(a, c);
-        graph.add_edge(b, c);
+        graph.add_edge(c, a);
+        graph.add_edge(c, b);
 
         // Nothing closed: c has 2 open blockers
         let closed_none = vec![false, false, false];
@@ -349,13 +349,13 @@ mod tests {
 
     #[test]
     fn test_open_blocker_count() {
-        // a -> c, b -> c
+        // c -> a, c -> b
         let mut graph = DiGraph::new();
         let a = graph.add_node("a");
         let b = graph.add_node("b");
         let c = graph.add_node("c");
-        graph.add_edge(a, c);
-        graph.add_edge(b, c);
+        graph.add_edge(c, a);
+        graph.add_edge(c, b);
 
         let closed_none = vec![false, false, false];
         assert_eq!(open_blocker_count(&graph, c, &closed_none), 2);
@@ -401,5 +401,9 @@ mod tests {
 
         let to_a = reachable_to(&graph, a);
         assert_eq!(to_a.len(), 3);
+
+        // Generic traversal includes the cycle; scheduling has no open root.
+        assert!(actionable_nodes(&graph, &[false; 3]).is_empty());
+        assert_eq!(actionable_nodes(&graph, &[true, false, false]), vec![c]);
     }
 }

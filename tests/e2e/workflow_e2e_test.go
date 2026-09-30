@@ -104,10 +104,6 @@ func TestWorkflow_NewProjectSetup(t *testing.T) {
 func TestWorkflow_TriageAndRecommendations(t *testing.T) {
 	bv := buildBvBinary(t)
 	projectDir := t.TempDir()
-	beadsDir := filepath.Join(projectDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("mkdir failed: %v", err)
-	}
 
 	// Create a project with mixed priorities and dependencies
 	issues := `{"id": "EPIC-1", "title": "Epic: Feature X", "status": "open", "priority": 0, "issue_type": "epic"}
@@ -115,9 +111,7 @@ func TestWorkflow_TriageAndRecommendations(t *testing.T) {
 {"id": "TASK-2", "title": "Medium Task", "status": "open", "priority": 2, "issue_type": "task", "dependencies": [{"depends_on_id": "TASK-1", "type": "blocks"}]}
 {"id": "TASK-3", "title": "Low Priority Task", "status": "open", "priority": 3, "issue_type": "task", "dependencies": [{"depends_on_id": "TASK-2", "type": "blocks"}]}
 {"id": "BUG-1", "title": "Critical Bug", "status": "open", "priority": 0, "issue_type": "bug"}`
-	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(issues), 0644); err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
+	writeBeads(t, projectDir, issues)
 
 	// Step 1: Get triage recommendations
 	cmd := exec.Command(bv, "--robot-triage")
@@ -166,12 +160,26 @@ func TestWorkflow_TriageAndRecommendations(t *testing.T) {
 		t.Fatalf("invalid JSON: %v", err)
 	}
 
-	// Verify next recommendation has claim command
-	if _, ok := next["claim_command"]; !ok {
-		t.Error("missing claim_command in robot-next output")
+	// This JSONL-only project still supplies a useful ready recommendation,
+	// but cannot authorize commands against an unverified live database.
+	diagnostic, ok := next["diagnostic_top_pick"].(map[string]interface{})
+	if !ok || diagnostic["id"] == "" || diagnostic["id"] == nil {
+		t.Fatalf("unbound next omitted its diagnostic recommendation: %s", out)
 	}
-	if _, ok := next["show_command"]; !ok {
-		t.Error("missing show_command in robot-next output")
+	topPicks, ok := quickRef["top_picks"].([]interface{})
+	if !ok || len(topPicks) == 0 {
+		t.Fatal("triage omitted ready top picks")
+	}
+	triageTop, ok := topPicks[0].(map[string]interface{})
+	if !ok || diagnostic["id"] != triageTop["id"] {
+		t.Errorf("next diagnostic %v differs from triage top %v", diagnostic, topPicks[0])
+	}
+	if next["actionable"] != false || next["id"] != nil || next["claim_command"] != nil || next["show_command"] != nil {
+		t.Errorf("unbound next emitted an actionable command: %s", out)
+	}
+	actions, ok := next["actions"].(map[string]interface{})
+	if !ok || actions["local_id"] != diagnostic["id"] || actions["unavailable_reason"] == "" || actions["unavailable_reason"] == nil || actions["claim"] != nil || actions["show"] != nil {
+		t.Errorf("unbound next lost route diagnostics or invented a command: %s", out)
 	}
 
 	// Step 3: Verify blockers_to_clear in triage

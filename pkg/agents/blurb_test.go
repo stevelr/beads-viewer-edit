@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -37,8 +38,8 @@ func TestContainsBlurb(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:     "has blurb v4",
-			content:  "# My AGENTS.md\n\n<!-- bv-agent-instructions-v4 -->\nSome content\n<!-- end-bv-agent-instructions -->",
+			name:     "has blurb v5",
+			content:  "# My AGENTS.md\n\n<!-- bv-agent-instructions-v5 -->\nSome content\n<!-- end-bv-agent-instructions -->",
 			expected: true,
 		},
 	}
@@ -80,9 +81,9 @@ func TestGetBlurbVersion(t *testing.T) {
 			expected: 3,
 		},
 		{
-			name:     "version 4",
-			content:  "<!-- bv-agent-instructions-v4 -->",
-			expected: 4,
+			name:     "version 5",
+			content:  "<!-- bv-agent-instructions-v5 -->",
+			expected: 5,
 		},
 		{
 			name:     "version 10 (multi-digit)",
@@ -133,6 +134,44 @@ func TestAppendBlurb(t *testing.T) {
 	}
 }
 
+func TestAppendBlurbPreservesLineEndingConvention(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		eol     string
+	}{
+		{name: "LF", content: "# Header\n\nText\n", eol: "\n"},
+		{name: "CRLF", content: "# Header\r\n\r\nText\r\n", eol: "\r\n"},
+		{name: "bare CR", content: "# Header\r\rText\r", eol: "\r"},
+		{name: "no final newline", content: "# Header", eol: "\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := AppendBlurb(tt.content)
+			wantBlurb := strings.ReplaceAll(AgentBlurb, "\n", tt.eol)
+			if !strings.Contains(got, wantBlurb) {
+				t.Fatalf("AppendBlurb() did not use %q throughout generated block", tt.eol)
+			}
+			withoutExpected := strings.ReplaceAll(got, tt.eol, "")
+			if strings.ContainsAny(withoutExpected, "\r\n") {
+				t.Fatalf("AppendBlurb() introduced mixed line endings: %q", got)
+			}
+			updated := UpdateBlurb(got)
+			if second := UpdateBlurb(updated); second != updated {
+				t.Fatal("UpdateBlurb() was not idempotent after preserving line endings")
+			}
+		})
+	}
+}
+
+func TestAppendBlurbEmptyHasNoLeadingBlankLines(t *testing.T) {
+	got := AppendBlurb("")
+	want := AgentBlurb + "\n"
+	if got != want {
+		t.Fatalf("AppendBlurb(\"\") = %q, want generated blurb without a leading blank line", got)
+	}
+}
+
 func TestRemoveBlurb(t *testing.T) {
 	// Content with blurb
 	withBlurb := "# My AGENTS.md\n\nSome content.\n\n" + AgentBlurb + "\n"
@@ -164,7 +203,7 @@ func TestRemoveBlurbPreservesSurroundingLineBreak(t *testing.T) {
 	}
 }
 
-func TestRemoveBlurbUsesEndMarkerAfterStartMarker(t *testing.T) {
+func TestRemoveBlurbRejectsEndMarkerBeforeStart(t *testing.T) {
 	content := "# My AGENTS.md\n\n" +
 		"Example marker that is not an injected blurb:\n" +
 		BlurbEndMarker + "\n\n" +
@@ -173,13 +212,11 @@ func TestRemoveBlurbUsesEndMarkerAfterStartMarker(t *testing.T) {
 		BlurbEndMarker + "\n\n" +
 		"After blurb.\n"
 
-	result := RemoveBlurb(content)
-	expected := "# My AGENTS.md\n\n" +
-		"Example marker that is not an injected blurb:\n" +
-		BlurbEndMarker + "\n\n" +
-		"Before blurb.\nAfter blurb.\n"
-	if result != expected {
-		t.Fatalf("RemoveBlurb() = %q, want %q", result, expected)
+	if result := RemoveBlurb(content); result != content {
+		t.Fatalf("RemoveBlurb() changed malformed content: got %q, want %q", result, content)
+	}
+	if _, err := removeBlurbsChecked(content); err == nil {
+		t.Fatal("checked removal accepted an end marker before a start marker")
 	}
 }
 
@@ -195,13 +232,253 @@ func TestRemoveBlurbPreservesCRLFSeparator(t *testing.T) {
 	}
 }
 
-func TestRemoveBlurbInlineMarkersDoNotAddSeparator(t *testing.T) {
+func TestBareCRBlurbLinesPreserveExactOffsetsAndSeparator(t *testing.T) {
+	content := "# My AGENTS.md\r\rBefore blurb.\r\r" +
+		"<!-- bv-agent-instructions-v1 -->\rGenerated content\r<!-- end-bv-agent-instructions -->\r\r" +
+		"After blurb.\r"
+
+	if !ContainsBlurb(content) {
+		t.Fatal("bare-CR versioned blurb was not detected")
+	}
+	if version := GetBlurbVersion(content); version != 1 {
+		t.Fatalf("GetBlurbVersion()=%d for bare-CR content, want 1", version)
+	}
+	if count, err := inspectBlurbStructure(content); err != nil || count != 1 {
+		t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+	}
+
+	want := "# My AGENTS.md\r\rBefore blurb.\rAfter blurb.\r"
+	if got := RemoveBlurb(content); got != want {
+		t.Fatalf("RemoveBlurb() changed bare-CR offsets or separator:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestInlineMarkersAreNotInstalledBlurbs(t *testing.T) {
 	content := "before<!-- bv-agent-instructions-v1 -->generated<!-- end-bv-agent-instructions -->after"
 
-	result := RemoveBlurb(content)
-	expected := "beforeafter"
-	if result != expected {
-		t.Fatalf("RemoveBlurb() = %q, want %q", result, expected)
+	if ContainsBlurb(content) {
+		t.Fatal("inline marker text must not be treated as an installed blurb")
+	}
+	if result := RemoveBlurb(content); result != content {
+		t.Fatalf("RemoveBlurb() changed inline documentation: got %q, want %q", result, content)
+	}
+}
+
+func TestMarkerAndLegacyExamplesInsideMultilineHTMLCommentsArePreserved(t *testing.T) {
+	versioned := "# Documentation\n\n<!-- hidden example\n" +
+		BlurbStartMarker + "\nexample only\n" + BlurbEndMarker + "\n-->\n\n# Keep\n"
+	if ContainsAnyBlurb(versioned) {
+		t.Fatal("marker-shaped example inside multiline HTML comment counted as installed")
+	}
+	if version := GetBlurbVersion(versioned); version != 0 {
+		t.Fatalf("GetBlurbVersion()=%d for HTML-comment example, want 0", version)
+	}
+	if count, err := inspectBlurbStructure(versioned); err == nil || count != 0 {
+		t.Fatalf("inspectBlurbStructure() count=%d err=%v, want fail-closed stray end marker", count, err)
+	}
+	if got := RemoveBlurb(versioned); got != versioned {
+		t.Fatalf("RemoveBlurb() changed HTML-comment marker example:\n got: %q\nwant: %q", got, versioned)
+	}
+
+	legacy := "# Documentation\n\n<!-- hidden legacy example\n" +
+		"### Using bv as an AI sidecar\n\n" +
+		"--robot-insights\n--robot-plan\n" +
+		"bv already computes the hard parts for you.\n-->\n\n# Keep\n"
+	if ContainsLegacyBlurb(legacy) {
+		t.Fatal("legacy-shaped example inside multiline HTML comment counted as installed")
+	}
+	if got := RemoveLegacyBlurb(legacy); got != legacy {
+		t.Fatalf("RemoveLegacyBlurb() changed HTML-comment legacy example:\n got: %q\nwant: %q", got, legacy)
+	}
+	if got := RemoveBlurb(legacy); got != legacy {
+		t.Fatalf("RemoveBlurb() changed HTML-comment legacy example:\n got: %q\nwant: %q", got, legacy)
+	}
+}
+
+func TestMarkerAndLegacyExamplesInsideHTMLRawBlocksArePreserved(t *testing.T) {
+	tags := []struct {
+		name    string
+		opening string
+		closing string
+	}{
+		{name: "pre", opening: `<PrE class="example">`, closing: "</pRE>"},
+		{name: "script", opening: `<SCRIPT type="text/plain">`, closing: "</script>"},
+		{name: "style", opening: `<Style media="screen">`, closing: "</STYLE>"},
+		{name: "textarea", opening: `<TEXTAREA aria-label="example">`, closing: "</TextArea>"},
+	}
+
+	for _, tt := range tags {
+		t.Run(tt.name+"/versioned", func(t *testing.T) {
+			content := "# Documentation\n\n" + tt.opening + "\n" +
+				BlurbStartMarker + "\nexample only\n" + BlurbEndMarker + "\n" +
+				tt.closing + "\n\n# Keep\n"
+			if ContainsAnyBlurb(content) {
+				t.Fatal("marker-shaped raw-block example counted as installed")
+			}
+			if version := GetBlurbVersion(content); version != 0 {
+				t.Fatalf("GetBlurbVersion()=%d for raw-block example, want 0", version)
+			}
+			if count, err := inspectBlurbStructure(content); err != nil || count != 0 {
+				t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 0, nil", count, err)
+			}
+			if got := RemoveBlurb(content); got != content {
+				t.Fatalf("RemoveBlurb() changed raw-block marker example:\n got: %q\nwant: %q", got, content)
+			}
+		})
+
+		t.Run(tt.name+"/legacy", func(t *testing.T) {
+			content := "# Documentation\n\n" + tt.opening + "\n" +
+				"### Using bv as an AI sidecar\n\n" +
+				"--robot-insights\n--robot-plan\n" +
+				"bv already computes the hard parts for you.\n" +
+				tt.closing + "\n\n# Keep\n"
+			if ContainsLegacyBlurb(content) {
+				t.Fatal("legacy-shaped raw-block example counted as installed")
+			}
+			if got := RemoveLegacyBlurb(content); got != content {
+				t.Fatalf("RemoveLegacyBlurb() changed raw-block legacy example:\n got: %q\nwant: %q", got, content)
+			}
+			if got := RemoveBlurb(content); got != content {
+				t.Fatalf("RemoveBlurb() changed raw-block legacy example:\n got: %q\nwant: %q", got, content)
+			}
+		})
+	}
+
+	real := BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+	if !ContainsBlurb(real) {
+		t.Fatal("top-level standalone marker comments stopped being recognized")
+	}
+	if count, err := inspectBlurbStructure(real); err != nil || count != 1 {
+		t.Fatalf("top-level marker structure count=%d err=%v, want 1, nil", count, err)
+	}
+}
+
+func TestHTMLCommentBytesInFenceInfoDoNotHideFollowingBlurb(t *testing.T) {
+	content := "```text <!-- documentation token\n" +
+		"marker-shaped prose only\n" +
+		"```\n\n" +
+		BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+
+	if !ContainsBlurb(content) {
+		t.Fatal("HTML-comment bytes in a valid fence info string hid the installed blurb that followed")
+	}
+	if count, err := inspectBlurbStructure(content); err != nil || count != 1 {
+		t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+	}
+}
+
+func TestCommonMarkType7HTMLDoesNotHideFollowingInstalledBlurb(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+	}{
+		{name: "trailing prose is not complete tag", line: "<span> documentation"},
+		{name: "complete tag cannot interrupt paragraph", line: "<span>"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := "paragraph continues\n" + tt.line + "\n" +
+				BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+			if !ContainsBlurb(content) {
+				t.Fatal("type-7-like paragraph content hid the installed blurb")
+			}
+			if count, err := inspectBlurbStructure(content); err != nil || count != 1 {
+				t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+			}
+		})
+	}
+}
+
+func TestCommonMarkHTMLBlankRequiresOnlySpacesOrTabs(t *testing.T) {
+	content := "<div>\n\u00a0\n" + BlurbStartMarker + "\nexample only\n" + BlurbEndMarker + "\n\n# Keep\n"
+	if ContainsAnyBlurb(content) {
+		t.Fatal("NBSP incorrectly terminated an HTML block and exposed a marker example")
+	}
+	if got := RemoveBlurb(content); got != content {
+		t.Fatalf("RemoveBlurb() changed marker documentation after NBSP:\n got: %q\nwant: %q", got, content)
+	}
+}
+
+func TestHTMLBlockEndsWithItsMarkdownContainer(t *testing.T) {
+	for _, opening := range []string{
+		"- item\n  <div>\n",
+		"> <div>\n",
+	} {
+		content := opening + BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+		if !ContainsBlurb(content) {
+			t.Fatalf("HTML block escaped its container and hid installed blurb:\n%s", content)
+		}
+		if count, err := inspectBlurbStructure(content); err != nil || count != 1 {
+			t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+		}
+	}
+}
+
+func TestCommonMarkHTMLCommentEndsAtFirstClosingToken(t *testing.T) {
+	content := "<!-- documentation mentions <!-- token -->\n" +
+		BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+	if !ContainsBlurb(content) {
+		t.Fatal("nested-looking comment token hid installed blurb after first close")
+	}
+	if count, err := inspectBlurbStructure(content); err != nil || count != 1 {
+		t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+	}
+}
+
+func TestMarkerExamplesInsideAllHTMLBlockFormsArePreserved(t *testing.T) {
+	tests := []struct {
+		name    string
+		opening string
+		closing string
+	}{
+		{name: "block tag", opening: `<div class="example">`, closing: `</div>`},
+		{name: "table tag", opening: `<table>`, closing: `</table>`},
+		{name: "custom tag", opening: `<agent-example>`, closing: `</agent-example>`},
+		{name: "processing instruction", opening: `<?agent example`, closing: `?>`},
+		{name: "cdata", opening: `<![CDATA[`, closing: `]]>`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := "# Documentation\n\n" + tt.opening + "\n" +
+				BlurbStartMarker + "\nexample only\n" + BlurbEndMarker + "\n" +
+				tt.closing + "\n\n# Keep\n"
+			if ContainsAnyBlurb(content) {
+				t.Fatal("marker-shaped HTML-block example counted as installed")
+			}
+			if count, err := inspectBlurbStructure(content); err != nil || count != 0 {
+				t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 0, nil", count, err)
+			}
+			if got := RemoveBlurb(content); got != content {
+				t.Fatalf("RemoveBlurb() changed HTML-block documentation:\n got: %q\nwant: %q", got, content)
+			}
+		})
+	}
+}
+
+func TestHTMLDeclarationEndsAtFirstGreaterThanAndMarkerContentFailsClosed(t *testing.T) {
+	content := "<!AGENT example\n" + BlurbStartMarker + "\nexample only\n" + BlurbEndMarker + "\n>\n"
+	if count, err := inspectBlurbStructure(content); err == nil || count != 0 {
+		t.Fatalf("inspectBlurbStructure() count=%d err=%v, want fail-closed stray end marker", count, err)
+	}
+	if got := RemoveBlurb(content); got != content {
+		t.Fatalf("RemoveBlurb() changed malformed declaration documentation:\n got: %q\nwant: %q", got, content)
+	}
+}
+
+func TestInlineCodeCommentTokenDoesNotHideFollowingInstalledBlurb(t *testing.T) {
+	content := "Document the token `<!--` in prose.\n\n" +
+		BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+
+	if !ContainsBlurb(content) {
+		t.Fatal("inline-code comment token hid the installed blurb that followed")
+	}
+	if count, err := inspectBlurbStructure(content); err != nil || count != 1 {
+		t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+	}
+	want := "Document the token `<!--` in prose.\n"
+	if got := RemoveBlurb(content); got != want {
+		t.Fatalf("RemoveBlurb() = %q, want %q", got, want)
 	}
 }
 
@@ -243,6 +520,175 @@ func TestUpdateBlurb(t *testing.T) {
 	}
 }
 
+func TestUpdateBlurbMalformedMarkersFailClosed(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name:    "missing end marker",
+			content: "# Header\n\n<!-- bv-agent-instructions-v1 -->\nUser content without an end marker",
+		},
+		{
+			name: "nested start marker",
+			content: "<!-- bv-agent-instructions-v1 -->\nOld content\n" +
+				"<!-- bv-agent-instructions-v2 -->\nMore content\n<!-- end-bv-agent-instructions -->",
+		},
+		{
+			name:    "unexpected end marker",
+			content: "# Header\n<!-- end-bv-agent-instructions -->",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			first := UpdateBlurb(tt.content)
+			second := UpdateBlurb(first)
+			if first != tt.content || second != tt.content {
+				t.Fatalf("malformed content changed across repeated updates:\nfirst: %q\nsecond: %q\nwant: %q", first, second, tt.content)
+			}
+		})
+	}
+}
+
+func TestUpdateBlurbFutureVersionFailsClosed(t *testing.T) {
+	content := "# Header\n\n" +
+		fmt.Sprintf("<!-- bv-agent-instructions-v%d -->\nnewer instructions\n<!-- end-bv-agent-instructions -->\n\n", BlurbVersion+1) +
+		BlurbStartMarker + "\ncurrent instructions\n<!-- end-bv-agent-instructions -->\n"
+
+	if got := UpdateBlurb(content); got != content {
+		t.Fatalf("UpdateBlurb() downgraded future instructions:\n got: %q\nwant: %q", got, content)
+	}
+	if _, err := updateBlurbChecked(content); err == nil || !strings.Contains(err.Error(), "refusing to replace") {
+		t.Fatalf("checked update error=%v, want explicit future-version refusal", err)
+	}
+}
+
+func TestUpdateBlurbFutureVersionRevealedByLegacyRemovalFailsClosed(t *testing.T) {
+	content := "# Header\n\n" + LegacyBlurbContent + "\n" +
+		"<!-- bv-agent-instructions-v9 -->\n" +
+		"```bash\nfuture command\n```\n" +
+		"newer instructions\n<!-- end-bv-agent-instructions -->\n"
+
+	if got := UpdateBlurb(content); got != content {
+		t.Fatalf("UpdateBlurb() replaced a future blurb hidden by the legacy fence:\n got: %q\nwant: %q", got, content)
+	}
+	if _, err := updateBlurbChecked(content); err == nil || !strings.Contains(err.Error(), "refusing to replace") {
+		t.Fatalf("checked update error=%v, want future-version refusal after legacy removal", err)
+	}
+}
+
+func TestUpdateBlurbRejectsResultInsideEOFOpenFence(t *testing.T) {
+	content := "# Header\n\n" +
+		"<!-- bv-agent-instructions-v3 -->\nold instructions\n<!-- end-bv-agent-instructions -->\n\n" +
+		"```markdown\nuser example continues to EOF\n"
+
+	if got := UpdateBlurb(content); got != content {
+		t.Fatalf("UpdateBlurb() wrote the replacement inside an EOF-open fence:\n got: %q\nwant: %q", got, content)
+	}
+	if _, err := updateBlurbChecked(content); err == nil || !strings.Contains(err.Error(), "validate updated") {
+		t.Fatalf("checked update error=%v, want final-result validation failure", err)
+	}
+}
+
+func TestRemoveBlurbMalformedMarkersFailClosed(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name:    "missing end marker",
+			content: "# Header\n\n<!-- bv-agent-instructions-v1 -->\nUser content without an end marker",
+		},
+		{
+			name: "nested start marker",
+			content: "# Header\n<!-- bv-agent-instructions-v1 -->\nUser instructions\n" +
+				"<!-- bv-agent-instructions-v2 -->\nMore user instructions\n<!-- end-bv-agent-instructions -->\n# Footer",
+		},
+		{
+			name:    "unexpected end marker",
+			content: "# Header\n<!-- end-bv-agent-instructions -->\n# Footer",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RemoveBlurb(tt.content); got != tt.content {
+				t.Fatalf("malformed removal changed content:\n got: %q\nwant: %q", got, tt.content)
+			}
+			if _, err := removeBlurbsChecked(tt.content); err == nil {
+				t.Fatal("checked removal accepted malformed marker structure")
+			}
+		})
+	}
+}
+
+func TestRemoveBlurbFutureVersionFailsClosed(t *testing.T) {
+	content := "# Header\n\n<!-- bv-agent-instructions-v8 -->\nnewer\n<!-- end-bv-agent-instructions -->\n"
+	if got := RemoveBlurb(content); got != content {
+		t.Fatalf("RemoveBlurb() removed future instructions:\n got: %q\nwant: %q", got, content)
+	}
+	if _, err := removeBlurbsChecked(content); err == nil || !strings.Contains(err.Error(), "refusing to remove") {
+		t.Fatalf("checked removal error=%v, want future-version refusal", err)
+	}
+}
+
+func TestRemoveBlurbFutureVersionRevealedByLegacyRemovalFailsClosed(t *testing.T) {
+	content := "# Header\n\n" + LegacyBlurbContent + "\n" +
+		"<!-- bv-agent-instructions-v8 -->\n" +
+		"```bash\nfuture command\n```\n" +
+		"newer\n<!-- end-bv-agent-instructions -->\n"
+	if got := RemoveBlurb(content); got != content {
+		t.Fatalf("RemoveBlurb() removed future instructions hidden by the legacy fence:\n got: %q\nwant: %q", got, content)
+	}
+	if _, err := removeBlurbsChecked(content); err == nil || !strings.Contains(err.Error(), "refusing to remove") {
+		t.Fatalf("checked removal error=%v, want future-version refusal after legacy removal", err)
+	}
+}
+
+func TestRemoveBlurbRemovesLegacyAndAllVersionedBlocks(t *testing.T) {
+	legacy := `### Using bv as an AI sidecar
+
+--robot-insights
+--robot-plan
+bv already computes the hard parts for you.
+`
+	content := "# Header\n\n" + legacy + "\nPreserve between.\n\n" +
+		"<!-- bv-agent-instructions-v1 -->\none\n<!-- end-bv-agent-instructions -->\n\n" +
+		"Preserve after first.\n\n" +
+		"<!-- bv-agent-instructions-v5 -->\ntwo\n<!-- end-bv-agent-instructions -->\n\n# Footer\n"
+
+	removed, err := removeBlurbsChecked(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, unwanted := range []string{blurbStartPrefix, BlurbEndMarker, "bv already computes the hard parts"} {
+		if strings.Contains(removed, unwanted) {
+			t.Fatalf("removed content still contains %q:\n%s", unwanted, removed)
+		}
+	}
+	for _, preserved := range []string{"# Header", "Preserve between.", "Preserve after first.", "# Footer"} {
+		if !strings.Contains(removed, preserved) {
+			t.Fatalf("removal lost %q:\n%s", preserved, removed)
+		}
+	}
+}
+
+func TestUpdateBlurbCollapsesMultipleCompleteBlocks(t *testing.T) {
+	content := "# Header\n\n" +
+		"<!-- bv-agent-instructions-v1 -->\none\n<!-- end-bv-agent-instructions -->\n\n" +
+		"User instructions\n\n" +
+		"<!-- bv-agent-instructions-v2 -->\ntwo\n<!-- end-bv-agent-instructions -->\n"
+
+	updated := UpdateBlurb(content)
+	if got := strings.Count(updated, blurbStartPrefix); got != 1 {
+		t.Fatalf("start marker count=%d, want 1", got)
+	}
+	if !strings.Contains(updated, "User instructions") {
+		t.Fatal("update removed content between complete blurb blocks")
+	}
+}
+
 func TestNeedsUpdate(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -255,9 +701,25 @@ func TestNeedsUpdate(t *testing.T) {
 			expected: false,
 		},
 		{
-			name:     "current version",
-			content:  "<!-- bv-agent-instructions-v4 -->",
-			expected: false, // v4 is current, no update needed
+			name:     "single complete current version",
+			content:  BlurbStartMarker + "\ncontent\n<!-- end-bv-agent-instructions -->",
+			expected: false,
+		},
+		{
+			name:     "complete v5 needs atomic claim guidance",
+			content:  "<!-- bv-agent-instructions-v5 -->\nbr update <id> --status=in_progress --json\n<!-- end-bv-agent-instructions -->",
+			expected: true,
+		},
+		{
+			name:     "unterminated current version",
+			content:  BlurbStartMarker + "\ncontent",
+			expected: true,
+		},
+		{
+			name: "duplicate current version",
+			content: BlurbStartMarker + "\none\n<!-- end-bv-agent-instructions -->\n" +
+				BlurbStartMarker + "\ntwo\n<!-- end-bv-agent-instructions -->",
+			expected: true,
 		},
 		{
 			name:     "old v3 needs update",
@@ -272,7 +734,7 @@ func TestNeedsUpdate(t *testing.T) {
 		{
 			name:     "old v1 needs update",
 			content:  "<!-- bv-agent-instructions-v1 -->",
-			expected: true, // v1 is old, needs update to v4
+			expected: true,
 		},
 	}
 
@@ -293,7 +755,7 @@ func TestAgentBlurbContent(t *testing.T) {
 		"br list --status=open --json",
 		"br show <id> --json",
 		"br create",
-		"br update <id> --status=in_progress --json",
+		"br update <id> --claim --json",
 		"br close <id> --reason=\"Completed\" --json",
 		"br sync",
 		"br dep add",
@@ -303,7 +765,7 @@ func TestAgentBlurbContent(t *testing.T) {
 		"bd update <id> --claim --json",
 		"bd close <id> --json",
 		"bd dep add",
-		"bd export --no-memories -o .beads/beads.jsonl",
+		"bd export -o .beads/issues.jsonl",
 		"bv --robot-triage",
 		"bv --robot-next",
 		"bv --robot-plan",
@@ -390,6 +852,26 @@ coding tasks.
 bv already computes the hard parts for you.
 ` + "```"
 
+// ambiguousSameVersionBlockSwapContent presents two complete v4 blocks whose
+// visibility swaps depending on whether the legacy blurb's trailing fence is
+// treated as its closer or as a user fence opener.
+func ambiguousSameVersionBlockSwapContent() string {
+	return LegacyBlurbContent + "\n" +
+		BlurbStartMarker + "\nfirst physical block\n" + BlurbEndMarker + "\n" +
+		"```\n" +
+		BlurbStartMarker + "\nsecond physical block\n" + BlurbEndMarker + "\n"
+}
+
+// ambiguousTwoLegacyBlocksContent hides the second legacy section behind the
+// first section's ambiguous trailing fence. The conservative removal view sees
+// one legacy blurb while the hypothetical fence-consumed view sees two.
+func ambiguousTwoLegacyBlocksContent() string {
+	legacy := "### Using bv as an AI sidecar\n\n" +
+		"--robot-insights\n--robot-plan\n" +
+		"bv already computes the hard parts for you.\n"
+	return "# Header\n\n" + legacy + "```\n" + legacy + "```\n"
+}
+
 func TestContainsLegacyBlurb(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -430,6 +912,33 @@ func TestContainsLegacyBlurb(t *testing.T) {
 				t.Errorf("ContainsLegacyBlurb() = %v, want %v", result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestLegacyHeadingRequiresWhitespaceBeforeClosingHashes(t *testing.T) {
+	content := `# Documentation
+
+### Using bv as an AI sidecar###
+
+--robot-insights
+--robot-plan
+bv already computes the hard parts for you.
+
+# Keep
+`
+	if ContainsLegacyBlurb(content) {
+		t.Fatal("literal no-space trailing hashes were misparsed as an ATX closing sequence")
+	}
+	if got := RemoveLegacyBlurb(content); got != content {
+		t.Fatalf("RemoveLegacyBlurb() changed a non-legacy heading:\n got: %q\nwant: %q", got, content)
+	}
+	if got := RemoveBlurb(content); got != content {
+		t.Fatalf("RemoveBlurb() changed a non-legacy heading:\n got: %q\nwant: %q", got, content)
+	}
+
+	valid := strings.Replace(content, "sidecar###", "sidecar ###", 1)
+	if !ContainsLegacyBlurb(valid) {
+		t.Fatal("whitespace-delimited ATX closing hashes should still identify the legacy heading")
 	}
 }
 
@@ -533,6 +1042,206 @@ bv already computes the hard parts for you.
 	}
 	if !strings.Contains(result, "## Next Section") {
 		t.Error("RemoveLegacyBlurb() did not preserve next section")
+	}
+}
+
+func TestRemoveLegacyBlurbPreservesLaterUserFence(t *testing.T) {
+	legacy := `### Using bv as an AI sidecar
+
+--robot-insights
+--robot-plan
+bv already computes the hard parts for you.
+`
+	userCode := "```\nuser code must retain both fences\n```\n"
+	content := "# Header\n\n" + legacy + "\n" + userCode
+
+	result := RemoveLegacyBlurb(content)
+	if strings.Contains(result, "bv already computes the hard parts") {
+		t.Fatalf("legacy blurb was not removed:\n%s", result)
+	}
+	if !strings.Contains(result, userCode) {
+		t.Fatalf("legacy removal consumed a later user fence:\n got: %q\nwant to preserve: %q", result, userCode)
+	}
+}
+
+func TestRemoveLegacyBlurbPreservesImmediatelyAdjacentUserFence(t *testing.T) {
+	legacy := "### Using bv as an AI sidecar\n\n" +
+		"--robot-insights\n--robot-plan\n" +
+		"bv already computes the hard parts for you.\n"
+	userCode := "```\nuser code must retain both fences\n```\n"
+	content := "# Header\n\n" + legacy + userCode
+
+	result := RemoveLegacyBlurb(content)
+	if strings.Contains(result, "bv already computes the hard parts") {
+		t.Fatalf("legacy blurb was not removed:\n%s", result)
+	}
+	if !strings.HasSuffix(result, userCode) {
+		t.Fatalf("legacy removal changed an adjacent user fence:\n got: %q\nwant suffix: %q", result, userCode)
+	}
+	if got := strings.Count(result, "```"); got != 2 {
+		t.Fatalf("adjacent user fence delimiter count=%d, want 2", got)
+	}
+}
+
+func TestRemoveLegacyBlurbPreservesIndentedLiteralFence(t *testing.T) {
+	legacy := "### Using bv as an AI sidecar\n\n" +
+		"--robot-insights\n--robot-plan\n" +
+		"bv already computes the hard parts for you.\n"
+	literal := "    ```\nindented literal must remain\n"
+	result := RemoveLegacyBlurb(legacy + literal)
+	if !strings.HasSuffix(result, literal) {
+		t.Fatalf("legacy removal consumed a four-space-indented literal:\n got: %q\nwant suffix: %q", result, literal)
+	}
+}
+
+func TestRemoveLegacyBlurbPreservesUnclosedAdjacentUserFence(t *testing.T) {
+	legacy := "### Using bv as an AI sidecar\n\n" +
+		"--robot-insights\n--robot-plan\n" +
+		"bv already computes the hard parts for you.\n"
+	userCode := "```\nunfinished user example\n"
+	result := RemoveLegacyBlurb(legacy + userCode)
+	if !strings.HasSuffix(result, userCode) {
+		t.Fatalf("legacy removal consumed an unclosed adjacent user fence:\n got: %q\nwant suffix: %q", result, userCode)
+	}
+}
+
+func TestRemoveLegacyBlurbPreservesUnclosedFenceWhoseBodyStartsWithHeading(t *testing.T) {
+	legacy := "### Using bv as an AI sidecar\n\n" +
+		"--robot-insights\n--robot-plan\n" +
+		"bv already computes the hard parts for you.\n"
+	userCode := "```\n## literal heading inside unfinished fence\n"
+	result := RemoveLegacyBlurb(legacy + userCode)
+	if !strings.HasSuffix(result, userCode) {
+		t.Fatalf("legacy removal consumed an unclosed user fence before a heading:\n got: %q\nwant suffix: %q", result, userCode)
+	}
+}
+
+func TestCurrentBlurbHiddenByAmbiguousLegacyFenceFailsClosed(t *testing.T) {
+	content := LegacyBlurbContent + "\n" +
+		"<!-- bv-agent-instructions-v5 -->\n" +
+		"```bash\ncurrent command\n```\n" +
+		"current instructions\n<!-- end-bv-agent-instructions -->\n"
+
+	if got := UpdateBlurb(content); got != content {
+		t.Fatalf("UpdateBlurb rewrote ambiguous fenced content:\n got: %q\nwant: %q", got, content)
+	}
+	if got := RemoveBlurb(content); got != content {
+		t.Fatalf("RemoveBlurb rewrote ambiguous fenced content:\n got: %q\nwant: %q", got, content)
+	}
+	if _, err := updateBlurbChecked(content); err == nil || !strings.Contains(err.Error(), "malformed") {
+		t.Fatalf("checked update error=%v, want fail-closed malformed result", err)
+	}
+}
+
+func TestVersionedBlurbsHiddenByAmbiguousLegacyFenceFailClosed(t *testing.T) {
+	tests := []struct {
+		name      string
+		version   int
+		body      string
+		wantError string
+	}{
+		{name: "current simple body", version: BlurbVersion, body: "current instructions\n", wantError: "malformed"},
+		{name: "current bare fenced body", version: BlurbVersion, body: "```\ncurrent command\n```\ncurrent instructions\n", wantError: "malformed"},
+		{name: "future simple body", version: BlurbVersion + 5, body: "future instructions\n", wantError: "refusing"},
+		{name: "future bare fenced body", version: BlurbVersion + 5, body: "```\nfuture command\n```\nfuture instructions\n", wantError: "refusing"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := LegacyBlurbContent + "\n" +
+				fmt.Sprintf("<!-- bv-agent-instructions-v%d -->\n", tt.version) +
+				tt.body + BlurbEndMarker + "\n"
+
+			if got := UpdateBlurb(content); got != content {
+				t.Fatalf("UpdateBlurb rewrote ambiguous content:\n got: %q\nwant: %q", got, content)
+			}
+			if got := RemoveBlurb(content); got != content {
+				t.Fatalf("RemoveBlurb rewrote ambiguous content:\n got: %q\nwant: %q", got, content)
+			}
+			if _, err := updateBlurbChecked(content); err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("checked update error=%v, want %q fail-closed error", err, tt.wantError)
+			}
+			if _, err := removeBlurbsChecked(content); err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("checked removal error=%v, want %q fail-closed error", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestAmbiguousLegacyInterpretationsFailClosedWithoutMutation(t *testing.T) {
+	tests := []struct {
+		name                    string
+		content                 string
+		wantError               string
+		wantRealRemovals        int
+		wantAnalysisRemovals    int
+		wantRealVisibleBody     string
+		wantAnalysisVisibleBody string
+	}{
+		{
+			name:                    "same-version physical blocks swap visibility",
+			content:                 ambiguousSameVersionBlockSwapContent(),
+			wantError:               "ambiguous marker material",
+			wantRealRemovals:        1,
+			wantAnalysisRemovals:    1,
+			wantRealVisibleBody:     "second physical block",
+			wantAnalysisVisibleBody: "first physical block",
+		},
+		{
+			name:                 "second legacy block is hidden",
+			content:              ambiguousTwoLegacyBlocksContent(),
+			wantError:            "removal count",
+			wantRealRemovals:     1,
+			wantAnalysisRemovals: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			realView, ambiguous, realRemovals, err := removeLegacyBlurbsChecked(tt.content)
+			if err != nil {
+				t.Fatalf("conservative legacy removal failed: %v", err)
+			}
+			if !ambiguous {
+				t.Fatal("fixture did not preserve an ambiguous legacy fence")
+			}
+			analysisView, _, analysisRemovals, err := removeLegacyBlurbsCheckedWithPolicy(tt.content, true)
+			if err != nil {
+				t.Fatalf("hypothetical legacy removal failed: %v", err)
+			}
+			if realRemovals != tt.wantRealRemovals || analysisRemovals != tt.wantAnalysisRemovals {
+				t.Fatalf("legacy removal counts real/analysis=%d/%d, want %d/%d", realRemovals, analysisRemovals, tt.wantRealRemovals, tt.wantAnalysisRemovals)
+			}
+
+			if tt.wantRealVisibleBody != "" {
+				realBlocks, realErr := inspectBlurbBlocks(realView)
+				analysisBlocks, analysisErr := inspectBlurbBlocks(analysisView)
+				if realErr != nil || analysisErr != nil || len(realBlocks) != 1 || len(analysisBlocks) != 1 {
+					t.Fatalf("fixture block structure real=%v/%d analysis=%v/%d, want one valid block in each view", realErr, len(realBlocks), analysisErr, len(analysisBlocks))
+				}
+				realBlock := realView[realBlocks[0].start:realBlocks[0].end]
+				analysisBlock := analysisView[analysisBlocks[0].start:analysisBlocks[0].end]
+				if !strings.Contains(realBlock, tt.wantRealVisibleBody) || !strings.Contains(analysisBlock, tt.wantAnalysisVisibleBody) {
+					t.Fatalf("physical block visibility did not swap:\n real: %q\nanalysis: %q", realBlock, analysisBlock)
+				}
+				if realBlocks[0].version != BlurbVersion || analysisBlocks[0].version != BlurbVersion {
+					t.Fatalf("visible block versions real/analysis=%d/%d, want v%d in both", realBlocks[0].version, analysisBlocks[0].version, BlurbVersion)
+				}
+			}
+
+			if got := UpdateBlurb(tt.content); got != tt.content {
+				t.Fatalf("UpdateBlurb changed ambiguous content:\n got: %q\nwant: %q", got, tt.content)
+			}
+			if got := RemoveBlurb(tt.content); got != tt.content {
+				t.Fatalf("RemoveBlurb changed ambiguous content:\n got: %q\nwant: %q", got, tt.content)
+			}
+			if _, err := updateBlurbChecked(tt.content); err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("checked update error=%v, want %q", err, tt.wantError)
+			}
+			if _, err := removeBlurbsChecked(tt.content); err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("checked removal error=%v, want %q", err, tt.wantError)
+			}
+		})
 	}
 }
 
@@ -707,7 +1416,7 @@ Use --robot-plan to get plans.
 
 Note: bv already computes the hard parts - use it!
 `,
-			expected: true, // All patterns are present, even if scattered
+			expected: false,
 		},
 	}
 
@@ -844,9 +1553,9 @@ func TestGetBlurbVersionEdgeCases(t *testing.T) {
 			expected: 0, // \d+ matches "1" but then pattern expects " -->" not "a -->"
 		},
 		{
-			name:     "multiple version markers returns first",
+			name:     "multiple version markers returns highest",
 			content:  "<!-- bv-agent-instructions-v3 -->\nsome content\n<!-- bv-agent-instructions-v5 -->",
-			expected: 3, // FindStringSubmatch returns first match
+			expected: 5,
 		},
 		{
 			name:     "version marker in middle of content",
@@ -973,7 +1682,7 @@ Current blurb
 		{
 			name:     "marker inside code block",
 			content:  "```\n<!-- bv-agent-instructions-v1 -->\n```",
-			expected: true, // simple string check doesn't parse markdown
+			expected: false,
 		},
 	}
 
@@ -984,5 +1693,436 @@ Current blurb
 				t.Errorf("ContainsAnyBlurb() = %v, want %v", result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestCompleteMarkerExampleInsideFenceIsIgnoredAndPreserved(t *testing.T) {
+	content := "# Documentation\n\n```markdown\n" +
+		"<!-- bv-agent-instructions-v99 -->\nexample only\n<!-- end-bv-agent-instructions -->\n```\n"
+
+	if ContainsAnyBlurb(content) {
+		t.Fatal("complete fenced marker example must not count as an installed blurb")
+	}
+	if version := GetBlurbVersion(content); version != 0 {
+		t.Fatalf("GetBlurbVersion()=%d for fenced example, want 0", version)
+	}
+	if count, err := inspectBlurbStructure(content); err != nil || count != 0 {
+		t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 0, nil", count, err)
+	}
+	if got := RemoveBlurb(content); got != content {
+		t.Fatalf("RemoveBlurb() changed fenced example:\n got: %q\nwant: %q", got, content)
+	}
+}
+
+func TestCompleteMarkerExamplesInsideContainerFencesAreIgnoredAndPreserved(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "bullet list",
+			content: "- ```markdown\n" +
+				"  <!-- bv-agent-instructions-v99 -->\n" +
+				"  example only\n" +
+				"  <!-- end-bv-agent-instructions -->\n" +
+				"  ```\n",
+		},
+		{
+			name: "ordered list",
+			content: "1. ```markdown\n" +
+				"   <!-- bv-agent-instructions-v99 -->\n" +
+				"   example only\n" +
+				"   <!-- end-bv-agent-instructions -->\n" +
+				"   ```\n",
+		},
+		{
+			name: "blockquote",
+			content: "> ```markdown\n" +
+				"> <!-- bv-agent-instructions-v99 -->\n" +
+				"> example only\n" +
+				"> <!-- end-bv-agent-instructions -->\n" +
+				"> ```\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if ContainsAnyBlurb(tt.content) {
+				t.Fatal("container-fenced marker example must not count as an installed blurb")
+			}
+			if version := GetBlurbVersion(tt.content); version != 0 {
+				t.Fatalf("GetBlurbVersion()=%d for container-fenced example, want 0", version)
+			}
+			if count, err := inspectBlurbStructure(tt.content); err != nil || count != 0 {
+				t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 0, nil", count, err)
+			}
+			if got := RemoveBlurb(tt.content); got != tt.content {
+				t.Fatalf("RemoveBlurb() changed container-fenced example:\n got: %q\nwant: %q", got, tt.content)
+			}
+		})
+	}
+}
+
+func TestCompleteMarkerExamplesInsideNakedContainersAreIgnoredAndPreserved(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "bullet continuation",
+			content: "- Marker documentation:\n" +
+				"  <!-- bv-agent-instructions-v99 -->\n" +
+				"  example only\n" +
+				"  <!-- end-bv-agent-instructions -->\n",
+		},
+		{
+			name: "ordered continuation",
+			content: "1. Marker documentation:\n" +
+				"   <!-- bv-agent-instructions-v99 -->\n" +
+				"   example only\n" +
+				"   <!-- end-bv-agent-instructions -->\n",
+		},
+		{
+			name: "blockquote",
+			content: "> <!-- bv-agent-instructions-v99 -->\n" +
+				"> example only\n" +
+				"> <!-- end-bv-agent-instructions -->\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if ContainsAnyBlurb(tt.content) {
+				t.Fatal("container-nested marker example must not count as an installed blurb")
+			}
+			if version := GetBlurbVersion(tt.content); version != 0 {
+				t.Fatalf("GetBlurbVersion()=%d for container-nested example, want 0", version)
+			}
+			if count, err := inspectBlurbStructure(tt.content); err != nil || count != 0 {
+				t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 0, nil", count, err)
+			}
+			if got := RemoveBlurb(tt.content); got != tt.content {
+				t.Fatalf("RemoveBlurb() changed container-nested example:\n got: %q\nwant: %q", got, tt.content)
+			}
+		})
+	}
+}
+
+func TestNestedLegacyLookingSectionsAreIgnoredAndPreserved(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "bullet continuation",
+			content: "- Historical documentation:\n" +
+				"  ### Using bv as an AI sidecar\n" +
+				"  --robot-insights\n" +
+				"  --robot-plan\n" +
+				"  bv already computes the hard parts for you.\n",
+		},
+		{
+			name: "blockquote",
+			content: "> ### Using bv as an AI sidecar\n" +
+				"> --robot-insights\n" +
+				"> --robot-plan\n" +
+				"> bv already computes the hard parts for you.\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if ContainsLegacyBlurb(tt.content) {
+				t.Fatal("container-nested legacy example must not count as an installed blurb")
+			}
+			if got := RemoveLegacyBlurb(tt.content); got != tt.content {
+				t.Fatalf("RemoveLegacyBlurb() changed nested documentation:\n got: %q\nwant: %q", got, tt.content)
+			}
+			if got := RemoveBlurb(tt.content); got != tt.content {
+				t.Fatalf("RemoveBlurb() changed nested documentation:\n got: %q\nwant: %q", got, tt.content)
+			}
+		})
+	}
+}
+
+func TestLegacyPatternsMustAppearInTemplateOrder(t *testing.T) {
+	content := "### Using bv as an AI sidecar\n\n" +
+		"--robot-plan\n" +
+		"--robot-insights\n" +
+		"bv already computes the hard parts for you.\n"
+
+	if ContainsLegacyBlurb(content) {
+		t.Fatal("out-of-order documentation was misclassified as the historical template")
+	}
+	if got := RemoveLegacyBlurb(content); got != content {
+		t.Fatalf("RemoveLegacyBlurb() changed out-of-order documentation:\n got: %q\nwant: %q", got, content)
+	}
+}
+
+func TestSetextHeadingBoundsLegacyDetection(t *testing.T) {
+	content := "### Using bv as an AI sidecar\n\n" +
+		"--robot-insights\n\n" +
+		"Next Section\n" +
+		"------------\n\n" +
+		"--robot-plan\n" +
+		"bv already computes the hard parts for you.\n"
+
+	if ContainsLegacyBlurb(content) {
+		t.Fatal("legacy signature crossed a top-level setext section boundary")
+	}
+	if got := RemoveLegacyBlurb(content); got != content {
+		t.Fatalf("RemoveLegacyBlurb() crossed a setext boundary:\n got: %q\nwant: %q", got, content)
+	}
+	if got := RemoveBlurb(content); got != content {
+		t.Fatalf("RemoveBlurb() crossed a setext boundary:\n got: %q\nwant: %q", got, content)
+	}
+}
+
+func TestMultilineSetextHeadingBoundsLegacyDetection(t *testing.T) {
+	content := "### Using bv as an AI sidecar\n\n" +
+		"--robot-insights\n\n" +
+		"New section uses --robot-plan\n" +
+		"bv already computes the hard parts for you.\n" +
+		"continued heading\n" +
+		"-----------------\n"
+
+	if ContainsLegacyBlurb(content) {
+		t.Fatal("legacy signature crossed into multiline setext heading content")
+	}
+	if got := RemoveBlurb(content); got != content {
+		t.Fatalf("RemoveBlurb() crossed multiline setext heading content:\n got: %q\nwant: %q", got, content)
+	}
+}
+
+func TestMalformedHTMLBlockTagPrefixDoesNotHideInstalledBlurb(t *testing.T) {
+	for _, prefix := range []string{"<div/not-a-tag", "</div/not-a-tag"} {
+		t.Run(prefix, func(t *testing.T) {
+			content := prefix + "\n" +
+				BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+			if !ContainsBlurb(content) {
+				t.Fatal("malformed HTML tag prefix hid a top-level installed blurb")
+			}
+			if count, err := inspectBlurbStructure(content); err != nil || count != 1 {
+				t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+			}
+		})
+	}
+}
+
+func TestLazyContainerParagraphDoesNotTurnTypeSevenHTMLIntoBlock(t *testing.T) {
+	for _, prefix := range []string{"- paragraph", "> paragraph"} {
+		t.Run(prefix, func(t *testing.T) {
+			content := prefix + "\n" +
+				"<agent-example>\n" +
+				BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+			if !ContainsBlurb(content) {
+				t.Fatal("lazy container paragraph incorrectly turned type-7 HTML into a marker-hiding block")
+			}
+			if count, err := inspectBlurbStructure(content); err != nil || count != 1 {
+				t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+			}
+		})
+	}
+}
+
+func TestIndentedContinuationDoesNotInterruptParagraph(t *testing.T) {
+	content := "paragraph\n" +
+		"    continuation\n" +
+		"<agent-example>\n" +
+		BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+	if !ContainsBlurb(content) {
+		t.Fatal("indented paragraph continuation incorrectly enabled a marker-hiding type-7 HTML block")
+	}
+	if count, err := inspectBlurbStructure(content); err != nil || count != 1 {
+		t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+	}
+}
+
+func TestBareEqualsLineStartsParagraph(t *testing.T) {
+	content := "===\n" +
+		"<agent-example>\n" +
+		BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+	if !ContainsBlurb(content) {
+		t.Fatal("bare equals text incorrectly enabled a marker-hiding type-7 HTML block")
+	}
+	if count, err := inspectBlurbStructure(content); err != nil || count != 1 {
+		t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+	}
+}
+
+func TestMarkerExamplesRespectLessObviousListContainers(t *testing.T) {
+	nested := []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "empty bullet immediate content",
+			content: "-\n" +
+				"  <!-- bv-agent-instructions-v99 -->\n" +
+				"  example\n" +
+				"  <!-- end-bv-agent-instructions -->\n",
+		},
+		{
+			name: "empty ordered immediate content",
+			content: "1.\n" +
+				"   <!-- bv-agent-instructions-v99 -->\n" +
+				"   example\n" +
+				"   <!-- end-bv-agent-instructions -->\n",
+		},
+		{
+			name: "space-only empty bullet uses one-column padding",
+			content: "-   \n" +
+				"  <!-- bv-agent-instructions-v99 -->\n" +
+				"  example\n" +
+				"  <!-- end-bv-agent-instructions -->\n",
+		},
+		{
+			name: "tab-only empty bullet uses one-column padding",
+			content: "-\t\n" +
+				"  <!-- bv-agent-instructions-v99 -->\n" +
+				"  example\n" +
+				"  <!-- end-bv-agent-instructions -->\n",
+		},
+		{
+			name: "five-space code starts list with one-space padding",
+			content: "-     code\n" +
+				"  <!-- bv-agent-instructions-v99 -->\n" +
+				"  example\n" +
+				"  <!-- end-bv-agent-instructions -->\n",
+		},
+		{
+			name: "lazy continuation retains bullet",
+			content: "- Marker docs\n" +
+				"lazy continuation\n" +
+				"  <!-- bv-agent-instructions-v99 -->\n" +
+				"  example\n" +
+				"  <!-- end-bv-agent-instructions -->\n",
+		},
+		{
+			name: "nested list pops back to outer item",
+			content: "- outer\n" +
+				"  - nested\n" +
+				"  <!-- bv-agent-instructions-v99 -->\n" +
+				"  example\n" +
+				"  <!-- end-bv-agent-instructions -->\n",
+		},
+		{
+			name: "nested ordered list pops back to outer item",
+			content: "1. outer\n" +
+				"   1. nested\n" +
+				"   <!-- bv-agent-instructions-v99 -->\n" +
+				"   example\n" +
+				"   <!-- end-bv-agent-instructions -->\n",
+		},
+	}
+	for _, tt := range nested {
+		t.Run(tt.name, func(t *testing.T) {
+			if ContainsAnyBlurb(tt.content) {
+				t.Fatal("list-nested marker documentation counted as installed")
+			}
+			if got := RemoveBlurb(tt.content); got != tt.content {
+				t.Fatalf("RemoveBlurb() changed list-nested documentation:\n got: %q\nwant: %q", got, tt.content)
+			}
+		})
+	}
+}
+
+func TestListLikeLinesThatDoNotContainFollowingMarkers(t *testing.T) {
+	topLevel := []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "empty item followed by blank",
+			content: "-\n\n" +
+				"  <!-- bv-agent-instructions-v5 -->\n" +
+				"  installed\n" +
+				"  <!-- end-bv-agent-instructions -->\n",
+		},
+		{
+			name: "non-one ordered marker cannot interrupt paragraph",
+			content: "paragraph\n2. documentation\n" +
+				"   <!-- bv-agent-instructions-v5 -->\n" +
+				"   installed\n" +
+				"   <!-- end-bv-agent-instructions -->\n",
+		},
+		{
+			name: "zero ordered marker cannot interrupt paragraph",
+			content: "paragraph\n0. documentation\n" +
+				"   <!-- bv-agent-instructions-v5 -->\n" +
+				"   installed\n" +
+				"   <!-- end-bv-agent-instructions -->\n",
+		},
+		{
+			name: "tabbed bullet has four-column content indent",
+			content: "-\ttext\n" +
+				"  <!-- bv-agent-instructions-v5 -->\n" +
+				"  installed\n" +
+				"  <!-- end-bv-agent-instructions -->\n",
+		},
+		{
+			name: "tabbed ordered marker has four-column content indent",
+			content: "1.\ttext\n" +
+				"   <!-- bv-agent-instructions-v5 -->\n" +
+				"   installed\n" +
+				"   <!-- end-bv-agent-instructions -->\n",
+		},
+		{
+			name: "mixed space-tab padding reaches four columns",
+			content: "- \ttext\n" +
+				"  <!-- bv-agent-instructions-v5 -->\n" +
+				"  installed\n" +
+				"  <!-- end-bv-agent-instructions -->\n",
+		},
+	}
+	for _, tt := range topLevel {
+		t.Run(tt.name, func(t *testing.T) {
+			if !ContainsBlurb(tt.content) {
+				t.Fatal("top-level marker block was incorrectly absorbed by list state")
+			}
+			if count, err := inspectBlurbStructure(tt.content); err != nil || count != 1 {
+				t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+			}
+		})
+	}
+}
+
+func TestEmptyListMarkerCannotInterruptParagraph(t *testing.T) {
+	content := "paragraph\n*\n" +
+		"<agent-example>\n" +
+		BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+	if !ContainsBlurb(content) {
+		t.Fatal("empty list marker incorrectly interrupted a paragraph and hid installed markers")
+	}
+	if count, err := inspectBlurbStructure(content); err != nil || count != 1 {
+		t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+	}
+}
+
+func TestNestedEmptyMarkerDoesNotDiscardOuterList(t *testing.T) {
+	content := "- outer\n" +
+		"  *\n\n" +
+		"  <!-- bv-agent-instructions-v99 -->\n" +
+		"  example\n" +
+		"  <!-- end-bv-agent-instructions -->\n"
+	if ContainsAnyBlurb(content) {
+		t.Fatal("empty nested marker discarded outer list scope")
+	}
+	if got := RemoveBlurb(content); got != content {
+		t.Fatalf("RemoveBlurb() changed documentation inside outer list:\n got: %q\nwant: %q", got, content)
+	}
+}
+
+func TestNestedEmptyListAfterBlankPreservesOuterScope(t *testing.T) {
+	content := "- outer\n\n" +
+		"  *\n\n" +
+		"  <!-- bv-agent-instructions-v99 -->\n" +
+		"  example\n" +
+		"  <!-- end-bv-agent-instructions -->\n"
+	if ContainsAnyBlurb(content) {
+		t.Fatal("ending an empty nested list discarded its outer list scope")
+	}
+	if got := RemoveBlurb(content); got != content {
+		t.Fatalf("RemoveBlurb() changed documentation inside outer list:\n got: %q\nwant: %q", got, content)
 	}
 }

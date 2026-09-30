@@ -1,8 +1,39 @@
 package analysis
 
 import (
+	"strings"
 	"time"
+	"unicode"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+func quoteBeadsCommandID(id string) (string, bool) {
+	if id == "" || strings.HasPrefix(id, "-") || strings.IndexFunc(id, unicode.IsControl) >= 0 {
+		return "", false
+	}
+	return quoteShellWord(id), true
+}
+
+// quoteBeadsFlagValue quotes a value that the caller concatenates after a
+// complete flag name and '='. Unlike a positional ID, a leading '-' is safe in
+// that position.
+func quoteBeadsFlagValue(value string) (string, bool) {
+	if value == "" || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		return "", false
+	}
+	return quoteShellWord(value), true
+}
+
+func quoteShellWord(word string) string {
+	if strings.IndexFunc(word, func(r rune) bool {
+		return !(r == '-' || r == '_' || r == '=' || r == '/' || r == '.' || r == ':' || r == ',' ||
+			(r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z'))
+	}) < 0 {
+		return word
+	}
+	return "'" + strings.ReplaceAll(word, "'", "'\\''") + "'"
+}
 
 // SuggestionType categorizes the kind of suggestion
 type SuggestionType string
@@ -46,6 +77,9 @@ type Suggestion struct {
 
 	// ActionCommand is an optional CLI command to act on this suggestion
 	ActionCommand string `json:"action_command,omitempty"`
+	// Action preserves the source-bound argv and working directory. The shell
+	// command above is a rendering of the same action, never parsed as input.
+	Action *model.IssueCommand `json:"action,omitempty"`
 
 	// GeneratedAt is when this suggestion was created
 	GeneratedAt time.Time `json:"generated_at"`
@@ -154,25 +188,45 @@ func (s Suggestion) WithRelatedBead(beadID string) Suggestion {
 }
 
 // WithAction adds an action command to the suggestion
-func (s Suggestion) WithAction(cmd string) Suggestion {
-	s.ActionCommand = cmd
+func (s Suggestion) WithAction(cmd *model.IssueCommand) Suggestion {
+	s.Action = cmd
+	s.ActionCommand = ""
+	if cmd != nil {
+		s.ActionCommand = cmd.Shell
+	}
+	return s
+}
+
+func (s Suggestion) withMutationAction(issue model.Issue, kind model.MutationKind, peer *model.Issue, value string) Suggestion {
+	command, reason := issue.MutationAction(kind, peer, value)
+	s = s.WithAction(command)
+	if reason != "" {
+		s = s.WithMetadata("action_unavailable_reason", reason)
+	}
 	return s
 }
 
 // WithMetadata adds metadata to the suggestion
 func (s Suggestion) WithMetadata(key string, value interface{}) Suggestion {
-	if s.Metadata == nil {
-		s.Metadata = make(map[string]interface{})
+	metadata := make(map[string]interface{}, len(s.Metadata)+1)
+	for existingKey, existingValue := range s.Metadata {
+		metadata[existingKey] = existingValue
 	}
-	s.Metadata[key] = value
+	metadata[key] = value
+	s.Metadata = metadata
 	return s
 }
 
 // NewSuggestionSet creates a new suggestion set and computes stats
 func NewSuggestionSet(suggestions []Suggestion, dataHash string) SuggestionSet {
+	return NewSuggestionSetAt(suggestions, dataHash, time.Now())
+}
+
+// NewSuggestionSetAt creates a suggestion set at a caller-supplied instant.
+func NewSuggestionSetAt(suggestions []Suggestion, dataHash string, now time.Time) SuggestionSet {
 	set := SuggestionSet{
 		Suggestions: suggestions,
-		GeneratedAt: time.Now(),
+		GeneratedAt: now,
 		DataHash:    dataHash,
 	}
 	set.computeStats()

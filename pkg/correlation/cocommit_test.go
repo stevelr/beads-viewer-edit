@@ -403,6 +403,47 @@ func TestExtractAllCoCommits_NonStatusEvents(t *testing.T) {
 	}
 }
 
+func TestExtractAllCoCommits_PropagatesBatchFailureWithoutMemoizing(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_NO_CACHE", "")
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+
+	sha := strings.Repeat("a", 40)
+	c := NewCoCommitExtractor(t.TempDir()) // Existing directory, intentionally not a Git repository.
+	commits, err := c.ExtractAllCoCommits([]BeadEvent{
+		{BeadID: "bv-1", EventType: EventClaimed, CommitSHA: sha},
+	})
+	if err == nil {
+		t.Fatal("expected the failed git batch to propagate")
+	}
+	if !strings.Contains(err.Error(), "priming co-commit batch") {
+		t.Fatalf("error = %q, want co-commit batch context", err)
+	}
+	if commits != nil {
+		t.Fatalf("commits = %#v, want nil on batch failure", commits)
+	}
+	if _, ok := c.batchedSHAs[sha]; ok {
+		t.Fatal("failed SHA was marked as successfully batched")
+	}
+	if _, ok := c.fileCache[sha]; ok {
+		t.Fatal("failed SHA was memoized in the file cache")
+	}
+	if _, ok := c.statCache[sha]; ok {
+		t.Fatal("failed SHA was memoized in the line-stat cache")
+	}
+	if disk := loadPerCommitCoCommit(perCommitCoCommitCacheNamespace()); disk != nil {
+		if _, ok := disk[sha]; ok {
+			t.Fatal("failed SHA was persisted in the per-commit cache")
+		}
+	}
+
+	if _, err := c.ExtractAllCoCommits([]BeadEvent{
+		{BeadID: "bv-1", EventType: EventClaimed, CommitSHA: sha},
+	}); err == nil {
+		t.Fatal("second attempt unexpectedly used a poisoned cache entry")
+	}
+}
+
 func TestGenerateReason_LargeCommit(t *testing.T) {
 	c := NewCoCommitExtractor("/test/repo")
 

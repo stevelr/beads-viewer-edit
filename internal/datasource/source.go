@@ -11,7 +11,23 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 )
+
+// isIssueFileName reports whether a JSONL file name is one bv may load as the
+// issue set. The allowlist is loader.PreferredJSONLNames (issues.jsonl,
+// beads.jsonl, beads.base.jsonl); explicit overrides (BEADS_DB, --db) bypass
+// discovery entirely and are not subject to it.
+func isIssueFileName(name string) bool {
+	for _, allowed := range loader.PreferredJSONLNames {
+		if name == allowed {
+			return true
+		}
+	}
+	return false
+}
 
 // SourceType identifies the type of data source
 type SourceType string
@@ -76,6 +92,9 @@ type DiscoveryOptions struct {
 	Verbose bool
 	// Logger receives log messages when Verbose is true
 	Logger func(msg string)
+	// WarningHandler receives actionable discovery warnings, such as leftover
+	// merge artifacts. Nil keeps discovery silent for robot and probe callers.
+	WarningHandler func(msg string)
 }
 
 // DiscoverSources finds all potential data sources in the beads directory
@@ -107,9 +126,9 @@ func DiscoverSources(opts DiscoveryOptions) ([]DataSource, error) {
 		}
 
 		// Check BEADS_DB environment variable (can be file or directory)
-		if envDB := os.Getenv("BEADS_DB"); envDB != "" {
+		if envDB := env.BeadsDB.Get(); envDB != "" {
 			beadsDir = resolveBeadsDBPath(envDB)
-		} else if envDir := os.Getenv("BEADS_DIR"); envDir != "" {
+		} else if envDir := env.BeadsDir.Get(); envDir != "" {
 			// Check BEADS_DIR environment variable
 			beadsDir = envDir
 		} else {
@@ -237,6 +256,10 @@ func discoverLocalJSONLSources(beadsDir string, opts DiscoveryOptions) ([]DataSo
 	if err != nil {
 		return nil, fmt.Errorf("failed to read beads directory: %w", err)
 	}
+	// Filename authority is resolved before comparing this export with
+	// SQLite or worktree sources. A newer base/legacy snapshot must not
+	// shadow the canonical export, even when the canonical file is empty.
+	preferredPath, selectionErr := loader.FindJSONLPathWithWarnings(beadsDir, opts.WarningHandler)
 
 	for _, e := range entries {
 		if e.IsDir() {
@@ -249,19 +272,32 @@ func discoverLocalJSONLSources(beadsDir string, opts DiscoveryOptions) ([]DataSo
 			continue
 		}
 
-		// Skip backups, merge artifacts, and deletion manifests
-		if strings.Contains(name, ".backup") ||
-			strings.Contains(name, ".orig") ||
-			strings.Contains(name, ".merge") ||
-			name == "deletions.jsonl" ||
-			strings.HasPrefix(name, "beads.left") ||
-			strings.HasPrefix(name, "beads.right") {
+		// Only the canonical issue-file names are candidates. Discovery picks
+		// the freshest candidate, so anything else that lives beside
+		// issues.jsonl — br's sync_base.jsonl (a full, valid, stale snapshot),
+		// bv's sprints.jsonl and correlation_feedback.jsonl, bd's memories and
+		// interactions files, merge artifacts, backups — must never compete:
+		// a fresher sync_base.jsonl silently replaced the whole issue set, and
+		// probing sprints.jsonl printed spurious loader warnings.
+		if !isIssueFileName(name) {
+			if opts.Verbose {
+				opts.Logger(fmt.Sprintf("Skipping %s: not an issue file name (candidates: %s)", name, strings.Join(loader.PreferredJSONLNames, ", ")))
+			}
 			continue
 		}
 
 		path := filepath.Join(beadsDir, name)
-		info, err := e.Info()
+		if selectionErr != nil || path != preferredPath {
+			if opts.Verbose {
+				opts.Logger(fmt.Sprintf("Skipping %s: not the preferred local issue export", name))
+			}
+			continue
+		}
+		info, err := os.Stat(path)
 		if err != nil {
+			return nil, fmt.Errorf("inspect local issue export %s: %w", path, err)
+		}
+		if !info.Mode().IsRegular() {
 			continue
 		}
 
@@ -278,7 +314,7 @@ func discoverLocalJSONLSources(beadsDir string, opts DiscoveryOptions) ([]DataSo
 		}
 	}
 
-	return sources, nil
+	return sources, selectionErr
 }
 
 // discoverWorktreeSources finds JSONL files in git worktree beads directories

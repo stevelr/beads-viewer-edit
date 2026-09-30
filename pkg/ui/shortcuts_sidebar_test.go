@@ -203,7 +203,6 @@ func TestShortcutsSidebar_MatchesRegistry(t *testing.T) {
 			Key:      "test-key",
 			Desc:     "Test action",
 			Category: "TestCategory",
-			Handler:  func(m Model, msg tea.KeyMsg) (Model, bool) { return m, true },
 		})
 
 		sidebar.SetKeyRegistry(registry)

@@ -2,9 +2,8 @@
   description = "bv - Terminal UI for the Beads issue tracker";
 
   inputs = {
-    # Use nixpkgs unstable for Go 1.25+ support
-    # go.mod requires go 1.25, which isn't in stable nixpkgs yet
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # Go 1.26 support while retaining the existing Intel macOS package.
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -13,7 +12,7 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        version = "0.22.0";
+        version = "0.25.0";
 
         # To update vendorHash after go.mod/go.sum changes:
         # 1. Set vendorHash to: pkgs.lib.fakeHash
@@ -34,6 +33,11 @@
             inherit vendorHash;
 
             subPackages = [ "cmd/bv" ];
+
+            # CLI tests create isolated Git repositories and configure checkout
+            # trust. Declare Git in the test environment instead of relying on
+            # a host installation outside the Nix sandbox.
+            nativeCheckInputs = [ pkgs.gitMinimal ];
 
             ldflags = [
               "-s"

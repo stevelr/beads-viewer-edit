@@ -1,16 +1,21 @@
 package export
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 // makeTestIssue creates a test issue with given parameters.
@@ -56,6 +61,294 @@ func TestSetGitHash(t *testing.T) {
 
 	if exp.gitHash != "abc123" {
 		t.Errorf("Expected git hash abc123, got %s", exp.gitHash)
+	}
+}
+
+func TestSQLiteExportFullSourceReadiness(t *testing.T) {
+	now := time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC)
+	later := now.Add(time.Hour)
+	dep := func(id string, kind model.DependencyType) *model.Dependency {
+		return &model.Dependency{DependsOnID: id, Type: kind}
+	}
+	cases := []struct {
+		issue model.Issue
+		state model.DependencyState
+		ready bool
+	}{
+		{model.Issue{ID: "open", Status: model.StatusOpen}, model.DependenciesSatisfied, true},
+		{model.Issue{ID: "progress", Status: model.StatusInProgress, Assignee: "agent"}, model.DependenciesSatisfied, true},
+		{model.Issue{ID: "deferred", Status: model.StatusOpen, DeferUntil: &later}, model.DependenciesSatisfied, false},
+		{model.Issue{ID: "due-now", Status: model.StatusOpen, DeferUntil: &now}, model.DependenciesSatisfied, true},
+		{model.Issue{ID: "blocked-status", Status: model.StatusBlocked}, model.DependenciesSatisfied, false},
+		{model.Issue{ID: "custom-status", Status: "qa-review"}, model.DependenciesSatisfied, false},
+		{model.Issue{ID: "missing", Status: model.StatusOpen, Dependencies: []*model.Dependency{dep("absent", model.DepBlocks)}}, model.DependenciesUnknown, false},
+		{model.Issue{ID: "missing-parent", Status: model.StatusOpen, Dependencies: []*model.Dependency{dep("absent", model.DepParentChild)}}, model.DependenciesUnknown, false},
+		{model.Issue{ID: "filtered-blocker", Status: model.StatusOpen, Dependencies: []*model.Dependency{dep("hidden-open", model.DepWaitsFor)}}, model.DependenciesUnsatisfied, false},
+		{model.Issue{ID: "inherited", Status: model.StatusOpen, Dependencies: []*model.Dependency{dep("hidden-parent", model.DepParentChild)}}, model.DependenciesUnsatisfied, false},
+		{model.Issue{ID: "resolved", Status: model.StatusOpen, Dependencies: []*model.Dependency{dep("hidden-closed", model.DepBlocks), dep("hidden-deleted", model.DepWaitsFor)}}, model.DependenciesSatisfied, true},
+	}
+	source := []model.Issue{
+		{ID: "hidden-open", Status: model.StatusOpen},
+		{ID: "hidden-parent", Status: model.StatusOpen, Dependencies: []*model.Dependency{dep("hidden-open", model.DepConditionalBlocks)}},
+		{ID: "hidden-closed", Status: model.StatusClosed},
+		{ID: "hidden-deleted", Status: model.StatusTombstone},
+	}
+	var visible []*model.Issue
+	for i := range cases {
+		cases[i].issue.Title = cases[i].issue.ID
+		cases[i].issue.IssueType = model.TypeTask
+		source = append(source, cases[i].issue)
+		visible = append(visible, &cases[i].issue)
+	}
+	exporter := NewSQLiteExporter(visible, nil, nil, nil)
+	exporter.Config.Readiness = model.NewReadinessIndex(source)
+	exporter.Config.ReadinessAt = now
+	output := t.TempDir()
+	if err := exporter.Export(output); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(output, "beads.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, tc := range cases {
+		var state string
+		var ready bool
+		if err := db.QueryRow(`SELECT dependency_state, is_actionable FROM issue_overview_mv WHERE id = ?`, tc.issue.ID).Scan(&state, &ready); err != nil {
+			t.Fatal(err)
+		}
+		if state != string(tc.state) || ready != tc.ready {
+			t.Errorf("%s: state=%s ready=%v, want %s/%v", tc.issue.ID, state, ready, tc.state, tc.ready)
+		}
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM issues WHERE id LIKE 'hidden-%'`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("context rows leaked into display: count=%d err=%v", count, err)
+	}
+	var clock string
+	if err := db.QueryRow(`SELECT value FROM export_meta WHERE key='readiness_at'`).Scan(&clock); err != nil || clock != now.Format(time.RFC3339Nano) {
+		t.Fatalf("readiness clock=%q err=%v", clock, err)
+	}
+}
+
+func TestSQLiteExportStandaloneReadinessRefresh(t *testing.T) {
+	prerequisite := makeTestIssue("root", "Root", model.StatusOpen, 1, model.TypeTask)
+	child := makeTestIssue("child", "Child", model.StatusOpen, 1, model.TypeTask)
+	child.Dependencies = []*model.Dependency{{IssueID: "child", DependsOnID: "root", Type: model.DepBlocks}}
+	// Supply the same edge both ways, as real callers may do, plus a separate
+	// missing prerequisite. Neither merging nor a later export may mutate input.
+	missing := makeTestIssue("missing-child", "Missing", model.StatusOpen, 1, model.TypeTask)
+	exporter := NewSQLiteExporter([]*model.Issue{prerequisite, child, missing}, []*model.Dependency{
+		child.Dependencies[0], {IssueID: "missing-child", DependsOnID: "absent", Type: model.DepBlocks},
+	}, nil, nil)
+	for _, closed := range []bool{false, true} {
+		if closed {
+			prerequisite.Status = model.StatusClosed
+		}
+		output := t.TempDir()
+		if err := exporter.Export(output); err != nil {
+			t.Fatal(err)
+		}
+		db, err := sql.Open("sqlite", filepath.Join(output, "beads.sqlite3"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ready bool
+		if err := db.QueryRow(`SELECT is_actionable FROM issue_overview_mv WHERE id='child'`).Scan(&ready); err != nil || ready != closed {
+			t.Errorf("after root closed=%v child ready=%v err=%v", closed, ready, err)
+		}
+		var state string
+		if err := db.QueryRow(`SELECT dependency_state, is_actionable FROM issue_overview_mv WHERE id='missing-child'`).Scan(&state, &ready); err != nil || state != "unknown" || ready {
+			t.Errorf("missing prerequisite: state=%q ready=%v err=%v", state, ready, err)
+		}
+		db.Close()
+	}
+	if len(child.Dependencies) != 1 || len(missing.Dependencies) != 0 {
+		t.Fatal("export mutated caller dependency slices")
+	}
+}
+
+func TestSQLiteExportMetadataRollsBackFailedInsert(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "metadata-rollback.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if err := CreateSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertMetaValue(db, "sentinel", "preserve me"); err != nil {
+		t.Fatal(err)
+	}
+	// Reject the second new metadata row regardless of Go map iteration
+	// order. ABORT rolls back only that statement, so the caller must roll
+	// back the earlier successful write as part of its own transaction.
+	if _, err := db.Exec(`CREATE TRIGGER reject_second_metadata
+		BEFORE INSERT ON export_meta
+		WHEN (SELECT COUNT(*) FROM export_meta WHERE key <> 'sentinel') >= 1
+		BEGIN
+			SELECT RAISE(ABORT, 'reject second metadata row');
+		END`); err != nil {
+		t.Fatal(err)
+	}
+	exporter := NewSQLiteExporter(nil, nil, nil, nil)
+	exporter.readiness = model.NewReadinessIndex(nil)
+	exporter.readinessAt = time.Date(2026, 9, 12, 0, 0, 0, 0, time.UTC)
+	err = exporter.insertMeta(db)
+	var sqliteErr *sqlite.Error
+	if err == nil || !strings.Contains(err.Error(), "reject second metadata row") || !errors.As(err, &sqliteErr) {
+		t.Fatalf("expected SQLite trigger refusal after the first metadata write, got %v", err)
+	}
+	if db.Stats().InUse != 0 {
+		t.Fatal("failed metadata insertion retained its connection")
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM export_meta`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("failed metadata insertion left %d rows; want only the original sentinel", count)
+	}
+	var value string
+	if err := db.QueryRow(`SELECT value FROM export_meta WHERE key = 'sentinel'`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "preserve me" {
+		t.Fatalf("existing metadata changed: %q", value)
+	}
+}
+
+func TestSQLiteExportFailedRebuildPreservesPublishedDatabase(t *testing.T) {
+	output := t.TempDir()
+	issue := makeTestIssue("published", "Original", model.StatusOpen, 1, model.TypeTask)
+	exporter := NewSQLiteExporter([]*model.Issue{issue}, nil, nil, nil)
+	if err := exporter.Export(output); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(output, "beads.sqlite3")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A real primary-key violation fails after schema creation and partial
+	// inserts. The previously published snapshot must remain byte-for-byte intact.
+	broken := NewSQLiteExporter([]*model.Issue{issue, issue}, nil, nil, nil)
+	if err := broken.Export(output); err == nil || !strings.Contains(err.Error(), "UNIQUE constraint failed: issues.id") {
+		t.Fatalf("expected duplicate issue primary-key failure, got %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("failed rebuild changed published database: %v", err)
+	}
+	issue.Title = "Rebuilt"
+	if err := exporter.Export(output); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var title string
+	if err := db.QueryRow(`SELECT title FROM issues WHERE id='published'`).Scan(&title); err != nil || title != "Rebuilt" {
+		t.Fatalf("successful rebuild not published: title=%q err=%v", title, err)
+	}
+	remaining, err := filepath.Glob(filepath.Join(output, ".beads-*"))
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("temporary databases remain: %v err=%v", remaining, err)
+	}
+}
+
+func TestSQLiteExportRespectsUmask(t *testing.T) {
+	const directoryEnv = "BV_TEST_EXPORT_UMASK_DIR"
+	const maskEnv = "BV_TEST_EXPORT_UMASK"
+	if directory := os.Getenv(directoryEnv); directory != "" {
+		mask := os.Getenv(maskEnv)
+		want := os.FileMode(0644)
+		if mask == "077" {
+			want = 0600
+		} else if mask != "022" {
+			t.Fatalf("unsupported test umask %q", mask)
+		}
+		issue := makeTestIssue("private", "Private issue", model.StatusOpen, 1, model.TypeTask)
+		exporter := NewSQLiteExporter([]*model.Issue{issue}, nil, nil, nil)
+		for range 2 {
+			if err := exporter.Export(directory); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(filepath.Join(directory, "beads.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Mode().Perm(); got != want {
+				t.Fatalf("database mode under umask %s = %04o, want %04o", mask, got, want)
+			}
+		}
+		return
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix umask semantics")
+	}
+	for _, mask := range []string{"077", "022"} {
+		t.Run(mask, func(t *testing.T) {
+			directory := t.TempDir()
+			if err := os.Chmod(directory, 0755); err != nil {
+				t.Fatal(err)
+			}
+			// Change the mask only in a subprocess, never in the concurrent test runner.
+			command := exec.Command("sh", "-c", `umask "$1"; shift; exec "$@"`, "sh", mask, os.Args[0], "-test.run=^TestSQLiteExportRespectsUmask$") // ubs:ignore — fixed shell program; literal test masks and executable are passed as quoted positional arguments.
+			command.Env = append(os.Environ(), directoryEnv+"="+directory, maskEnv+"="+mask)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("umask %s export failed: %v\n%s", mask, err, output)
+			}
+		})
+	}
+}
+
+func TestWriteRobotJSONPreservesPayloadTimestamp(t *testing.T) {
+	const precise = "2026-09-05T02:00:00.123456789Z"
+	const envelopeTime = "2026-09-05T02:00:00Z"
+	for _, tc := range []struct {
+		name    string
+		payload map[string]any
+		want    string
+	}{
+		{"precise payload", map[string]any{"generated_at": precise, "issue_count": 2}, precise},
+		{"envelope fallback", map[string]any{"issue_count": 2}, envelopeTime},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exporter := NewSQLiteExporter(nil, nil, nil, nil)
+			exporter.Config.RobotEnvelope = map[string]json.RawMessage{
+				"generated_at":     json.RawMessage(`"` + envelopeTime + `"`),
+				"source_authority": json.RawMessage(`{"state":"partial","claim_safe":false}`),
+				"authority_hash":   json.RawMessage(`"source-fingerprint"`),
+			}
+			path := filepath.Join(t.TempDir(), "meta.json")
+			if err := exporter.writeRobotJSON(path, tc.payload); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got struct {
+				GeneratedAt   string `json:"generated_at"`
+				IssueCount    int    `json:"issue_count"`
+				AuthorityHash string `json:"authority_hash"`
+				Authority     struct {
+					State     string `json:"state"`
+					ClaimSafe bool   `json:"claim_safe"`
+				} `json:"source_authority"`
+			}
+			if err := json.Unmarshal(data, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.GeneratedAt != tc.want || got.IssueCount != 2 || got.AuthorityHash != "source-fingerprint" || got.Authority.State != "partial" || got.Authority.ClaimSafe {
+				t.Fatalf("payload timestamp or shared authority changed: got %s, want timestamp %q, count2 and partial authority", data, tc.want)
+			}
+		})
 	}
 }
 

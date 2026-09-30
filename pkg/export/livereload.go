@@ -202,9 +202,19 @@ func (h *LiveReloadHub) removeClient(ch chan struct{}) {
 	delete(h.clients, ch)
 }
 
-// LiveReloadScript returns JavaScript that connects to the SSE endpoint and reloads on events.
-const LiveReloadScript = `<script>
-(function() {
+// LiveReloadScriptPath is where the preview server serves the live-reload
+// script. It is a same-origin file (not an inline block) because the exported
+// dashboard's Content-Security-Policy forbids inline scripts; injecting an
+// inline <script> would be refused by the browser and live reload would
+// silently never connect.
+const LiveReloadScriptPath = "/__preview__/livereload.js"
+
+// LiveReloadScriptTag is the tag injected before </body> in HTML responses.
+const LiveReloadScriptTag = `<script src="` + LiveReloadScriptPath + `"></script>`
+
+// LiveReloadScript is the JavaScript served at LiveReloadScriptPath: it
+// connects to the SSE endpoint and reloads the page on events.
+const LiveReloadScript = `(function() {
   if (typeof(EventSource) === 'undefined') return;
   var reconnectDelay = 1000;
   var maxReconnectDelay = 30000;
@@ -232,9 +242,23 @@ const LiveReloadScript = `<script>
 
   connect();
 })();
-</script>`
+`
 
-// liveReloadMiddleware injects the live-reload script into HTML responses.
+// liveReloadScriptHandler serves LiveReloadScript as a JavaScript file.
+func liveReloadScriptHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = w.Write([]byte(LiveReloadScript))
+}
+
+// liveReloadMiddleware injects the live-reload script tag into HTML responses.
 func liveReloadMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Only inject into HTML files
@@ -243,10 +267,10 @@ func liveReloadMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Wrap response writer to inject script
+		// Wrap response writer to inject the script tag
 		irw := &injectingResponseWriter{
 			ResponseWriter: w,
-			inject:         []byte(LiveReloadScript),
+			inject:         []byte(LiveReloadScriptTag),
 		}
 
 		next.ServeHTTP(irw, r)

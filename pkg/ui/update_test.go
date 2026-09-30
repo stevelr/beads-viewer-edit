@@ -1,15 +1,21 @@
 package ui
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/charmbracelet/bubbles/list"
+	tea "github.com/charmbracelet/bubbletea"
 	_ "modernc.org/sqlite"
 )
 
@@ -46,7 +52,7 @@ func TestCopyIssueToClipboardInvalidItem(t *testing.T) {
 	m := NewModel(nil, nil, "")
 	m.list.SetItems([]list.Item{badItem{}})
 	m.list.Select(0)
-	m.copyIssueToClipboard()
+	_ = m.copyIssueToClipboard()
 	if !m.statusIsError || m.statusMsg == "" {
 		t.Fatalf("expected error copying invalid item, got %q", m.statusMsg)
 	}
@@ -93,7 +99,8 @@ func TestInsightsCurrentPanelItemCount(t *testing.T) {
 }
 
 func TestUpdateFileChangedReloadsSelection(t *testing.T) {
-	data := `{"id":"ONE","title":"One","status":"open"}`
+	t.Setenv("BV_BACKGROUND_MODE", "0")
+	data := `{"id":"ONE","title":"One","status":"open","issue_type":"task"}`
 	tmp := t.TempDir()
 	beads := filepath.Join(tmp, "beads.jsonl")
 	if err := os.WriteFile(beads, []byte(data), 0644); err != nil {
@@ -108,6 +115,440 @@ func TestUpdateFileChangedReloadsSelection(t *testing.T) {
 	m2 := updated.(*Model)
 	if m2.statusIsError {
 		t.Fatalf("expected successful reload, got error %q", m2.statusMsg)
+	}
+	if !m2.historyLoading || m2.historyLoadRequestGeneration == 0 ||
+		m2.historyLoadDataGeneration != m2.semanticDataGeneration {
+		t.Fatalf(
+			"sync reload did not own a current history refresh: loading=%v data=%d current=%d request=%d",
+			m2.historyLoading,
+			m2.historyLoadDataGeneration,
+			m2.semanticDataGeneration,
+			m2.historyLoadRequestGeneration,
+		)
+	}
+}
+
+func historyReportWithIssue(id, title string) *correlation.HistoryReport {
+	return &correlation.HistoryReport{
+		Histories: map[string]correlation.BeadHistory{
+			id: {
+				BeadID: id,
+				Title:  title,
+				Commits: []correlation.CorrelatedCommit{
+					{SHA: "abc123", ShortSHA: "abc123", Message: title},
+				},
+			},
+		},
+	}
+}
+
+func TestHistoryLoadRejectsStaleCompletionAfterSnapshotSwap(t *testing.T) {
+	m := NewModel([]model.Issue{{ID: "OLD", Title: "Old", Status: model.StatusOpen}}, nil, "")
+	if cmd := m.startHistoryLoad(); cmd == nil {
+		t.Fatal("initial history request was not scheduled")
+	}
+	oldDataGeneration := m.historyLoadDataGeneration
+	oldRequestGeneration := m.historyLoadRequestGeneration
+
+	snapshot := NewSnapshotBuilder([]model.Issue{{ID: "NEW", Title: "New", Status: model.StatusOpen}}).Build()
+	updated, _ := m.Update(SnapshotReadyMsg{Snapshot: snapshot, SnapshotVer: 1})
+	m = updated.(*Model)
+	if !m.historyLoading {
+		t.Fatal("snapshot swap did not start a current history request")
+	}
+	if m.historyLoadRequestGeneration == oldRequestGeneration {
+		t.Fatal("snapshot swap reused the previous history request generation")
+	}
+
+	staleReport := historyReportWithIssue("OLD", "Old")
+	updated, _ = m.Update(HistoryLoadedMsg{
+		DataGeneration:    oldDataGeneration,
+		RequestGeneration: oldRequestGeneration,
+		Report:            staleReport,
+	})
+	m = updated.(*Model)
+	if m.historyView.report == staleReport {
+		t.Fatal("stale history completion replaced the current history view")
+	}
+	if !m.historyLoading {
+		t.Fatal("stale history completion cleared current request ownership")
+	}
+
+	currentReport := historyReportWithIssue("NEW", "New")
+	updated, _ = m.Update(HistoryLoadedMsg{
+		DataGeneration:    m.historyLoadDataGeneration,
+		RequestGeneration: m.historyLoadRequestGeneration,
+		Report:            currentReport,
+	})
+	m = updated.(*Model)
+	if m.historyLoading {
+		t.Fatal("accepted history completion left the request active")
+	}
+	if m.historyView.report != currentReport {
+		t.Fatal("current history completion was not installed")
+	}
+}
+
+func TestHistoryLoadCancelsInjectedBlockingLoader(t *testing.T) {
+	type historyRequest struct {
+		ctx               context.Context
+		dataGeneration    uint64
+		requestGeneration uint64
+	}
+
+	created := make(chan historyRequest, 2)
+	started := make(chan uint64, 2)
+	completed := make(chan tea.Msg, 2)
+	m := NewModel([]model.Issue{{ID: "OLD", Title: "Old", Status: model.StatusOpen}}, nil, "")
+	defer m.cancelHistoryLoad()
+	m.historyLoadCommand = func(
+		ctx context.Context,
+		_ []correlation.BeadInfo,
+		_ string,
+		dataGeneration, requestGeneration uint64,
+	) tea.Cmd {
+		created <- historyRequest{
+			ctx:               ctx,
+			dataGeneration:    dataGeneration,
+			requestGeneration: requestGeneration,
+		}
+		return func() tea.Msg {
+			started <- requestGeneration
+			<-ctx.Done()
+			return HistoryLoadedMsg{
+				DataGeneration:    dataGeneration,
+				RequestGeneration: requestGeneration,
+				Error:             ctx.Err(),
+			}
+		}
+	}
+
+	firstCmd := m.startHistoryLoad()
+	if firstCmd == nil {
+		t.Fatal("initial history command was not scheduled")
+	}
+	first := <-created
+	go func() { completed <- firstCmd() }()
+	select {
+	case got := <-started:
+		if got != first.requestGeneration {
+			t.Fatalf("started request = %d, want %d", got, first.requestGeneration)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initial blocking history command did not start")
+	}
+
+	requestGeneration := m.historyLoadRequestGeneration
+	if cmd := m.startHistoryLoad(); cmd != nil {
+		t.Fatal("same-dataset history request was not coalesced")
+	}
+	if m.historyLoadRequestGeneration != requestGeneration {
+		t.Fatal("coalesced history request consumed a request generation")
+	}
+	select {
+	case <-first.ctx.Done():
+		t.Fatal("same-dataset coalescing cancelled the shared history request")
+	default:
+	}
+	select {
+	case request := <-created:
+		t.Fatalf("coalesced history request created command %d", request.requestGeneration)
+	default:
+	}
+
+	m.beginSemanticDatasetUpdate()
+	secondCmd := m.startHistoryLoad()
+	if secondCmd == nil {
+		t.Fatal("replacement history command was not scheduled")
+	}
+	second := <-created
+	if second.dataGeneration != m.semanticDataGeneration ||
+		second.requestGeneration == first.requestGeneration {
+		t.Fatalf(
+			"replacement ownership = data %d/request %d, current data %d/old request %d",
+			second.dataGeneration,
+			second.requestGeneration,
+			m.semanticDataGeneration,
+			first.requestGeneration,
+		)
+	}
+	select {
+	case <-first.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not cancel the superseded history context")
+	}
+	go func() { completed <- secondCmd() }()
+	select {
+	case got := <-started:
+		if got != second.requestGeneration {
+			t.Fatalf("started request = %d, want %d", got, second.requestGeneration)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement blocking history command did not start")
+	}
+
+	var stale tea.Msg
+	select {
+	case stale = <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("superseded history command was not cancelled")
+	}
+	updated, _ := m.Update(stale)
+	m = updated.(*Model)
+	if !m.historyLoading || m.historyLoadRequestGeneration != second.requestGeneration {
+		t.Fatal("cancelled stale completion cleared replacement ownership")
+	}
+
+	m.historyView.SetReport(historyReportWithIssue("OLD", "Old"))
+	m.issues = nil
+	m.beginSemanticDatasetUpdate()
+	if cmd := m.startHistoryLoad(); cmd != nil {
+		t.Fatal("zero-issue dataset scheduled a history command")
+	}
+	if m.historyLoading || m.historyLoadCancel != nil || m.historyView.report != nil {
+		t.Fatal("zero-issue dataset did not cancel and clear history ownership")
+	}
+	select {
+	case <-second.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("zero-issue update did not cancel the replacement history context")
+	}
+	select {
+	case cancelled := <-completed:
+		updated, _ = m.Update(cancelled)
+		m = updated.(*Model)
+		if m.historyView.report != nil || m.historyLoading {
+			t.Fatal("cancelled completion resurrected history after zero-issue update")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("zero-issue update did not cancel replacement history command")
+	}
+}
+
+func TestQuitCommandCancelsHistoryLoad(t *testing.T) {
+	var owned context.Context
+	m := NewModel([]model.Issue{{ID: "A", Status: model.StatusOpen}}, nil, "")
+	m.historyLoadCommand = func(
+		ctx context.Context,
+		_ []correlation.BeadInfo,
+		_ string,
+		_, _ uint64,
+	) tea.Cmd {
+		owned = ctx
+		return func() tea.Msg { return nil }
+	}
+	if cmd := m.startHistoryLoad(); cmd == nil || owned == nil {
+		t.Fatal("history load did not acquire cancellable ownership")
+	}
+
+	quit := m.quitCommand()
+	select {
+	case <-owned.Done():
+	case <-time.After(time.Second):
+		t.Fatal("quit did not cancel the active history load")
+	}
+	if m.historyLoadCancel != nil {
+		t.Fatal("quit retained a consumed history cancellation function")
+	}
+	quitMsg := quit()
+	if _, ok := quitMsg.(tea.QuitMsg); !ok {
+		t.Fatalf("quit command returned %T, want tea.QuitMsg", quitMsg)
+	}
+}
+
+func TestStopCancelsHistoryLoad(t *testing.T) {
+	var owned context.Context
+	m := NewModel([]model.Issue{{ID: "A", Status: model.StatusOpen}}, nil, "")
+	m.historyLoadCommand = func(
+		ctx context.Context,
+		_ []correlation.BeadInfo,
+		_ string,
+		_, _ uint64,
+	) tea.Cmd {
+		owned = ctx
+		return func() tea.Msg { return nil }
+	}
+	if cmd := m.startHistoryLoad(); cmd == nil || owned == nil {
+		t.Fatal("history load did not acquire cancellable ownership")
+	}
+
+	m.Stop()
+	select {
+	case <-owned.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Model.Stop did not cancel the active history load")
+	}
+	if m.historyLoadCancel != nil {
+		t.Fatal("Model.Stop retained a consumed history cancellation function")
+	}
+}
+
+func TestEnterHistoryViewSchedulesAsyncRetryWithoutGitWorkOnUpdateLoop(t *testing.T) {
+	created := 0
+	m := NewModel([]model.Issue{{ID: "A", Status: model.StatusOpen}}, nil, "")
+	m.historyLoading = false
+	m.historyLoadFailed = true
+	m.historyLoadCommand = func(
+		_ context.Context,
+		_ []correlation.BeadInfo,
+		_ string,
+		_, _ uint64,
+	) tea.Cmd {
+		created++
+		return func() tea.Msg { return nil }
+	}
+
+	cmd := m.enterHistoryView()
+	if cmd == nil || created != 1 {
+		t.Fatalf("enterHistoryView command=%v factories=%d, want one asynchronous retry", cmd != nil, created)
+	}
+	if !m.isHistoryView || m.focused != focusHistory || !m.historyLoading {
+		t.Fatalf("history view state visible=%v focus=%v loading=%v", m.isHistoryView, m.focused, m.historyLoading)
+	}
+	m.cancelHistoryLoad()
+}
+
+func TestGlobalHistoryToggleSchedulesRetryAndKeepsTinyTerminalUsable(t *testing.T) {
+	created := 0
+	m := NewModel([]model.Issue{{ID: "A", Status: model.StatusOpen}}, nil, "")
+	m.height = 2
+	m.historyLoading = false
+	m.historyLoadFailed = true
+	m.historyLoadCommand = func(
+		_ context.Context,
+		_ []correlation.BeadInfo,
+		_ string,
+		_, _ uint64,
+	) tea.Cmd {
+		created++
+		return func() tea.Msg { return nil }
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	m = updated.(*Model)
+	if cmd == nil || created != 1 || !m.isHistoryView || m.focused != focusHistory {
+		t.Fatalf("global h command=%v factories=%d visible=%v focus=%v", cmd != nil, created, m.isHistoryView, m.focused)
+	}
+	if m.historyView.height < 5 {
+		t.Fatalf("tiny-terminal history height=%d, want floor 5", m.historyView.height)
+	}
+	m.cancelHistoryLoad()
+}
+
+func TestHistoryRefreshHidesAndDisablesPreviousDatasetReport(t *testing.T) {
+	const oldTitle = "OLD-DATASET-SENTINEL"
+	m := NewModel([]model.Issue{{ID: "OLD", Title: oldTitle, Status: model.StatusOpen}}, nil, "")
+	oldReport := historyReportWithIssue("OLD", oldTitle)
+	m.historyView.SetReport(oldReport)
+	m.historyReportDataGeneration = m.semanticDataGeneration
+	m.isHistoryView = true
+	m.focused = focusHistory
+	m.historyLoading = false
+	m.historyLoadCommand = func(
+		_ context.Context,
+		_ []correlation.BeadInfo,
+		_ string,
+		_, _ uint64,
+	) tea.Cmd {
+		return func() tea.Msg { return nil }
+	}
+
+	m.issues = []model.Issue{{ID: "NEW", Title: "New", Status: model.StatusOpen}}
+	m.beginSemanticDatasetUpdate()
+	if cmd := m.startHistoryLoad(); cmd == nil {
+		t.Fatal("new dataset did not start a history load")
+	}
+	if m.historyReportIsCurrent() {
+		t.Fatal("previous dataset report remained current after generation advance")
+	}
+	view := m.View()
+	if strings.Contains(view, oldTitle) || !strings.Contains(view, "Loading history") {
+		t.Fatalf("history refresh view exposed stale report or omitted loading state: %q", view)
+	}
+	selectedBefore := m.historyView.SelectedBeadID()
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = updated.(*Model)
+	if got := m.historyView.SelectedBeadID(); got != selectedBefore {
+		t.Fatalf("stale history accepted navigation: got %q, want %q", got, selectedBefore)
+	}
+	m.cancelHistoryLoad()
+}
+
+func TestHistoryFailureRetainsHiddenSelectionAndHRetriesInPlace(t *testing.T) {
+	m := NewModel([]model.Issue{{ID: "OLD", Status: model.StatusOpen}}, nil, "")
+	oldReport := historyReportWithIssue("OLD", "Old")
+	m.historyView.SetReport(oldReport)
+	m.historyReportDataGeneration = m.semanticDataGeneration
+	m.isHistoryView = true
+	m.focused = focusHistory
+	m.historyLoading = false
+	m.issues = []model.Issue{{ID: "NEW", Status: model.StatusOpen}}
+	m.beginSemanticDatasetUpdate()
+	m.historyLoadCommand = func(
+		_ context.Context,
+		_ []correlation.BeadInfo,
+		_ string,
+		_, _ uint64,
+	) tea.Cmd {
+		return func() tea.Msg { return nil }
+	}
+	if cmd := m.startHistoryLoad(); cmd == nil {
+		t.Fatal("new dataset did not start a history load")
+	}
+	updated, _ := m.Update(HistoryLoadedMsg{
+		DataGeneration:    m.historyLoadDataGeneration,
+		RequestGeneration: m.historyLoadRequestGeneration,
+		Error:             errors.New("temporary git failure"),
+	})
+	m = updated.(*Model)
+	if m.historyView.report != oldReport || m.historyView.SelectedBeadID() != "OLD" {
+		t.Fatal("failed refresh discarded hidden report identity")
+	}
+	if m.historyReportIsCurrent() {
+		t.Fatal("failed refresh exposed the previous generation as current")
+	}
+	updated, retryCmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	m = updated.(*Model)
+	if retryCmd == nil || !m.isHistoryView || !m.historyLoading {
+		t.Fatalf("one-key retry command=%v visible=%v loading=%v", retryCmd != nil, m.isHistoryView, m.historyLoading)
+	}
+	m.cancelHistoryLoad()
+}
+
+func TestHistoryRefreshPreservesActiveSearchSession(t *testing.T) {
+	m := NewModel([]model.Issue{{ID: "NEW", Title: "Beta work", Status: model.StatusOpen}}, nil, "")
+	m.historyView = NewHistoryModel(historyReportWithIssue("OLD", "Alpha work"), m.theme)
+	m.isHistoryView = true
+	m.focused = focusHistory
+	focusCmd := m.historyView.StartSearch()
+	m.historyView.searchInput.SetValue("beta")
+	m.historyView.lastSearchQuery = "beta"
+	m.historyView.applySearchFilter()
+	_ = m.beginEmbeddedTextInputSession(embeddedTextInputHistorySearch, focusCmd)
+	session := m.embeddedTextInputSession
+
+	if cmd := m.startHistoryLoad(); cmd == nil {
+		t.Fatal("history refresh was not scheduled")
+	}
+	refreshed := historyReportWithIssue("NEW", "Beta work")
+	updated, _ := m.Update(HistoryLoadedMsg{
+		DataGeneration:    m.historyLoadDataGeneration,
+		RequestGeneration: m.historyLoadRequestGeneration,
+		Report:            refreshed,
+	})
+	m = updated.(*Model)
+
+	if got := m.historyView.SearchQuery(); got != "beta" {
+		t.Fatalf("search query = %q, want beta", got)
+	}
+	if !m.historyView.IsSearchActive() || !m.historyView.searchInput.Focused() {
+		t.Fatal("history refresh dropped active search focus")
+	}
+	if !m.embeddedTextInputSessionIsActive(session) {
+		t.Fatal("history refresh invalidated the active embedded-input session")
+	}
+	if len(m.historyView.beadIDs) != 1 || m.historyView.beadIDs[0] != "NEW" {
+		t.Fatalf("refreshed search results = %#v, want [NEW]", m.historyView.beadIDs)
 	}
 }
 
@@ -150,6 +591,64 @@ func TestUpdateFileChangedReloadsSQLiteSource(t *testing.T) {
 	}
 }
 
+func TestReloadPreservesHiddenTombstoneAuthority(t *testing.T) {
+	for _, kind := range []string{"jsonl", "sqlite3"} {
+		t.Run(kind, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "issues."+kind)
+			if kind == "jsonl" {
+				content := `{"id":"READY","title":"Satisfied predecessor","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"DELETED","type":"blocks"}]}` + "\n" +
+					`{"id":"UNKNOWN","title":"Missing predecessor","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"ABSENT","type":"blocks"}]}` + "\n" +
+					`{"id":"DELETED","title":"Deleted","status":"tombstone","issue_type":"task"}` + "\n"
+				if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				db, err := sql.Open("sqlite", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				if _, err := db.Exec(`
+					CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL);
+					CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT);
+					INSERT INTO issues VALUES ('READY', 'Satisfied predecessor', 'open'), ('UNKNOWN', 'Missing predecessor', 'open'), ('DELETED', 'Deleted', 'tombstone');
+					INSERT INTO dependencies VALUES ('READY', 'DELETED', 'blocks'), ('UNKNOWN', 'ABSENT', 'blocks');
+				`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			m := NewModel(nil, nil, "")
+			m.beadsPath = path
+			updated, _ := m.Update(FileChangedMsg{})
+			m = updated.(*Model)
+			defer loader.ReturnIssuePtrsToPool(m.pooledIssues)
+			if m.statusIsError || len(m.issues) != 2 || m.issueMap["DELETED"] != nil {
+				t.Fatalf("deleted issue was resurrected or reload failed: rows=%v status=%q", m.issues, m.statusMsg)
+			}
+			m.SetFilter("ready")
+			if got := m.FilteredIssues(); len(got) != 1 || got[0].ID != "READY" || m.countReady != 1 {
+				t.Errorf("synchronous reload lost dependency authority: ready=%d rows=%v", m.countReady, got)
+			}
+			worker, err := NewBackgroundWorker(WorkerConfig{BeadsPath: path})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer worker.Stop()
+			snapshot := worker.buildSnapshot(false)
+			if snapshot == nil {
+				t.Fatal("background reload failed")
+			}
+			defer snapshot.releasePooledIssues()
+			if len(snapshot.Issues) != 2 || snapshot.IssueMap["DELETED"] != nil || snapshot.CountReady != 1 {
+				t.Errorf("background reload lost hidden dependency authority: rows=%v ready=%d", snapshot.Issues, snapshot.CountReady)
+			}
+			if !snapshot.Analyzer.Readiness().Ready("READY", time.Now()) || snapshot.Analyzer.Readiness().Ready("UNKNOWN", time.Now()) {
+				t.Fatal("background readiness confused deleted and absent predecessors")
+			}
+		})
+	}
+}
+
 func TestLoadIssuesForReloadSQLiteHonorsIssueFilter(t *testing.T) {
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "beads.sqlite3")
@@ -163,9 +662,12 @@ func TestLoadIssuesForReloadSQLiteHonorsIssueFilter(t *testing.T) {
 			title TEXT NOT NULL,
 			status TEXT NOT NULL
 		);
+		CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT);
 		INSERT INTO issues (id, title, status) VALUES
 			('OPEN-1', 'Open issue', 'open'),
-			('CLOSED-1', 'Closed issue', 'closed');
+			('CLOSED-1', 'Closed issue', 'closed'),
+			('DELETED-1', 'Deleted issue', 'tombstone');
+		INSERT INTO dependencies VALUES ('OPEN-1', 'CLOSED-1', 'blocks'), ('OPEN-1', 'DELETED-1', 'blocks');
 	`); err != nil {
 		_ = db.Close()
 		t.Fatalf("seed sqlite: %v", err)
@@ -184,6 +686,66 @@ func TestLoadIssuesForReloadSQLiteHonorsIssueFilter(t *testing.T) {
 	}
 	if len(loaded.Issues) != 1 || loaded.Issues[0].ID != "OPEN-1" {
 		t.Fatalf("unexpected filtered sqlite issues: %#v", loaded.Issues)
+	}
+	if loaded.Authority == nil || !loaded.Authority.Ready("OPEN-1", time.Now()) {
+		t.Fatal("SQLite display filter discarded closed/deleted dependency authority")
+	}
+}
+
+func TestBackgroundWorkerCountsSQLiteRowsInsteadOfBinaryNewlines(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "beads.sqlite3")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE issues (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			status TEXT NOT NULL
+		);
+		CREATE TABLE binary_noise (payload BLOB);
+		INSERT INTO issues (id, title, status) VALUES
+			('OPEN-1', 'Open issue', 'open'),
+			('CLOSED-1', 'Closed issue', 'closed');
+	`); err != nil {
+		_ = db.Close()
+		t.Fatalf("seed sqlite: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO binary_noise(payload) VALUES (?)", strings.Repeat("\n", 20_050)); err != nil {
+		_ = db.Close()
+		t.Fatalf("seed sqlite newline noise: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close sqlite: %v", err)
+	}
+
+	if binaryLines, err := countJSONLLines(dbPath); err != nil || binaryLines < 20_000 {
+		t.Fatalf("fixture does not expose binary-newline miscount: lines=%d err=%v", binaryLines, err)
+	}
+	if issueCount, err := countIssuesForReload(dbPath); err != nil || issueCount != 2 {
+		t.Fatalf("SQLite issue count=%d err=%v, want 2", issueCount, err)
+	}
+
+	worker, err := NewBackgroundWorker(WorkerConfig{BeadsPath: dbPath})
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker: %v", err)
+	}
+	defer worker.Stop()
+	snapshot := worker.buildSnapshot(false)
+	if snapshot == nil {
+		t.Fatal("SQLite background snapshot is nil")
+	}
+	defer snapshot.releasePooledIssues()
+	if snapshot.DatasetTier != datasetTierSmall || snapshot.SourceIssueCountHint != 2 {
+		t.Fatalf("SQLite snapshot tier/count=%v/%d, want small/2", snapshot.DatasetTier, snapshot.SourceIssueCountHint)
+	}
+	if snapshot.LoadedOpenOnly || snapshot.TruncatedCount != 0 {
+		t.Fatalf("SQLite snapshot was spuriously truncated: openOnly=%v truncated=%d", snapshot.LoadedOpenOnly, snapshot.TruncatedCount)
+	}
+	if len(snapshot.Issues) != 2 {
+		t.Fatalf("SQLite snapshot loaded %d issues, want both open and closed rows", len(snapshot.Issues))
 	}
 }
 

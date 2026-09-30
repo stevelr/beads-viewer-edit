@@ -9,18 +9,31 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // GraphModel represents the dependency graph view with visual ASCII art visualization
 type GraphModel struct {
-	issues       []model.Issue
-	issueMap     map[string]*model.Issue
-	insights     *analysis.Insights
-	selectedIdx  int
-	scrollOffset int
-	width        int
-	height       int
-	theme        Theme
+	issues         []model.Issue
+	issueMap       map[string]*model.Issue
+	insights       *analysis.Insights
+	selectedIdx    int
+	scrollOffset   int
+	width          int
+	height         int
+	theme          Theme
+	scrollX        int
+	scrollY        int
+	maxScrollX     int
+	maxScrollY     int
+	expanded       map[string]bool
+	criticalPath   map[string]bool
+	criticalNext   map[string]string
+	canvasID       string
+	canvasWidth    int
+	canvasExpanded bool
+	canvasLines    []string
+	canvasColumns  int
 
 	// Precomputed graph relationships
 	blockers   map[string][]string // What each issue depends on (blocks this issue)
@@ -57,6 +70,7 @@ func (g *GraphModel) SetSnapshot(snapshot *DataSnapshot) {
 	if snapshot == nil {
 		return
 	}
+	g.canvasLines = nil
 
 	// Capture current selection
 	var selectedID string
@@ -89,6 +103,8 @@ func (g *GraphModel) SetSnapshot(snapshot *DataSnapshot) {
 		g.rankCriticalPath = layout.RankCriticalPath
 		g.rankInDegree = layout.RankInDegree
 		g.rankOutDegree = layout.RankOutDegree
+		g.criticalPath = layout.CriticalPath
+		g.criticalNext = layout.CriticalNext
 	} else {
 		g.rebuildGraph()
 	}
@@ -110,6 +126,7 @@ func (g *GraphModel) SetSnapshot(snapshot *DataSnapshot) {
 	if g.selectedIdx >= len(g.sortedIDs) {
 		g.selectedIdx = 0
 	}
+	g.restoreNavigation(selectedID)
 }
 
 // SetIssues updates the graph data preserving the selected issue if possible
@@ -144,9 +161,22 @@ func (g *GraphModel) SetIssues(issues []model.Issue, insights *analysis.Insights
 			}
 		}
 	}
+	g.restoreNavigation(selectedID)
+}
+
+func (g *GraphModel) restoreNavigation(selectedID string) {
+	for id := range g.expanded {
+		if g.issueMap[id] == nil {
+			delete(g.expanded, id)
+		}
+	}
+	if selected := g.SelectedIssue(); selected == nil || selected.ID != selectedID {
+		g.ensureVisible()
+	}
 }
 
 func (g *GraphModel) rebuildGraph() {
+	g.canvasLines = nil
 	size := len(g.issues)
 	g.issueMap = make(map[string]*model.Issue, size)
 	g.blockers = make(map[string][]string, size)
@@ -189,6 +219,65 @@ func (g *GraphModel) rebuildGraph() {
 	if g.selectedIdx >= len(g.sortedIDs) {
 		g.selectedIdx = 0
 	}
+	g.criticalPath, g.criticalNext = visibleCriticalChain(g.sortedIDs, g.blockers, g.dependents)
+}
+
+// visibleCriticalChain selects one deterministic longest chain in the visible
+// graph. Project-wide scores cannot choose it: filtering can hide an entire long
+// branch. A cycle prevents topological completion, so no chain is invented there.
+// Snapshot construction does this work off the UI loop; filtered views use the
+// same calculation when their visible graph changes.
+func visibleCriticalChain(ids []string, blockers, dependents map[string][]string) (map[string]bool, map[string]string) {
+	pending := make(map[string]int, len(ids))
+	depth := make(map[string]int, len(ids))
+	previous := make(map[string]string, len(ids))
+	queue := make([]string, 0, len(ids))
+	for _, id := range ids {
+		depth[id] = 1
+	}
+	for _, id := range ids {
+		for _, blocker := range blockers[id] {
+			if _, visible := depth[blocker]; visible {
+				pending[id]++
+			}
+		}
+		if pending[id] == 0 {
+			queue = append(queue, id)
+		}
+	}
+	current := ""
+	for i := 0; i < len(queue); i++ {
+		id := queue[i]
+		if depth[id] > depth[current] || (depth[id] == depth[current] && id < current) {
+			current = id
+		}
+		for _, dependent := range dependents[id] {
+			if _, visible := depth[dependent]; !visible {
+				continue
+			}
+			if d := depth[id] + 1; d > depth[dependent] || (d == depth[dependent] && id < previous[dependent]) {
+				depth[dependent], previous[dependent] = d, id
+			}
+			pending[dependent]--
+			if pending[dependent] == 0 {
+				queue = append(queue, dependent)
+			}
+		}
+	}
+	if len(queue) != len(ids) || current == "" {
+		return nil, nil
+	}
+	criticalPath := make(map[string]bool)
+	criticalNext := make(map[string]string)
+	for current != "" {
+		criticalPath[current] = true
+		parent := previous[current]
+		if parent != "" {
+			criticalNext[parent] = current
+		}
+		current = parent
+	}
+	return criticalPath, criticalNext
 }
 
 // computeRankings precomputes rankings for all metrics
@@ -256,10 +345,26 @@ func (g *GraphModel) PageDown() {
 	g.ensureVisible()
 }
 
-func (g *GraphModel) ScrollLeft()  {}
-func (g *GraphModel) ScrollRight() {}
+func (g *GraphModel) ScrollLeft()  { g.scrollX = max(0, g.scrollX-8) }
+func (g *GraphModel) ScrollRight() { g.scrollX = min(g.maxScrollX, g.scrollX+8) }
+func (g *GraphModel) ScrollUp()    { g.scrollY = max(0, g.scrollY-3) }
+func (g *GraphModel) ScrollDown()  { g.scrollY = min(g.maxScrollY, g.scrollY+3) }
 
-func (g *GraphModel) ensureVisible() {}
+func (g *GraphModel) ensureVisible() {
+	g.scrollX, g.scrollY = 0, 0
+}
+
+// ToggleExpand shows the selected node's transitive dependency paths. Expansion
+// belongs to the node, so returning to it preserves the user's choice.
+func (g *GraphModel) ToggleExpand() {
+	if issue := g.SelectedIssue(); issue != nil {
+		if g.expanded == nil {
+			g.expanded = make(map[string]bool)
+		}
+		g.expanded[issue.ID] = !g.expanded[issue.ID]
+		g.ensureVisible()
+	}
+}
 
 func (g *GraphModel) SelectedIssue() *model.Issue {
 	if len(g.sortedIDs) == 0 || g.selectedIdx < 0 || g.selectedIdx >= len(g.sortedIDs) {
@@ -287,17 +392,21 @@ func (g *GraphModel) TotalCount() int {
 
 // View renders the visual graph view
 func (g *GraphModel) View(width, height int) string {
+	if width <= 0 || height <= 0 {
+		return ""
+	}
 	g.width = width
 	g.height = height
 	t := g.theme
 
 	if len(g.sortedIDs) == 0 || g.selectedIdx < 0 || g.selectedIdx >= len(g.sortedIDs) {
-		return t.Renderer.NewStyle().
+		empty := t.Renderer.NewStyle().
 			Width(width).
 			Height(height).
 			Align(lipgloss.Center, lipgloss.Center).
 			Foreground(t.Secondary).
 			Render("No issues to display")
+		return g.clipGraph(empty, width, height, 0, 0)
 	}
 
 	selectedID := g.sortedIDs[g.selectedIdx]
@@ -333,7 +442,19 @@ func (g *GraphModel) View(width, height int) string {
 		Foreground(t.Secondary).
 		Render(strings.Repeat("│\n", sepHeight))
 
-	return lipgloss.JoinHorizontal(lipgloss.Top, listView, separator, graphView)
+	return g.clipGraph(lipgloss.JoinHorizontal(lipgloss.Top, listView, separator, graphView), width, height, 0, 0)
+}
+
+// clipGraph cuts terminal cells, not bytes/runes, preserving graphemes and ANSI
+// style sequences even when a wide character straddles the viewport boundary.
+func (g *GraphModel) clipGraph(content string, width, height, x, y int) string {
+	lines := strings.Split(content, "\n")
+	y = min(max(0, y), len(lines))
+	lines = lines[y:min(len(lines), y+max(0, height))]
+	for i := range lines {
+		lines[i] = ansi.Cut(lines[i], x, x+max(0, width))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // renderNodeList renders the left panel with all nodes
@@ -406,9 +527,11 @@ func (g *GraphModel) renderNodeList(width, height int, t Theme) string {
 	return strings.Join(lines, "\n")
 }
 
-// renderVisualGraph renders the ASCII art graph visualization with metrics
-func (g *GraphModel) renderVisualGraph(id string, issue *model.Issue, width, height int, t Theme) string {
+func (g *GraphModel) renderGraphCanvas(id string, issue *model.Issue, width int, t Theme) []string {
 	var sections []string
+	if g.expanded[id] {
+		sections = append(sections, g.renderDependencyPaths(id, t), "")
+	}
 
 	blockerIDs := g.blockers[id]
 	dependentIDs := g.dependents[id]
@@ -443,14 +566,91 @@ func (g *GraphModel) renderVisualGraph(id string, issue *model.Issue, width, hei
 	// ═══════════════════════════════════════════════════════════════════════
 	sections = append(sections, g.renderMetricsPanel(id, width, t))
 
-	// Navigation hint
-	navStyle := t.Renderer.NewStyle().
-		Foreground(t.Secondary).
-		Italic(true)
-	sections = append(sections, "")
-	sections = append(sections, navStyle.Render("j/k: navigate • enter: view details • g: back to list"))
+	return strings.Split(strings.Join(sections, "\n"), "\n")
+}
 
-	return strings.Join(sections, "\n")
+// Cache only the selected canvas, invalidating it on data, width or expansion
+// changes. Repeated pan/scroll keys then render just the visible lines instead of
+// rebuilding every transitive edge and every metric row for each frame.
+func (g *GraphModel) renderVisualGraph(id string, issue *model.Issue, width, height int, t Theme) string {
+	viewportWidth, viewportHeight := max(1, width), max(1, height)
+	canvasWidth := max(60, viewportWidth)
+	neighbors := max(len(g.blockers[id]), len(g.dependents[id]))
+	rowWidth := min(5, neighbors) * 22 // 20 content cells plus two border cells
+	if neighbors > 5 {
+		rowWidth += len(fmt.Sprintf("+%d more", neighbors-5))
+	}
+	canvasWidth = max(canvasWidth, rowWidth)
+	if g.canvasLines == nil || g.canvasID != id || g.canvasWidth != canvasWidth || g.canvasExpanded != g.expanded[id] {
+		g.canvasLines = g.renderGraphCanvas(id, issue, canvasWidth, t)
+		g.canvasID, g.canvasWidth, g.canvasExpanded = id, canvasWidth, g.expanded[id]
+		g.canvasColumns = 0
+		for _, line := range g.canvasLines {
+			g.canvasColumns = max(g.canvasColumns, ansi.StringWidth(line))
+		}
+	}
+	bodyHeight := max(0, viewportHeight-2)
+	g.maxScrollX = max(0, g.canvasColumns-viewportWidth)
+	g.maxScrollY = max(0, len(g.canvasLines)-max(1, bodyHeight))
+	g.scrollX = min(g.scrollX, g.maxScrollX)
+	g.scrollY = min(g.scrollY, g.maxScrollY)
+	state := "collapsed"
+	if g.expanded[id] {
+		state = "expanded"
+	}
+	statusID := smartTruncateID(id, max(4, viewportWidth/3))
+	status := fmt.Sprintf("%s • %s • column %d/%d • row %d/%d", statusID, state, g.scrollX+1, g.maxScrollX+1, g.scrollY+1, g.maxScrollY+1)
+	hint := "H/L: pan • J/K: scroll • space: expand • j/k: select • enter: detail • ◆ critical path"
+	foot := t.Renderer.NewStyle().Foreground(t.Secondary).Render(status + "\n" + hint)
+	if bodyHeight == 0 {
+		return g.clipGraph(foot, viewportWidth, viewportHeight, 0, 0)
+	}
+	visible := strings.Join(g.canvasLines[g.scrollY:min(len(g.canvasLines), g.scrollY+bodyHeight)], "\n")
+	body := g.clipGraph(visible, viewportWidth, bodyHeight, g.scrollX, 0)
+	return body + "\n" + g.clipGraph(foot, viewportWidth, 2, 0, 0)
+}
+
+// renderDependencyPaths lists actual edges in both directions without treating
+// siblings as a chain. Each node is visited once per direction; cycles and shared
+// branches remain visible as edges but cannot recurse forever. Out-of-scope
+// endpoints are labeled and never traversed into hidden issue data.
+func (g *GraphModel) renderDependencyPaths(id string, t Theme) string {
+	lines := []string{t.Renderer.NewStyle().Bold(true).Foreground(t.Feature).Render("DEPENDENCY PATHS (prerequisite → dependent)")}
+	for _, direction := range []struct {
+		title string
+		edges map[string][]string
+		up    bool
+	}{{"Upstream", g.blockers, true}, {"Downstream", g.dependents, false}} {
+		lines = append(lines, direction.title)
+		queue := []string{id}
+		seen := map[string]bool{id: true}
+		for i := 0; i < len(queue); i++ {
+			from := queue[i]
+			neighbors := append([]string(nil), direction.edges[from]...)
+			sort.Strings(neighbors)
+			for j, to := range neighbors {
+				if j > 0 && neighbors[j-1] == to {
+					continue
+				}
+				left, right := from, to
+				if direction.up {
+					left, right = to, from
+				}
+				line := "  " + left + " → " + right
+				if g.issueMap[to] == nil {
+					line += " (not in filter)"
+				} else if !seen[to] {
+					seen[to] = true
+					queue = append(queue, to)
+				}
+				if g.criticalNext[left] == right {
+					line = t.Renderer.NewStyle().Foreground(t.Feature).Bold(true).Render("◆" + line)
+				}
+				lines = append(lines, line)
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // renderBlockersVisual renders blocker nodes as boxes
@@ -579,6 +779,10 @@ func (g *GraphModel) renderNodeBox(id string, boxWidth int, t Theme, isEgo bool)
 
 	// Build box content
 	line1 := fmt.Sprintf("%s %s", statusIcon, displayID)
+	if g.criticalPath[id] {
+		line1 = "◆ " + line1
+		statusColor = t.Feature
+	}
 
 	var boxStyle lipgloss.Style
 	if isEgo {
@@ -638,6 +842,9 @@ func (g *GraphModel) renderEgoNode(id string, issue *model.Issue, width int, t T
 	}
 
 	content := icons + " " + displayID
+	if g.criticalPath[id] {
+		content = "◆ " + content
+	}
 	if title != "" {
 		content += "\n" + title
 	}

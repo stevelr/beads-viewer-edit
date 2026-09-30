@@ -1,6 +1,8 @@
 package main_test
 
 import (
+	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -8,11 +10,703 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+func TestExportPagesRecipeScope(t *testing.T) {
+	bv := buildBvBinary(t)
+	stageViewerAssets(t, bv)
+	root := recipeProject(t)
+	for _, tc := range []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"actionable", []string{"--recipe", "actionable"}, []string{"BL-1", "SP-1"}},
+		{"label-intersection", []string{"--recipe", "actionable", "--label", "sprint"}, []string{"SP-1"}},
+		{"file-recipe", []string{"--recipe", ".beads/recipes/sprint.yaml"}, []string{"SP-1", "SP-2"}},
+		{"empty-repo", []string{"--recipe", "actionable", "--repo", "absent"}, nil},
+		{"empty-label", []string{"--recipe", "actionable", "--label", "absent"}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			output := filepath.Join(root, tc.name)
+			args := append([]string{"--export-pages", output, "--pages-include-history=false", "--no-hooks"}, tc.args...)
+			cmd := exec.Command(bv, args...)
+			cmd.Dir = root
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("scoped export: %v\n%s", err, out)
+			}
+			db, err := sql.Open("sqlite", filepath.Join(output, "beads.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			rows, err := db.Query(`SELECT id FROM issues ORDER BY id`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			var got []string
+			for rows.Next() {
+				var id string
+				if err := rows.Scan(&id); err != nil {
+					t.Fatal(err)
+				}
+				got = append(got, id)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("exported IDs=%v want=%v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExportPagesWatchUsesLoadedSource(t *testing.T) {
+	bv := buildBvBinary(t)
+	stageViewerAssets(t, bv)
+	for _, tc := range []struct {
+		name     string
+		rejected string
+		explicit bool
+		sqlite   bool
+		wal      bool
+		poll     bool
+	}{
+		{"invalid-jsonl", "beads.jsonl", false, false, false, false},
+		{"invalid-sqlite", "beads.db", false, false, false, false},
+		{"explicit-jsonl", "beads.jsonl", true, false, false, false},
+		{"explicit-sqlite", "beads.jsonl", true, true, false, false},
+		{"explicit-sqlite-wal", "beads.jsonl", true, true, true, false},
+		{"explicit-sqlite-wal-polling", "beads.jsonl", true, true, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("BEADS_DIR", "")
+			t.Setenv("BEADS_DB", "")
+			t.Setenv("BV_FORCE_POLL", "")
+			t.Setenv("BV_FORCE_POLLING", "0")
+			if tc.poll {
+				t.Setenv("BV_FORCE_POLLING", "1")
+			}
+			writeIssuesJSONL(t, root, `{"id":"before","title":"Before refresh","status":"open","issue_type":"task"}`+"\n")
+			selected := filepath.Join(root, ".beads", "issues.jsonl")
+			var sourceDB *sql.DB
+			if tc.sqlite {
+				selected = filepath.Join(root, ".beads", "selected.db")
+				var err error
+				sourceDB, err = sql.Open("sqlite", selected)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer sourceDB.Close()
+				sourceDB.SetMaxOpenConns(1)
+				if tc.wal {
+					if _, err := sourceDB.Exec(`PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if _, err := sourceDB.Exec(`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL);
+					INSERT INTO issues VALUES ('before', 'Before refresh', 'open')`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rejected := filepath.Join(root, ".beads", tc.rejected)
+			if err := os.WriteFile(rejected, []byte("{invalid\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			// A deterministic freshness ordering, independent of filesystem clock resolution.
+			older := time.Unix(1_700_000_000, 0)
+			if err := os.Chtimes(selected, older, older); err != nil {
+				t.Fatal(err)
+			}
+			newer := older.Add(time.Hour)
+			if err := os.Chtimes(rejected, newer, newer); err != nil {
+				t.Fatal(err)
+			}
+			output := filepath.Join(root, "export")
+			args := []string{"--export-pages", output, "--watch-export", "--pages-include-history=false", "--no-hooks"}
+			if tc.explicit {
+				args = append(args, "--db", selected)
+			}
+			logPath := filepath.Join(root, "watch.log")
+			log, err := os.Create(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer log.Close()
+			cmd := exec.Command(bv, args...)
+			cmd.Dir = root
+			cmd.Stdout, cmd.Stderr = log, log
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait(); close(done) }()
+			t.Cleanup(func() {
+				_ = cmd.Process.Signal(os.Interrupt)
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					_ = cmd.Process.Kill()
+					<-done
+				}
+			})
+			waitForPublication := func(id string, claimSafe bool) {
+				t.Helper()
+				deadline := time.Now().Add(15 * time.Second)
+				for time.Now().Before(deadline) {
+					data, err := os.ReadFile(filepath.Join(output, "data", "triage.json"))
+					var got struct {
+						SourcePath string `json:"source_path"`
+						Authority  struct {
+							ClaimSafe bool `json:"claim_safe"`
+						} `json:"source_authority"`
+						Recommendations []struct{ ID string } `json:"recommendations"`
+					}
+					logs, _ := os.ReadFile(logPath)
+					if err == nil && json.Unmarshal(data, &got) == nil && len(got.Recommendations) == 1 && got.Recommendations[0].ID == id && strings.Contains(string(logs), "To preview with auto-refresh") {
+						if got.SourcePath != selected || got.Authority.ClaimSafe != claimSafe {
+							t.Fatalf("source/authority mismatch: %s\n%s", data, logs)
+						}
+						if !strings.Contains(string(logs), "Watching: "+selected) || strings.Contains(string(logs), "Watching: "+rejected) {
+							t.Fatalf("watch source differs from loaded source %s:\n%s", selected, logs)
+						}
+						t.Logf("published %s from %s, claim_safe=%v", id, selected, claimSafe)
+						return
+					}
+					select {
+					case err := <-done:
+						t.Fatalf("watch exited before publishing %s: %v\n%s", id, err, logs)
+					default:
+					}
+					time.Sleep(25 * time.Millisecond)
+				}
+				logs, _ := os.ReadFile(logPath)
+				t.Fatalf("watch did not publish %s from %s\n%s", id, selected, logs)
+			}
+			// A legacy JSONL beside issues.jsonl is excluded before validation,
+			// so it cannot degrade the canonical export's authority. A corrupt
+			// SQLite candidate still exercises actual fallback and must do so.
+			waitForPublication("before", tc.explicit || tc.rejected == "beads.jsonl")
+			var siblingDB *sql.DB
+			if tc.wal {
+				var err error
+				siblingDB, err = sql.Open("sqlite", filepath.Join(root, ".beads", "sibling.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer siblingDB.Close()
+				siblingDB.SetMaxOpenConns(1)
+				if _, err := siblingDB.Exec(`PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+					CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL);
+					INSERT INTO issues VALUES ('sibling', 'Unrelated issue', 'open')`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			mainBefore, err := os.Stat(selected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The second mutation must arrive through the watcher after the
+			// startup settle recheck has already published the first mutation.
+			for _, id := range []string{"after", "again"} {
+				if sourceDB != nil {
+					if siblingDB != nil {
+						if _, err := siblingDB.Exec(`UPDATE issues SET title=?`, "Sibling "+id); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if _, err := sourceDB.Exec(`UPDATE issues SET id=?, title=?`, id, id); err != nil {
+						t.Fatal(err)
+					}
+					if tc.wal {
+						mainAfter, err := os.Stat(selected)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if !mainBefore.ModTime().Equal(mainAfter.ModTime()) || mainBefore.Size() != mainAfter.Size() {
+							t.Fatal("WAL test changed the main database; watcher must observe the held writer's WAL")
+						}
+					}
+				} else {
+					writeIssuesJSONL(t, root, fmt.Sprintf("{\"id\":%q,\"title\":%q,\"status\":\"open\",\"issue_type\":\"task\"}\n", id, id))
+				}
+				waitForPublication(id, true)
+			}
+		})
+	}
+}
+
+func TestExportPagesHistoricalCannotWatch(t *testing.T) {
+	bv := buildBvBinary(t)
+	root := t.TempDir()
+	output := filepath.Join(root, "historical-export")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bv, "--as-of", "HEAD", "--export-pages", output, "--watch-export")
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err == nil || ctx.Err() != nil || !strings.Contains(string(out), "--watch-export cannot be combined with --as-of") {
+		t.Fatalf("expected early historical watch refusal, got err=%v timeout=%v\n%s", err, ctx.Err(), out)
+	}
+	if _, err := os.Stat(output); !os.IsNotExist(err) {
+		t.Fatalf("invalid historical watch created an export: %v", err)
+	}
+}
+
+func TestExportPagesRecipeScopeAndWatchReload(t *testing.T) {
+	bv := buildBvBinary(t)
+	stageViewerAssets(t, bv)
+	root := t.TempDir()
+	const initial = `{"id":"a","title":"Zulu","status":"open","priority":1,"issue_type":"task","source_repo":"selected","labels":["focus"]}
+{"id":"b","title":"Aardvark","status":"open","priority":1,"issue_type":"task","source_repo":"selected","labels":["focus"],"dependencies":[{"issue_id":"b","depends_on_id":"gate","type":"blocks"}]}
+{"id":"c","title":"Alpha","status":"open","priority":1,"issue_type":"task","source_repo":"selected","labels":["focus"]}
+{"id":"d","title":"Bravo","status":"open","priority":1,"issue_type":"task","source_repo":"selected","labels":["focus"]}
+{"id":"gate","title":"External gate","status":"open","issue_type":"task","source_repo":"other"}
+{"id":"other-repo","title":"Wrong repository","status":"open","priority":0,"issue_type":"task","source_repo":"other","labels":["focus"]}
+{"id":"other-label","title":"Wrong label","status":"open","priority":0,"issue_type":"task","source_repo":"selected","labels":["other"]}
+{"id":"missing","title":"Missing gate","status":"open","priority":0,"issue_type":"task","source_repo":"selected","labels":["focus"],"dependencies":[{"issue_id":"missing","depends_on_id":"absent","type":"blocks"}]}
+{"id":"deferred","title":"Future work","status":"open","priority":0,"issue_type":"task","source_repo":"selected","labels":["focus"],"defer_until":"2099-01-01T00:00:00Z"}
+`
+	writeIssuesJSONL(t, root, initial)
+	writeRecipeFile(t, root, "picks.yaml", `filters:
+  actionable: true
+sort:
+  field: priority
+  secondary:
+    field: title
+view:
+  max_items: 2
+`)
+	output := filepath.Join(root, "export")
+	logPath := filepath.Join(root, "watch.log")
+	log, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	cmd := exec.Command(bv, "--export-pages", output, "--watch-export", "--recipe", "picks", "--repo", "selected", "--label", "focus", "--pages-include-history=false", "--no-hooks")
+	cmd.Dir = root
+	cmd.Stdout, cmd.Stderr = log, log
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait(); close(done) }()
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+			<-done
+		}
+	})
+	type payload struct {
+		DataHash        string                               `json:"data_hash"`
+		AuthorityHash   string                               `json:"authority_hash"`
+		ScopeHash       string                               `json:"scope_hash"`
+		IssueCount      int                                  `json:"issue_count"`
+		Scope           struct{ Label, Recipe, Repo string } `json:"scope"`
+		Authority       struct{ State string }               `json:"source_authority"`
+		Recommendations []struct{ ID string }                `json:"recommendations"`
+	}
+	// Observe a complete publication: all JSON envelopes agree, SQLite holds
+	// exactly the expected ready rows, and triage names those same candidates.
+	waitForSelection := func(previousAuthority string, want ...string) payload {
+		t.Helper()
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			data, err := os.ReadFile(filepath.Join(output, "data", "meta.json"))
+			var meta payload
+			complete := err == nil && json.Unmarshal(data, &meta) == nil && meta.AuthorityHash != "" && meta.AuthorityHash != previousAuthority && meta.IssueCount == len(want)
+			for _, name := range []string{"triage.json", "project_health.json", "graph_layout.json"} {
+				if !complete {
+					break
+				}
+				data, err := os.ReadFile(filepath.Join(output, "data", name))
+				var other payload
+				complete = err == nil && json.Unmarshal(data, &other) == nil && other.AuthorityHash == meta.AuthorityHash && other.DataHash == meta.DataHash && other.ScopeHash == meta.ScopeHash
+				if complete && name == "triage.json" {
+					var ids []string
+					for _, rec := range other.Recommendations {
+						ids = append(ids, rec.ID)
+					}
+					slices.Sort(ids)
+					complete = slices.Equal(ids, want)
+				}
+			}
+			if complete {
+				db, err := sql.Open("sqlite", filepath.Join(output, "beads.sqlite3"))
+				if err == nil {
+					rows, queryErr := db.Query(`SELECT id, is_actionable FROM issue_overview_mv ORDER BY id`)
+					var ids []string
+					if queryErr == nil {
+						for rows.Next() {
+							var id string
+							var ready bool
+							if err := rows.Scan(&id, &ready); err != nil || !ready {
+								complete = false
+								break
+							}
+							ids = append(ids, id)
+						}
+						complete = complete && rows.Err() == nil && slices.Equal(ids, want)
+						rows.Close()
+					}
+					db.Close()
+					if queryErr == nil && complete {
+						if meta.Scope.Label != "focus" || meta.Scope.Recipe != "picks" || meta.Scope.Repo != "selected" || meta.Authority.State != "complete" {
+							t.Fatalf("scope/authority metadata drift: %+v", meta)
+						}
+						return meta
+					}
+				}
+			}
+			select {
+			case err := <-done:
+				logs, _ := os.ReadFile(logPath)
+				t.Fatalf("watch exited before selection %v: %v\n%s", want, err, logs)
+			default:
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		logs, _ := os.ReadFile(logPath)
+		t.Fatalf("watch did not publish selection %v\n%s", want, logs)
+		return payload{}
+	}
+	first := waitForSelection("", "c", "d")
+	// Rewriting identical source must not undo scope or cause an export loop.
+	writeIssuesJSONL(t, root, initial)
+	time.Sleep(2 * time.Second)
+	logs, err := os.ReadFile(logPath)
+	if err != nil || strings.Count(string(logs), "Export complete") != 1 {
+		t.Fatalf("unchanged source re-exported: %v\n%s", err, logs)
+	}
+	closedGate := strings.Replace(initial, `"id":"gate","title":"External gate","status":"open"`, `"id":"gate","title":"External gate","status":"closed"`, 1)
+	writeIssuesJSONL(t, root, closedGate)
+	second := waitForSelection(first.AuthorityHash, "b", "c")
+	if first.DataHash != second.DataHash || first.ScopeHash == second.ScopeHash {
+		t.Fatalf("hidden gate change lost authority/candidate distinction: first=%+v second=%+v", first, second)
+	}
+	// A new matching candidate must replace a row whose label changed. New
+	// IDs must not be excluded by the candidate map captured at startup.
+	changed := strings.Replace(closedGate, `"id":"c","title":"Alpha","status":"open","priority":1,"issue_type":"task","source_repo":"selected","labels":["focus"]`, `"id":"c","title":"Alpha","status":"open","priority":1,"issue_type":"task","source_repo":"selected","labels":["other"]`, 1)
+	changed += `{"id":"new","title":"Aaron","status":"in_progress","priority":1,"issue_type":"task","source_repo":"selected","labels":["focus"]}` + "\n"
+	writeIssuesJSONL(t, root, changed)
+	third := waitForSelection(second.AuthorityHash, "b", "new")
+	// Move every potentially ready row out of the intersection, preserving
+	// other-repo/other-label negatives and the missing/deferred source rows.
+	empty := strings.ReplaceAll(changed, `"priority":1,"issue_type":"task","source_repo":"selected"`, `"priority":1,"issue_type":"task","source_repo":"other"`)
+	writeIssuesJSONL(t, root, empty)
+	final := waitForSelection(third.AuthorityHash)
+	if final.DataHash == third.DataHash || final.ScopeHash == third.ScopeHash {
+		t.Fatalf("empty selection retained stale hashes: before=%+v after=%+v", third, final)
+	}
+}
+
+func TestExportPagesFullSourceReadiness(t *testing.T) {
+	bv := buildBvBinary(t)
+	stageViewerAssets(t, bv)
+	root := t.TempDir()
+	beads := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(beads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := `{"id":"ready","title":"Ready","status":"in_progress","issue_type":"task","source_repo":"selected"}
+{"id":"missing","title":"Missing","status":"open","issue_type":"task","source_repo":"selected","dependencies":[{"issue_id":"missing","depends_on_id":"absent","type":"blocks"}]}
+{"id":"deferred","title":"Deferred","status":"open","issue_type":"task","source_repo":"selected","defer_until":"2026-09-10T00:00:00Z"}
+{"id":"inherited","title":"Inherited","status":"open","issue_type":"task","source_repo":"selected","dependencies":[{"issue_id":"inherited","depends_on_id":"parent","type":"parent-child"}]}
+{"id":"filtered","title":"Filtered blocker","status":"open","issue_type":"task","source_repo":"selected","dependencies":[{"issue_id":"filtered","depends_on_id":"outside","type":"waits-for"}]}
+{"id":"resolved","title":"Resolved","status":"open","issue_type":"task","source_repo":"selected","dependencies":[{"issue_id":"resolved","depends_on_id":"closed","type":"blocks"},{"issue_id":"resolved","depends_on_id":"deleted","type":"waits-for"}]}
+{"id":"parent","title":"Parent","status":"open","issue_type":"epic","dependencies":[{"issue_id":"parent","depends_on_id":"outside","type":"conditional-blocks"}]}
+{"id":"outside","title":"Outside filter","status":"open","issue_type":"task"}
+{"id":"closed","title":"Closed","status":"closed","issue_type":"task"}
+{"id":"deleted","title":"Deleted","status":"tombstone","issue_type":"task"}
+`
+	if err := os.WriteFile(filepath.Join(beads, "issues.jsonl"), []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC)
+	t.Setenv("SOURCE_DATE_EPOCH", fmt.Sprint(now.Unix()))
+	output := filepath.Join(root, "export")
+	cmd := exec.Command(bv, "--export-pages", output, "--repo", "selected", "--pages-include-closed=false", "--pages-include-history=false", "--no-hooks")
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("export readiness fixture: %v\n%s", err, out)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(output, "beads.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	want := map[string]struct {
+		state string
+		ready bool
+	}{
+		"ready": {"satisfied", true}, "resolved": {"satisfied", true},
+		"missing": {"unknown", false}, "deferred": {"satisfied", false},
+		"inherited": {"unsatisfied", false}, "filtered": {"unsatisfied", false},
+	}
+	rows, err := db.Query(`SELECT id, dependency_state, is_actionable FROM issue_overview_mv`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var id, state string
+		var ready bool
+		if err := rows.Scan(&id, &state, &ready); err != nil {
+			t.Fatal(err)
+		}
+		expected, exists := want[id]
+		if !exists || state != expected.state || ready != expected.ready {
+			t.Errorf("unexpected exported row %s: state=%s ready=%v expected=%+v", id, state, ready, expected)
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if count != len(want) {
+		t.Fatalf("visible count=%d want=%d", count, len(want))
+	}
+	var clock string
+	if err := db.QueryRow(`SELECT value FROM export_meta WHERE key='readiness_at'`).Scan(&clock); err != nil || clock != now.Format(time.RFC3339) {
+		t.Fatalf("readiness clock=%s err=%v", clock, err)
+	}
+}
+
+func TestExportPagesSourceAuthorityAndWatchReload(t *testing.T) {
+	bv := buildBvBinary(t)
+	stageViewerAssets(t, bv)
+	root := t.TempDir()
+	beads := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(beads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(beads, "issues.jsonl")
+	valid := []byte(`{"id":"safe","title":"Exportable work","status":"open","issue_type":"task"}` + "\n")
+	if err := os.WriteFile(path, valid, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(root, "export")
+	logPath := filepath.Join(root, "watch.log")
+	log, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	cmd := exec.Command(bv, "--export-pages", output, "--watch-export", "--pages-include-history=false", "--no-hooks")
+	cmd.Dir = root
+	cmd.Stdout, cmd.Stderr = log, log
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait(); close(done) }()
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+			<-done
+		}
+	})
+	type payload struct {
+		DataHash      string `json:"data_hash"`
+		AuthorityHash string `json:"authority_hash"`
+		Authority     struct {
+			State     string `json:"state"`
+			ClaimSafe bool   `json:"claim_safe"`
+		} `json:"source_authority"`
+		Commands struct {
+			ClaimTop string `json:"claim_top"`
+		} `json:"commands"`
+		Recommendations []struct {
+			ID        string `json:"id"`
+			Claimable bool   `json:"claimable"`
+		} `json:"recommendations"`
+	}
+	waitForState := func(state string) payload {
+		t.Helper()
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			data, err := os.ReadFile(filepath.Join(output, "data", "triage.json"))
+			var got payload
+			if err == nil && json.Unmarshal(data, &got) == nil && got.Authority.State == state {
+				complete := true
+				for _, name := range []string{"meta.json", "project_health.json", "graph_layout.json"} {
+					otherData, readErr := os.ReadFile(filepath.Join(output, "data", name))
+					var other payload
+					if readErr != nil || json.Unmarshal(otherData, &other) != nil || other.AuthorityHash != got.AuthorityHash {
+						complete = false
+						break
+					}
+				}
+				if complete {
+					return got
+				}
+			}
+			select {
+			case err := <-done:
+				logs, _ := os.ReadFile(logPath)
+				t.Fatalf("watch exited before %s: %v\n%s", state, err, logs)
+			default:
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		logs, _ := os.ReadFile(logPath)
+		t.Fatalf("watch did not publish %s authority\n%s", state, logs)
+		return payload{}
+	}
+	healthy := waitForState("complete")
+	if !healthy.Authority.ClaimSafe || healthy.Commands.ClaimTop != "" || len(healthy.Recommendations) != 1 || healthy.Recommendations[0].ID != "safe" || !healthy.Recommendations[0].Claimable {
+		t.Fatalf("healthy graph must retain the ready issue without inventing a tracker route: %+v", healthy)
+	}
+	if err := os.WriteFile(path, append(append([]byte(nil), valid...), []byte("{invalid\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	partial := waitForState("partial")
+	if partial.Authority.ClaimSafe || partial.Commands.ClaimTop != "" || len(partial.Recommendations) != 1 || partial.Recommendations[0].ID != "safe" || partial.Recommendations[0].Claimable {
+		t.Fatalf("partial export must retain useful work but withhold claims: %+v", partial)
+	}
+	if partial.DataHash != healthy.DataHash || partial.AuthorityHash == healthy.AuthorityHash {
+		t.Fatalf("hidden parse loss did not trigger authority-aware re-export: healthy=%+v partial=%+v", healthy, partial)
+	}
+	for _, name := range []string{"meta.json", "project_health.json", "graph_layout.json"} {
+		data, err := os.ReadFile(filepath.Join(output, "data", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var exported payload
+		if err := json.Unmarshal(data, &exported); err != nil {
+			t.Fatal(err)
+		}
+		if exported.Authority.State != "partial" || exported.AuthorityHash != partial.AuthorityHash {
+			t.Fatalf("%s lost current authority: %s", name, data)
+		}
+	}
+	if err := os.Rename(path, path+".saved"); err != nil {
+		t.Fatal(err)
+	}
+	failed := waitForState("unknown")
+	if failed.Authority.ClaimSafe || failed.Commands.ClaimTop != "" {
+		t.Fatalf("failed reload left proven claims in the bundle: %+v", failed)
+	}
+	if err := os.WriteFile(path, valid, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recovered := waitForState("complete")
+	if !recovered.Authority.ClaimSafe || recovered.Commands.ClaimTop != "" || recovered.AuthorityHash != healthy.AuthorityHash || len(recovered.Recommendations) != 1 || recovered.Recommendations[0].ID != "safe" || !recovered.Recommendations[0].Claimable {
+		t.Fatalf("restored source did not restore graph readiness without an unbound command: %+v", recovered)
+	}
+	// Changing only a dependency must refresh the SQLite readiness snapshot too.
+	withMissing := []byte(`{"id":"safe","title":"Exportable work","status":"open","issue_type":"task","dependencies":[{"issue_id":"safe","depends_on_id":"absent","type":"blocks"}]}` + "\n")
+	if err := os.WriteFile(path, withMissing, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		db, err := sql.Open("sqlite", filepath.Join(output, "beads.sqlite3"))
+		if err == nil {
+			var state string
+			var ready bool
+			err = db.QueryRow(`SELECT dependency_state, is_actionable FROM issue_overview_mv WHERE id='safe'`).Scan(&state, &ready)
+			db.Close()
+			if err == nil && state == "unknown" && !ready {
+				return
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	logs, _ := os.ReadFile(logPath)
+	t.Fatalf("watch retained ready SQLite state after a prerequisite disappeared\n%s", logs)
+}
+
+func TestPartialWorkspaceExportArtifactsRetainAuthority(t *testing.T) {
+	bv := buildBvBinary(t)
+	stageViewerAssets(t, bv)
+	root := writeWorkspaceFixture(t)
+	config := filepath.Join(root, ".bv", "workspace.yaml")
+	contents, err := os.ReadFile(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents = bytes.Replace(contents, []byte("path: apps/web"), []byte("path: missing-web"), 1)
+	if err := os.WriteFile(config, contents, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range []string{"pages", "graph", "brief", "script"} {
+		t.Run(format, func(t *testing.T) {
+			output := filepath.Join(root, format)
+			args := []string{"--workspace", config}
+			switch format {
+			case "pages":
+				args = append(args, "--export-pages", output, "--pages-include-history=false", "--no-hooks")
+			case "graph":
+				output += ".html"
+				args = append(args, "--export-graph", output)
+			case "brief":
+				args = append(args, "--agent-brief", output)
+			case "script":
+				args = append(args, "--emit-script")
+			}
+			cmd := exec.Command(bv, args...)
+			cmd.Dir = root
+			logs, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("%v\n%s", err, logs)
+			}
+			var data []byte
+			switch format {
+			case "pages":
+				data, err = os.ReadFile(filepath.Join(output, "data", "triage.json"))
+			case "graph":
+				data, err = os.ReadFile(output)
+				if err == nil {
+					match := regexp.MustCompile(`const DATA = (\{[^\n]+\});`).FindSubmatch(data)
+					if len(match) != 2 {
+						t.Fatalf("missing embedded graph JSON")
+					}
+					data = match[1]
+				}
+			case "brief":
+				data, err = os.ReadFile(filepath.Join(output, "triage.json"))
+			case "script":
+				if bytes.Contains(logs, []byte("--claim")) || !bytes.Contains(logs, []byte(`"claim_safe":false`)) || !bytes.Contains(logs, []byte("api-AUTH-1:")) || !bytes.Contains(logs, []byte("# No verified live tracker route")) {
+					t.Fatalf("partial unbound script must preserve issue identity and withhold unverified commands:\n%s", logs)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(data, &payload); err != nil {
+				t.Fatalf("%v\n%s", err, data)
+			}
+			authority, ok := payload["source_authority"].(map[string]any)
+			if !ok || authority["state"] != "partial" || authority["claim_safe"] != false || !bytes.Contains(data, []byte("api-AUTH-1")) {
+				t.Fatalf("export lost useful source data or diagnostics: %s", data)
+			}
+			if regexp.MustCompile(`"claimable"\s*:\s*true`).Match(data) || regexp.MustCompile(`"claim_top"\s*:\s*"[^\"]+"`).Match(data) {
+				t.Fatalf("partial artifact emitted claim: %s", data)
+			}
+		})
+	}
+}
 
 func TestExportPages_IncludesHistoryAndRunsHooks(t *testing.T) {
 	bv := buildBvBinary(t)
@@ -218,10 +912,45 @@ func TestExportPages_HTMLStructure(t *testing.T) {
 		}
 	}
 
-	// Security headers (CSP)
+	// Security headers (CSP). The exported index must forbid inline scripts:
+	// every script is a same-origin file, so an injected <script> or on*=
+	// handler cannot run even if a rendering bug reintroduces an XSS sink.
 	if !strings.Contains(html, "Content-Security-Policy") {
 		t.Error("missing Content-Security-Policy meta tag")
 	}
+	scriptSrc := cspDirective(t, html, "script-src")
+	if strings.Contains(scriptSrc, "'unsafe-inline'") {
+		t.Errorf("script-src must not allow 'unsafe-inline': %q", scriptSrc)
+	}
+	if !strings.Contains(scriptSrc, "'wasm-unsafe-eval'") {
+		t.Errorf("script-src must allow 'wasm-unsafe-eval' for sql.js and bv_graph_bg.wasm: %q", scriptSrc)
+	}
+	for _, tag := range regexp.MustCompile(`(?is)<script\b[^>]*>`).FindAllString(html, -1) {
+		if !regexp.MustCompile(`(?i)\bsrc\s*=`).MatchString(tag) {
+			t.Errorf("exported index.html still contains an inline script block: %s", tag)
+		}
+	}
+	if m := regexp.MustCompile(`(?i)<[a-z][^>]*\son[a-z]+\s*=`).FindString(html); m != "" {
+		t.Errorf("exported index.html contains an inline event handler attribute: %s", m)
+	}
+}
+
+// cspDirective returns the value of one directive from the exported page's
+// Content-Security-Policy meta tag (the directives are separated by ';').
+func cspDirective(t *testing.T, html, name string) string {
+	t.Helper()
+	m := regexp.MustCompile(`(?is)http-equiv="Content-Security-Policy"\s+content="([^"]*)"`).FindStringSubmatch(html)
+	if m == nil {
+		t.Fatal("cannot locate the Content-Security-Policy meta content")
+	}
+	for _, directive := range strings.Split(m[1], ";") {
+		fields := strings.Fields(directive)
+		if len(fields) > 0 && fields[0] == name {
+			return strings.Join(fields[1:], " ")
+		}
+	}
+	t.Fatalf("CSP has no %s directive: %q", name, m[1])
+	return ""
 }
 
 func TestExportPages_IssueOverviewMetrics(t *testing.T) {
@@ -814,11 +1543,12 @@ func TestExportPages_ExcludeClosed_SQLiteVerification(t *testing.T) {
 		t.Fatalf("mkdir .beads: %v", err)
 	}
 
-	// Create mix of open and closed issues
+	// Resolved prerequisites can be omitted from display without becoming unknown.
 	issueData := `{"id": "open-1", "title": "Open Issue One", "status": "open", "priority": 1, "issue_type": "task"}
 {"id": "open-2", "title": "Open Issue Two", "status": "open", "priority": 2, "issue_type": "bug"}
 {"id": "closed-1", "title": "Closed Issue One", "status": "closed", "priority": 1, "issue_type": "task"}
 {"id": "closed-2", "title": "Closed Issue Two", "status": "closed", "priority": 2, "issue_type": "feature"}
+{"id": "deleted-1", "title": "Deleted Issue", "status": "tombstone", "priority": 2, "issue_type": "task"}
 {"id": "inprogress-1", "title": "In Progress Issue", "status": "in_progress", "priority": 1, "issue_type": "task"}`
 	if err := os.WriteFile(filepath.Join(beadsPath, "issues.jsonl"), []byte(issueData), 0o644); err != nil {
 		t.Fatalf("write issues.jsonl: %v", err)
@@ -867,6 +1597,18 @@ func TestExportPages_ExcludeClosed_SQLiteVerification(t *testing.T) {
 		t.Errorf("Missing expected issues: open-1=%v, open-2=%v, inprogress-1=%v",
 			foundOpen1, foundOpen2, foundInProgress)
 	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var resolved string
+	if err := db.QueryRow("SELECT value FROM export_meta WHERE key = 'resolved_issue_ids'").Scan(&resolved); err != nil {
+		t.Fatal(err)
+	}
+	if resolved != `["closed-1","closed-2","deleted-1"]` {
+		t.Fatalf("resolved prerequisite metadata = %s", resolved)
+	}
 }
 
 // TestExportPages_ExcludeHistory verifies history.json is absent
@@ -901,6 +1643,46 @@ func TestExportPages_ExcludeHistory(t *testing.T) {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("missing expected artifact %s: %v", p, err)
 		}
+	}
+}
+
+func TestExportPages_WithoutGitHistory(t *testing.T) {
+	bv := buildBvBinary(t)
+	stageViewerAssets(t, bv)
+	repo := createSimpleRepo(t, 2)
+	if _, err := os.Stat(filepath.Join(repo, ".git")); !os.IsNotExist(err) {
+		t.Fatalf("expected fixture without local Git history, got %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "bundle")
+	cmd := exec.Command(bv, "--export-pages", out)
+	cmd.Dir = repo
+	combined, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("export without Git history failed: %v\n%s", err, combined)
+	}
+	warning := "Warning: failed to generate history: not a git repository: " + repo
+	if !strings.Contains(string(combined), warning) {
+		t.Fatalf("missing optional-history warning %q:\n%s", warning, combined)
+	}
+	if _, err := os.Stat(filepath.Join(out, "data", "history.json")); !os.IsNotExist(err) {
+		t.Fatalf("history.json should be absent without Git history, got %v", err)
+	}
+	for _, name := range []string{"index.html", "beads.sqlite3", "data/meta.json", "data/triage.json", "data/graph_layout.json"} {
+		info, err := os.Stat(filepath.Join(out, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("required bundle file %s: %v", name, err)
+		}
+		if info.Size() == 0 {
+			t.Fatalf("required bundle file %s is empty", name)
+		}
+	}
+	issues := queryAllIssues(t, filepath.Join(out, "beads.sqlite3"))
+	ids := make(map[string]bool, len(issues))
+	for _, issue := range issues {
+		ids[issue.ID] = true
+	}
+	if len(issues) != 2 || !ids["issue-1"] || !ids["issue-2"] {
+		t.Fatalf("export without history lost fixture issues: %+v", issues)
 	}
 }
 
@@ -1908,5 +2690,178 @@ func TestExportPages_GraphLayoutFetch(t *testing.T) {
 	}
 	if foundPositionHandling < 2 {
 		t.Errorf("graph.js missing position handling markers (found %d/3)", foundPositionHandling)
+	}
+}
+
+// TestExportPages_HybridWasmHookRunsInBuiltBinary (I4): BV_BUILD_HYBRID_WASM
+// must be honoured by the released binary, which ships embedded viewer
+// assets. Without wasm-pack on PATH the export has to fail loudly instead of
+// silently skipping the build; with wasm-pack present the hook would build,
+// so the test skips rather than spend minutes compiling Rust.
+func TestExportPages_HybridWasmHookRunsInBuiltBinary(t *testing.T) {
+	if _, err := exec.LookPath("wasm-pack"); err == nil {
+		t.Skip("wasm-pack is installed; the hook would run a real build")
+	}
+	bv := buildBvBinary(t)
+	env := t.TempDir()
+	writeBeads(t, env, `{"id":"W-1","title":"one","status":"open","priority":1,"issue_type":"task"}`)
+	out := filepath.Join(env, "bundle")
+
+	cmd := exec.Command(bv, "--export-pages", out)
+	cmd.Dir = env
+	cmd.Env = append(os.Environ(), "BV_BUILD_HYBRID_WASM=1")
+	combined, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("export should fail when the hybrid build was requested but wasm-pack is missing:\n%s", combined)
+	}
+	if !strings.Contains(string(combined), "wasm-pack") {
+		t.Fatalf("failure should name wasm-pack:\n%s", combined)
+	}
+
+	// Without the flag the same export succeeds and ships no wasm/ directory
+	// unless the assets carried one.
+	cmd = exec.Command(bv, "--export-pages", out)
+	cmd.Dir = env
+	if combined, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("plain export failed: %v\n%s", err, combined)
+	}
+	if _, err := os.Stat(filepath.Join(out, "index.html")); err != nil {
+		t.Fatalf("bundle missing index.html: %v", err)
+	}
+}
+
+// TestExportPages_RecordsLoadSizes (I4) exports this repository's dashboard
+// and measures what a viewer has to download before first render. With
+// BV_RECORD_PERF=1 it writes tests/artifacts/perf/pages_load.json (the source
+// of the README's bundle-size claims); otherwise it guards that record
+// against a bundle that grew by more than a quarter. Time-to-first-render
+// needs a browser and is only measured when BV_HEADLESS_BROWSER names one;
+// without it the JSON says so instead of inventing a number.
+func TestExportPages_RecordsLoadSizes(t *testing.T) {
+	repo, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".beads", "issues.jsonl")); err != nil {
+		t.Skip("repository tracker not present")
+	}
+	bv := buildBvBinary(t)
+	out := filepath.Join(t.TempDir(), "bundle")
+	cmd := exec.Command(bv, "--export-pages", out)
+	cmd.Dir = repo
+	combined, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("export failed: %v\n%s", err, combined)
+	}
+
+	size := func(rel string) int64 {
+		info, err := os.Stat(filepath.Join(out, rel))
+		if err != nil {
+			t.Fatalf("bundle file %s: %v", rel, err)
+		}
+		return info.Size()
+	}
+	// A source archive has no local Git history. Production still exports the
+	// repository's complete current graph and warns that time-travel is absent.
+	// With Git present, a missing history file remains a regression.
+	var historyBytes *int64
+	historyStatus := "available"
+	if _, err := os.Stat(filepath.Join(repo, ".git")); err == nil {
+		n := size(filepath.Join("data", "history.json"))
+		historyBytes = &n
+	} else if os.IsNotExist(err) {
+		historyStatus = "unavailable_no_git"
+		warning := "Warning: failed to generate history: not a git repository: " + repo
+		if !strings.Contains(string(combined), warning) {
+			t.Fatalf("missing optional-history warning %q:\n%s", warning, combined)
+		}
+		if _, err := os.Stat(filepath.Join(out, "data", "history.json")); !os.IsNotExist(err) {
+			t.Fatalf("history.json should be absent without Git history, got %v", err)
+		}
+	} else {
+		t.Fatalf("stat repository Git metadata: %v", err)
+	}
+	var total, vendor int64
+	if err := filepath.Walk(out, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		total += info.Size()
+		if strings.Contains(path, string(filepath.Separator)+"vendor"+string(filepath.Separator)) {
+			vendor += info.Size()
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	layoutBytes, err := os.ReadFile(filepath.Join(out, "data", "graph_layout.json"))
+	if err != nil {
+		t.Fatalf("graph_layout.json: %v", err)
+	}
+	var layout struct {
+		NodeCount int `json:"node_count"`
+		EdgeCount int `json:"edge_count"`
+	}
+	if err := json.Unmarshal(layoutBytes, &layout); err != nil {
+		t.Fatalf("graph_layout.json decode: %v", err)
+	}
+
+	record := map[string]any{
+		"generated_at":   time.Now().UTC().Format(time.RFC3339),
+		"issues":         layout.NodeCount,
+		"edges":          layout.EdgeCount,
+		"history_status": historyStatus,
+		"bytes": map[string]any{
+			"index_html":        size("index.html"),
+			"beads_sqlite3":     size("beads.sqlite3"),
+			"graph_layout_json": int64(len(layoutBytes)),
+			"triage_json":       size(filepath.Join("data", "triage.json")),
+			"history_json":      historyBytes,
+			"vendor_total":      vendor,
+			"bundle_total":      total,
+		},
+		"first_render_ms": nil,
+		"note":            "first_render_ms is measured only when BV_HEADLESS_BROWSER names a browser; absent here",
+	}
+	if browser := os.Getenv("BV_HEADLESS_BROWSER"); browser != "" {
+		record["note"] = "BV_HEADLESS_BROWSER is set but timing is not implemented yet; sizes only"
+	}
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("pages bundle for %d issues / %d edges: %s", layout.NodeCount, layout.EdgeCount, data)
+	recordPath := filepath.Join(repo, "tests", "artifacts", "perf", "pages_load.json")
+	if os.Getenv("BV_RECORD_PERF") == "1" {
+		// Deliberate re-measurement: rewrite the committed record.
+		if err := os.MkdirAll(filepath.Dir(recordPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(recordPath, append(data, '\n'), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		// Ordinary runs guard the committed record instead of rewriting it
+		// (a rewrite on every e2e run dirtied the tree after each gate).
+		// A bundle that grew by more than a quarter is a regression to record
+		// on purpose, not silently.
+		committed, err := os.ReadFile(recordPath)
+		if err != nil {
+			t.Fatalf("%s is missing; run this test with BV_RECORD_PERF=1 to record it: %v", recordPath, err)
+		}
+		var prior struct {
+			Bytes struct {
+				BundleTotal int64 `json:"bundle_total"`
+			} `json:"bytes"`
+		}
+		if err := json.Unmarshal(committed, &prior); err != nil {
+			t.Fatalf("decode %s: %v", recordPath, err)
+		}
+		if prior.Bytes.BundleTotal > 0 && total > prior.Bytes.BundleTotal*5/4 {
+			t.Fatalf("bundle_total grew from %d to %d bytes (more than 25%%); re-record with BV_RECORD_PERF=1 if intended", prior.Bytes.BundleTotal, total)
+		}
+	}
+	if layout.NodeCount == 0 || size("beads.sqlite3") == 0 {
+		t.Fatalf("bundle should carry the repository's issues")
 	}
 }

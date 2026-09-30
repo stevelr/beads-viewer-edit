@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -194,10 +195,17 @@ func (t *TemporalCorrelator) touchesBeadsFile(sha string) bool {
 
 // calculateTemporalConfidence computes dynamic confidence for temporal correlation
 func (t *TemporalCorrelator) calculateTemporalConfidence(window TemporalWindow, files []FileChange, pathHints []string) float64 {
+	return temporalConfidence(window, t.activeBeadCount(window), files, pathHints)
+}
+
+// temporalConfidence is the receiver-free confidence model shared by the
+// per-window git path (TemporalCorrelator) and the walk-based strategy the
+// Correlator runs; activeBeads is the number of beads the author had active
+// during the window (already resolved by the caller).
+func temporalConfidence(window TemporalWindow, activeBeads int, files []FileChange, pathHints []string) float64 {
 	base := 0.50
 
 	// Factor 1: How many beads was this author working on?
-	activeBeads := t.activeBeadCount(window)
 	if activeBeads <= 1 {
 		base += 0.20 // Only one bead = higher confidence
 	} else if activeBeads == 2 {
@@ -229,6 +237,12 @@ func (t *TemporalCorrelator) calculateTemporalConfidence(window TemporalWindow, 
 
 // generateTemporalReason creates a human-readable explanation for the correlation
 func (t *TemporalCorrelator) generateTemporalReason(window TemporalWindow, files []FileChange, pathHints []string) string {
+	return temporalReason(window, t.activeBeadCount(window), files, pathHints)
+}
+
+// temporalReason is the receiver-free reason builder paired with
+// temporalConfidence.
+func temporalReason(window TemporalWindow, activeBeads int, files []FileChange, pathHints []string) string {
 	parts := []string{
 		fmt.Sprintf("Commit by %s during bead's active window", window.Author),
 	}
@@ -240,7 +254,6 @@ func (t *TemporalCorrelator) generateTemporalReason(window TemporalWindow, files
 		parts = append(parts, fmt.Sprintf("long window (%dd)", int(windowDuration.Hours()/24)))
 	}
 
-	activeBeads := t.activeBeadCount(window)
 	if activeBeads <= 1 {
 		parts = append(parts, "author had only this bead active")
 	} else if activeBeads > 3 {
@@ -377,6 +390,139 @@ func (t *TemporalCorrelator) ExtractAllTemporalCorrelations(histories map[string
 	}
 
 	return allCommits, nil
+}
+
+// temporalCandidate is a walk-based temporal match stored in the history
+// artifact BEFORE confidence is assigned. Confidence depends on the bead's
+// title (path hints, +0.15), and titles come from the working-tree bead set,
+// which the HEAD-keyed artifact cache deliberately excludes; so the artifact
+// keeps only HEAD-derived facts and assembleReport finalizes the confidence
+// against the current title via finalizeTemporalCandidate.
+type temporalCandidate struct {
+	BeadID       string       `json:"bead_id"`
+	SHA          string       `json:"sha"`
+	Message      string       `json:"message"`
+	Author       string       `json:"author"`
+	AuthorEmail  string       `json:"author_email"`
+	Timestamp    time.Time    `json:"timestamp"`
+	Files        []FileChange `json:"files"`
+	WindowAuthor string       `json:"window_author"` // claimant display name (for the reason text)
+	WindowStart  time.Time    `json:"window_start"`
+	WindowEnd    time.Time    `json:"window_end"`
+	ActiveBeads  int          `json:"active_beads"`
+}
+
+// temporalWindowsFromEvents derives one claimed→closed window per bead from
+// extracted lifecycle events (chronological), with ActiveBeads set to the
+// number of beads the same claimant had claimed and still open at any point
+// during the window (itself included). Unlike ExtractAllTemporalCorrelations
+// it never consults time.Now(): a bead that was never closed is treated as
+// open for the rest of history, which is the same answer for every past
+// window and keeps the artifact deterministic. Windows are returned in bead
+// id order.
+func temporalWindowsFromEvents(events []BeadEvent, beadFilter string) []TemporalWindow {
+	eventsByBead := make(map[string][]BeadEvent)
+	for _, ev := range events {
+		eventsByBead[ev.BeadID] = append(eventsByBead[ev.BeadID], ev)
+	}
+	beadIDs := make([]string, 0, len(eventsByBead))
+	for id := range eventsByBead {
+		beadIDs = append(beadIDs, id)
+	}
+	sort.Strings(beadIDs)
+
+	type claimSpan struct {
+		email  string
+		start  time.Time
+		end    time.Time
+		closed bool
+	}
+	spans := make(map[string]claimSpan, len(beadIDs))
+	var windows []TemporalWindow
+	for _, id := range beadIDs {
+		m := GetBeadMilestones(eventsByBead[id])
+		if m.Claimed == nil {
+			continue
+		}
+		span := claimSpan{email: m.Claimed.AuthorEmail, start: m.Claimed.Timestamp}
+		if m.Closed != nil {
+			span.end = m.Closed.Timestamp
+			span.closed = true
+		}
+		spans[id] = span
+		if beadFilter != "" && id != beadFilter {
+			continue
+		}
+		if w := ExtractWindowFromMilestones(id, "", m); w != nil {
+			windows = append(windows, *w)
+		}
+	}
+	for i := range windows {
+		w := &windows[i]
+		concurrent := 0
+		for _, span := range spans {
+			if span.email != w.AuthorEmail {
+				continue
+			}
+			if !span.start.Before(w.End) {
+				continue
+			}
+			if span.closed && !span.end.After(w.Start) {
+				continue
+			}
+			concurrent++
+		}
+		w.ActiveBeads = concurrent
+	}
+	return windows
+}
+
+// commitInWindow reports whether a walked commit was authored by the window's
+// claimant (email match when the claim carries one, else display name) inside
+// [Start, End]. Matching by email rather than a regex over "Name <email>"
+// avoids the substring false positives of `git log --author`.
+func commitInWindow(w TemporalWindow, wc walkedCommit) bool {
+	if wc.Timestamp.Before(w.Start) || wc.Timestamp.After(w.End) {
+		return false
+	}
+	if w.AuthorEmail != "" {
+		return strings.EqualFold(wc.AuthorEmail, w.AuthorEmail)
+	}
+	if w.Author != "" {
+		return strings.EqualFold(wc.Author, w.Author)
+	}
+	return false
+}
+
+// finalizeTemporalCandidate turns an artifact candidate into a scored
+// CorrelatedCommit using the bead's CURRENT title for path hints.
+func finalizeTemporalCandidate(cand temporalCandidate, title string) CorrelatedCommit {
+	window := TemporalWindow{
+		BeadID:      cand.BeadID,
+		Title:       title,
+		Author:      cand.WindowAuthor,
+		Start:       cand.WindowStart,
+		End:         cand.WindowEnd,
+		ActiveBeads: cand.ActiveBeads,
+	}
+	active := cand.ActiveBeads
+	if active <= 0 {
+		active = 1
+	}
+	hints := extractPathHints(title)
+	return CorrelatedCommit{
+		BeadID:      cand.BeadID,
+		SHA:         cand.SHA,
+		ShortSHA:    shortSHA(cand.SHA),
+		Message:     cand.Message,
+		Author:      cand.Author,
+		AuthorEmail: cand.AuthorEmail,
+		Timestamp:   cand.Timestamp,
+		Files:       cand.Files,
+		Method:      MethodTemporalAuthor,
+		Confidence:  temporalConfidence(window, active, cand.Files, hints),
+		Reason:      temporalReason(window, active, cand.Files, hints),
+	}
 }
 
 // calculateActiveBeadsPerAuthor computes how many beads each author had in progress

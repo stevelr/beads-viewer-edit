@@ -27,7 +27,7 @@ type FlowMatrixModel struct {
 
 	// Drill-down state
 	showDrilldown   bool
-	drilldownIssues []model.Issue
+	drilldownIssues []model.Issue // Adjacent blocker/blocked endpoints for each unique pair.
 	drilldownCursor int
 	drilldownScroll int
 	drilldownTitle  string
@@ -53,18 +53,53 @@ func NewFlowMatrixModel(theme Theme) FlowMatrixModel {
 	}
 }
 
-// SetData initializes the model with flow data
+// SetData refreshes flow data while preserving a surviving label and endpoint.
 func (m *FlowMatrixModel) SetData(flow *analysis.CrossLabelFlow, issues []model.Issue) {
+	label := m.SelectedLabel()
+	var blockerID, blockedID string
+	endpoint := m.drilldownCursor % 2
+	if m.SelectedDrilldownIssue() != nil {
+		pairStart := m.drilldownCursor - endpoint
+		if pairStart+1 < len(m.drilldownIssues) {
+			blockerID = m.drilldownIssues[pairStart].ID
+			blockedID = m.drilldownIssues[pairStart+1].ID
+		}
+	}
 	m.flow = flow
 	m.issues = issues
-	m.ready = flow != nil && len(flow.Labels) > 0
 	m.computeStats()
+	m.ready = len(m.labelStats) > 0
+	m.cursor, m.scrollOffset = 0, 0
+	found := false
+	for i, stats := range m.labelStats {
+		if stats.Label == label {
+			m.cursor, found = i, true
+			break
+		}
+	}
+	m.ensureVisible()
+	if !found {
+		m.showDrilldown = false
+		m.drilldownIssues = nil
+		m.drilldownCursor, m.drilldownScroll = 0, 0
+	} else if m.showDrilldown {
+		m.openDrilldown()
+		for i := 0; i+1 < len(m.drilldownIssues); i += 2 {
+			if m.drilldownIssues[i].ID == blockerID && m.drilldownIssues[i+1].ID == blockedID {
+				m.drilldownCursor = i + endpoint
+				break
+			}
+		}
+		m.ensureDrilldownVisible()
+	}
 }
 
 // SetSize sets the available rendering dimensions
 func (m *FlowMatrixModel) SetSize(width, height int) {
-	m.width = width
-	m.height = height
+	m.width = max(0, width)
+	m.height = max(0, height)
+	m.ensureVisible()
+	m.ensureDrilldownVisible()
 }
 
 // computeStats builds per-label statistics from the flow matrix
@@ -231,16 +266,19 @@ func (m *FlowMatrixModel) ensureVisible() {
 }
 
 func (m *FlowMatrixModel) ensureDrilldownVisible() {
-	visible := m.height - 8
-	if visible < 3 {
-		visible = 3
-	}
+	visible := m.drilldownVisibleRows()
 	if m.drilldownCursor < m.drilldownScroll {
-		m.drilldownScroll = m.drilldownCursor
+		m.drilldownScroll = m.drilldownCursor / 2 * 2
 	}
 	if m.drilldownCursor >= m.drilldownScroll+visible {
-		m.drilldownScroll = m.drilldownCursor - visible + 1
+		m.drilldownScroll = m.drilldownCursor/2*2 - visible + 2
 	}
+	m.drilldownScroll = min(m.drilldownScroll, max(0, len(m.drilldownIssues)-visible))
+}
+
+func (m *FlowMatrixModel) drilldownVisibleRows() int {
+	// Keep both endpoints on screen together, including while scrolling.
+	return max(2, (m.height-8)/2*2)
 }
 
 func (m *FlowMatrixModel) visibleRows() int {
@@ -252,36 +290,53 @@ func (m *FlowMatrixModel) visibleRows() int {
 }
 
 func (m *FlowMatrixModel) openDrilldown() {
-	if m.cursor >= len(m.labelStats) {
+	if m.cursor < 0 || m.cursor >= len(m.labelStats) || m.flow == nil {
 		return
 	}
 	selectedLabel := m.labelStats[m.cursor].Label
 
-	// Find issues with this label that have cross-label dependencies
-	var relevant []model.Issue
+	// The producer already decided which edges block. Label membership alone
+	// includes unrelated work and misses the other endpoint of each relationship.
+	issueMap := make(map[string]model.Issue, len(m.issues))
 	for _, iss := range m.issues {
-		hasLabel := false
-		for _, l := range iss.Labels {
-			if l == selectedLabel {
-				hasLabel = true
-				break
+		issueMap[iss.ID] = iss
+	}
+	type pairKey struct{ blocker, blocked string }
+	seen := make(map[pairKey]bool)
+	var pairs []pairKey
+	for _, dep := range m.flow.Dependencies {
+		if dep.FromLabel != selectedLabel && dep.ToLabel != selectedLabel {
+			continue
+		}
+		for _, pair := range dep.BlockingPairs {
+			key := pairKey{pair.BlockerID, pair.BlockedID}
+			_, blockerFound := issueMap[key.blocker]
+			_, blockedFound := issueMap[key.blocked]
+			if blockerFound && blockedFound && !seen[key] {
+				seen[key] = true
+				pairs = append(pairs, key)
 			}
 		}
-		if hasLabel {
-			relevant = append(relevant, iss)
-		}
 	}
-
-	m.drilldownIssues = relevant
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].blocker != pairs[j].blocker {
+			return pairs[i].blocker < pairs[j].blocker
+		}
+		return pairs[i].blocked < pairs[j].blocked
+	})
+	m.drilldownIssues = make([]model.Issue, 0, 2*len(pairs))
+	for _, pair := range pairs {
+		m.drilldownIssues = append(m.drilldownIssues, issueMap[pair.blocker], issueMap[pair.blocked])
+	}
 	m.drilldownCursor = 0
 	m.drilldownScroll = 0
-	m.drilldownTitle = fmt.Sprintf("Issues with label: %s", selectedLabel)
+	m.drilldownTitle = fmt.Sprintf("Dependencies involving: %s", selectedLabel)
 	m.showDrilldown = true
 }
 
 // SelectedLabel returns the currently selected label (for drill-down from parent)
 func (m *FlowMatrixModel) SelectedLabel() string {
-	if m.cursor < len(m.labelStats) {
+	if m.cursor >= 0 && m.cursor < len(m.labelStats) {
 		return m.labelStats[m.cursor].Label
 	}
 	return ""
@@ -742,23 +797,21 @@ func (m FlowMatrixModel) renderDrilldown() string {
 		Bold(true).
 		Foreground(m.theme.Primary)
 
-	b.WriteString(headerStyle.Render(m.drilldownTitle))
-	b.WriteString(fmt.Sprintf(" (%d issues)\n", len(m.drilldownIssues)))
+	header := fmt.Sprintf("%s (%d relationships)", m.drilldownTitle, len(m.drilldownIssues)/2)
+	b.WriteString(headerStyle.Render(truncateRunesHelper(header, m.width, "…")))
+	b.WriteString("\n")
 
 	borderStyle := m.theme.Renderer.NewStyle().Foreground(m.theme.Border)
 	b.WriteString(borderStyle.Render(strings.Repeat("─", m.width)))
 	b.WriteString("\n\n")
 
 	if len(m.drilldownIssues) == 0 {
-		b.WriteString("No issues found")
+		b.WriteString(truncateRunesHelper("No blocking relationships found", m.width, "…"))
 		return b.String()
 	}
 
 	// Visible rows
-	visible := m.height - 8
-	if visible < 3 {
-		visible = 3
-	}
+	visible := m.drilldownVisibleRows()
 	start := m.drilldownScroll
 	end := start + visible
 	if end > len(m.drilldownIssues) {
@@ -774,24 +827,15 @@ func (m FlowMatrixModel) renderDrilldown() string {
 		statusStyle := m.theme.Renderer.NewStyle().Foreground(statusColor)
 		statusIndicator := "●"
 
-		// Issue line
-		idStyle := m.theme.Renderer.NewStyle().Foreground(m.theme.Primary)
-		titleStyle := m.theme.Renderer.NewStyle().Foreground(m.theme.Base.GetForeground())
-
-		title := iss.Title
-		maxTitleLen := m.width - 25
-		if maxTitleLen < 20 {
-			maxTitleLen = 20
+		prefix := ""
+		if i%2 == 1 {
+			prefix = "  blocks "
 		}
-		titleRunes := []rune(title)
-		if len(titleRunes) > maxTitleLen {
-			title = string(titleRunes[:maxTitleLen-1]) + "…"
+		text := truncateRunesHelper(prefix+iss.ID+" "+iss.Title, max(0, m.width-2), "…")
+		row := statusStyle.Render(statusIndicator) + " " + text
+		if m.width < 2 {
+			row = truncateRunesHelper(statusIndicator, m.width, "")
 		}
-
-		row := fmt.Sprintf("%s %s %s",
-			statusStyle.Render(statusIndicator),
-			idStyle.Render(iss.ID),
-			titleStyle.Render(title))
 
 		if selected {
 			selectStyle := m.theme.Renderer.NewStyle().
@@ -812,7 +856,7 @@ func (m FlowMatrixModel) renderDrilldown() string {
 	b.WriteString("\n")
 
 	helpStyle := m.theme.Renderer.NewStyle().Foreground(m.theme.Subtext)
-	b.WriteString(helpStyle.Render("j/k: navigate  Esc: back"))
+	b.WriteString(helpStyle.Render(truncateRunesHelper("j/k: endpoint  Enter: details  Esc: back", m.width, "…")))
 
 	return b.String()
 }
@@ -879,7 +923,7 @@ func (m *FlowMatrixModel) GoToEnd() {
 
 // SelectedDrilldownIssue returns the currently selected issue in drilldown mode
 func (m *FlowMatrixModel) SelectedDrilldownIssue() *model.Issue {
-	if !m.showDrilldown || m.drilldownCursor >= len(m.drilldownIssues) {
+	if !m.showDrilldown || m.drilldownCursor < 0 || m.drilldownCursor >= len(m.drilldownIssues) {
 		return nil
 	}
 	return &m.drilldownIssues[m.drilldownCursor]

@@ -451,13 +451,14 @@ func TestHelpViewTransition(t *testing.T) {
 	issues := createTestIssues(10)
 
 	views := []struct {
-		name     string
-		enterKey string
+		name          string
+		enterKey      string
+		expectedFocus string
 	}{
-		{"list", ""},
-		{"tree", "E"},
-		{"board", "b"},
-		{"graph", "g"},
+		{"list", "", "list"},
+		{"tree", "E", "tree"},
+		{"board", "b", "board"},
+		{"graph", "g", "graph"},
 	}
 
 	for _, v := range views {
@@ -482,8 +483,8 @@ func TestHelpViewTransition(t *testing.T) {
 			newM, _ = m.Update(integrationSpecialKey(tea.KeyEsc))
 			m = newM.(*ui.Model)
 
-			if m.FocusState() == "help" {
-				t.Error("Should have exited help with Esc")
+			if got := m.FocusState(); got != v.expectedFocus {
+				t.Errorf("Focus after help from %s = %q, want %q", v.name, got, v.expectedFocus)
 			}
 		})
 	}

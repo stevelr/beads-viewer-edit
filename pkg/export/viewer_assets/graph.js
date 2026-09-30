@@ -632,6 +632,15 @@ async function initWasm() {
     return false;
 }
 
+// Keep graph construction and rendered links aligned with the Go loader.
+function isBlockingDependency(dependency) {
+    return !dependency.type || ['blocks', 'conditional-blocks', 'waits-for'].includes(dependency.type);
+}
+
+function isResolvedIssue(issue) {
+    return issue.status === 'closed' || issue.status === 'tombstone';
+}
+
 function buildWasmGraph() {
     if (!store.wasmReady) return;
 
@@ -652,13 +661,13 @@ function buildWasmGraph() {
 
         // Add blocking edges
         store.dependencies
-            .filter(d => d.type === 'blocks' || !d.type)
+            .filter(isBlockingDependency)
             .forEach(d => {
-                const fromIdx = store.wasmGraph.nodeIdx(d.issue_id);
-                const toIdx = store.wasmGraph.nodeIdx(d.depends_on_id);
-                if (fromIdx !== undefined && toIdx !== undefined) {
-                    store.wasmGraph.addEdge(fromIdx, toIdx);
-                }
+                // Keep omitted prerequisites in the analysis even though they
+                // have no rendered node. Unknown references remain blockers.
+                const fromIdx = store.wasmGraph.addNode(d.issue_id);
+                const toIdx = store.wasmGraph.addNode(d.depends_on_id);
+                store.wasmGraph.addEdge(fromIdx, toIdx);
             });
 
         console.log(`[bv-graph] WASM graph: ${store.wasmGraph.nodeCount()} nodes, ${store.wasmGraph.edgeCount()} edges`);
@@ -666,6 +675,12 @@ function buildWasmGraph() {
         console.warn('[bv-graph] Failed to build WASM graph:', e);
         store.wasmGraph = null;
     }
+}
+
+// Keep the viewer's metric names separate from wasm-bindgen's serialized fields.
+export function computeHITSMetrics(wasmGraph) {
+    const result = wasmGraph.hitsDefault();
+    return { hub: result.hubs, authority: result.authorities };
 }
 
 function computeMetrics() {
@@ -696,13 +711,7 @@ function computeMetrics() {
 
         // HITS (hub and authority scores)
         try {
-            const hitsResult = store.wasmGraph.hitsDefault();
-            if (hitsResult) {
-                store.metrics.hits = {
-                    hub: hitsResult.hub,
-                    authority: hitsResult.authority
-                };
-            }
+            store.metrics.hits = computeHITSMetrics(store.wasmGraph);
         } catch (e) {
             console.warn('[bv-graph] HITS computation skipped:', e);
         }
@@ -887,6 +896,7 @@ export async function loadPrecomputedLayout() {
  * @param {object} [layout] - Optional pre-computed layout
  */
 export function loadData(issues, dependencies, layout = precomputedLayout) {
+    resetWhatIf();
     store.reset();
     store.issues = issues;
     store.dependencies = dependencies;
@@ -947,7 +957,10 @@ export function loadData(issues, dependencies, layout = precomputedLayout) {
     if (layout?.positions) {
         store.graph.zoomToFit(200, 50);
     } else {
-        setTimeout(() => store.graph.zoomToFit(400, 50), 500);
+        const graph = store.graph;
+        setTimeout(() => {
+            if (store.graph === graph) graph.zoomToFit(400, 50);
+        }, 500);
     }
 
     // Emit event
@@ -968,7 +981,7 @@ function prepareGraphData(layout = null) {
     let nodes = issues.filter(issue => {
         // Status filter
         if (filters.status && issue.status !== filters.status) return false;
-        if (!filters.showClosed && issue.status === 'closed') return false;
+        if (!filters.showClosed && isResolvedIssue(issue)) return false;
 
         // Priority filter
         if (filters.priority !== null && issue.priority !== filters.priority) return false;
@@ -994,7 +1007,7 @@ function prepareGraphData(layout = null) {
 
     // Filter links
     let links = dependencies
-        .filter(d => (d.type === 'blocks' || !d.type))
+        .filter(isBlockingDependency)
         .filter(d => nodeIds.has(d.issue_id) && nodeIds.has(d.depends_on_id))
         .map(d => ({
             source: d.issue_id,
@@ -1135,7 +1148,7 @@ function getNodeOpacity(node) {
     }
 
     // Dim closed nodes
-    if (node.status === 'closed') return 0.6;
+    if (isResolvedIssue(node)) return 0.6;
 
     return 1;
 }
@@ -1288,7 +1301,7 @@ function getLinkColor(link) {
 
     // What-if cascade links (bright green for unblocking edges)
     if (whatIfState.active && store.highlightedLinks.has(linkId)) {
-        if (sourceNode?._whatIfState === 'closing' || targetNode?._whatIfState === 'unblocked') {
+        if (targetNode?._whatIfState === 'closing' || sourceNode?._whatIfState === 'unblocked') {
             return THEME.accent.green;
         }
     }
@@ -1584,7 +1597,8 @@ const whatIfState = {
     sourceNode: null,
     unblockedNodes: new Set(),
     animationPhase: 0,
-    animationTimer: null
+    animationTimer: null,
+    unblockTimers: new Set()
 };
 
 /**
@@ -1597,9 +1611,9 @@ export function performWhatIf(node) {
         return null;
     }
 
-    // Only simulate on open issues
-    if (node.status === 'closed') {
-        showToast('Issue is already closed', 'info');
+    // Resolved issues no longer contribute blocking work.
+    if (isResolvedIssue(node)) {
+        showToast('Issue is already resolved', 'info');
         return null;
     }
 
@@ -1635,13 +1649,18 @@ function buildClosedSet() {
     const closedSet = new Uint8Array(n);
 
     store.issues.forEach(issue => {
-        if (issue.status === 'closed') {
+        if (isResolvedIssue(issue)) {
             const idx = store.wasmGraph.nodeIdx(issue.id);
             if (idx !== undefined && idx < n) {
                 closedSet[idx] = 1;
             }
         }
     });
+
+    for (const id of window.beadsViewer?.getResolvedIssueIDs?.() || []) {
+        const idx = store.wasmGraph.nodeIdx(id);
+        if (idx !== undefined) closedSet[idx] = 1;
+    }
 
     return closedSet;
 }
@@ -1682,7 +1701,9 @@ function animateWhatIfCascade(sourceNode, result) {
     let delay = 300;
 
     unblockedIds.forEach((id, i) => {
-        setTimeout(() => {
+        const timer = setTimeout(() => {
+            whatIfState.unblockTimers.delete(timer);
+            if (!whatIfState.active || whatIfState.sourceNode !== sourceNode) return;
             whatIfState.unblockedNodes.add(id);
             store.highlightedNodes.add(id);
 
@@ -1692,21 +1713,19 @@ function animateWhatIfCascade(sourceNode, result) {
                 unblockedNode._whatIfState = 'unblocked';
             }
 
-            // Highlight the edge from blocker to this node
+            // Rendered edges point from the dependent to its prerequisite.
             store.dependencies.forEach(dep => {
-                if (dep.issue_id === sourceNode.id && dep.depends_on_id === id) {
-                    store.highlightedLinks.add(`${sourceNode.id}-${id}`);
-                }
-                // Also highlight edges from other closed nodes that contribute
-                const blocker = store.nodeMap.get(dep.issue_id);
-                if (blocker && (blocker.status === 'closed' || dep.issue_id === sourceNode.id) && dep.depends_on_id === id) {
-                    store.highlightedLinks.add(`${dep.issue_id}-${id}`);
+                if (!isBlockingDependency(dep) || dep.issue_id !== id) return;
+                const blocker = store.nodeMap.get(dep.depends_on_id);
+                if (dep.depends_on_id === sourceNode.id || (blocker && isResolvedIssue(blocker))) {
+                    store.highlightedLinks.add(`${id}-${dep.depends_on_id}`);
                 }
             });
 
             refreshGraph();
             dispatchEvent('whatIfUnblock', { nodeId: id, index: i, total: unblockedIds.length });
         }, delay + i * 150);
+        whatIfState.unblockTimers.add(timer);
     });
 
     // Phase 3: Show summary after animations complete
@@ -1749,6 +1768,8 @@ function showWhatIfSummary(sourceNode, result, unblockedIds) {
  * Reset what-if visualization state
  */
 export function resetWhatIf() {
+    for (const timer of whatIfState.unblockTimers) clearTimeout(timer);
+    whatIfState.unblockTimers.clear();
     if (whatIfState.animationTimer) {
         clearTimeout(whatIfState.animationTimer);
         whatIfState.animationTimer = null;
@@ -1769,7 +1790,7 @@ export function resetWhatIf() {
 
     store.highlightedNodes.clear();
     store.highlightedLinks.clear();
-    store.graph?.refresh();
+    refreshGraph();
 
     dispatchEvent('whatIfReset');
 }
@@ -1983,7 +2004,7 @@ export function resetCriticalPath() {
 
     store.highlightedNodes.clear();
     store.highlightedLinks.clear();
-    store.graph?.refresh();
+    refreshGraph();
 
     dispatchEvent('criticalPathReset');
 }
@@ -2059,9 +2080,9 @@ export function highlightDependencyPath(node) {
     if (idx === undefined) return;
 
     // Get all nodes that block this one (upstream)
-    const blockers = store.wasmGraph.reachableTo(idx);
+    const blockers = store.wasmGraph.reachableFrom(idx);
     // Get all nodes blocked by this one (downstream)
-    const dependents = store.wasmGraph.reachableFrom(idx);
+    const dependents = store.wasmGraph.reachableTo(idx);
 
     // Highlight nodes
     store.highlightedNodes.add(node.id);
@@ -2200,7 +2221,7 @@ export function highlightCycle(index, zoom = false) {
         });
     }
 
-    store.graph?.refresh();
+    refreshGraph();
 
     // Zoom to cycle if requested
     if (zoom) {
@@ -2301,7 +2322,7 @@ export function resetCycleNavigator() {
 
     store.highlightedNodes.clear();
     store.highlightedLinks.clear();
-    store.graph?.refresh();
+    refreshGraph();
 
     dispatchEvent('cycleNavigatorReset');
 }
@@ -2432,7 +2453,7 @@ function deactivateLabelGalaxy() {
     labelClusterState.active = false;
     labelClusterState.clusterHulls.clear();
     hideLabelLegend();
-    store.graph?.refresh();
+    refreshGraph();
     dispatchEvent('labelGalaxyDeactivated');
 }
 
@@ -2752,7 +2773,7 @@ function navigateByPriority(direction) {
 
     // Sort nodes by priority (ascending), then by PageRank (descending)
     const sortedNodes = [...graphData.nodes]
-        .filter(n => n.status !== 'closed') // Only open/in-progress
+        .filter(n => !isResolvedIssue(n))
         .sort((a, b) => {
             const pDiff = (a.priority ?? 99) - (b.priority ?? 99);
             if (pDiff !== 0) return pDiff;
@@ -2927,17 +2948,17 @@ function showTooltip(node) {
 
     tooltipEl.innerHTML = `
         <div style="font-weight: 600; margin-bottom: 8px; color: ${THEME.accent.cyan}">
-            ${icon} ${node.id}
+            ${icon} ${escapeHtml(node.id)}
         </div>
         <div style="margin-bottom: 8px; line-height: 1.4;">
             ${escapeHtml(node.title)}
         </div>
         <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px;">
             <span style="background: ${statusColor}; color: ${THEME.bg}; padding: 2px 8px; border-radius: 4px; font-size: 10px; text-transform: uppercase;">
-                ${node.status}
+                ${escapeHtml(node.status)}
             </span>
             <span style="color: ${priorityColor}; font-weight: 600;">
-                P${node.priority}
+                P${escapeHtml(String(node.priority))}
             </span>
         </div>
         <div style="font-size: 10px; color: ${THEME.fgMuted}; display: grid; grid-template-columns: 1fr 1fr; gap: 4px;">
@@ -3205,10 +3226,12 @@ export function getConfig() {
 
 export function setConfig(key, value) {
     store.config[key] = value;
-    store.graph?.refresh();
+    refreshGraph();
 }
 
 export function cleanup() {
+    resetWhatIf();
+    store.graph?.pauseAnimation();
     hideTooltip();
     if (tooltipEl) {
         tooltipEl.remove();
@@ -3852,7 +3875,7 @@ export function generateDemoHistory(issues, numCommits = 20) {
             const toClose = addedArr.slice(0, Math.floor(addedArr.length * 0.2));
             toClose.forEach(id => {
                 const issue = issues.find(iss => iss.id === id);
-                if (issue && issue.status === 'closed') {
+                if (issue && isResolvedIssue(issue)) {
                     commit.beads_closed.push(id);
                     closedSet.add(id);
                 }

@@ -123,13 +123,16 @@ func (a *Analyzer) GenerateEnhancedRecommendations() []EnhancedPriorityRecommend
 
 // GenerateEnhancedRecommendationsWithThresholds generates enhanced recommendations
 func (a *Analyzer) GenerateEnhancedRecommendationsWithThresholds(thresholds RecommendationThresholds) []EnhancedPriorityRecommendation {
-	scores := a.ComputeImpactScores()
+	// Keep the whole batch on one completed snapshot. Reanalyzing each score
+	// rereads and reconstructs the same robot disk cache for every issue.
+	stats := a.Analyze()
+	scores := a.ComputeImpactScoresFromStats(&stats, a.Now())
 	if len(scores) == 0 {
 		return nil
 	}
 
 	// Get basic recommendations
-	basicRecs := a.GenerateRecommendationsWithThresholds(thresholds)
+	basicRecs := a.GenerateRecommendationsFromStats(&stats, thresholds)
 
 	// Create a map for quick lookup
 	recMap := make(map[string]*PriorityRecommendation)
@@ -138,14 +141,14 @@ func (a *Analyzer) GenerateEnhancedRecommendationsWithThresholds(thresholds Reco
 	}
 
 	var enhanced []EnhancedPriorityRecommendation
-	now := time.Now().UTC()
+	now := a.Now().UTC()
 
 	// Enhance each score with what-if deltas
 	for _, score := range scores {
 		rec, hasRec := recMap[score.IssueID]
 
 		// Generate what-if for all scores (not just those with recommendations)
-		whatIf := a.computeWhatIfDelta(score.IssueID)
+		whatIf := a.computeWhatIfDeltaFromStats(score.IssueID, &stats)
 		topReasons := GenerateTopReasons(score)
 
 		// Determine if caps were applied
@@ -229,8 +232,9 @@ func (a *Analyzer) TopWhatIfDeltas(n int) []WhatIfEntry {
 }
 
 // TopWhatIfDeltasFromStats returns the top N issues with highest downstream
-// impact using graph statistics already computed by the caller. A nil stats
-// pointer falls back to one synchronous analysis for the whole batch.
+// impact among selected candidates using graph statistics already computed by
+// the caller. Context-only issues remain in the graph and readiness authority.
+// A nil stats pointer falls back to one synchronous analysis for the whole batch.
 func (a *Analyzer) TopWhatIfDeltasFromStats(stats *GraphStats, n int) []WhatIfEntry {
 	if stats == nil {
 		analyzed := a.Analyze()
@@ -244,7 +248,7 @@ func (a *Analyzer) TopWhatIfDeltasFromStats(stats *GraphStats, n int) []WhatIfEn
 	var results []WhatIfEntry
 
 	for id, issue := range a.issueMap {
-		if isClosedLikeStatus(issue.Status) {
+		if !a.IsCandidate(id) || isClosedLikeStatus(issue.Status) {
 			continue
 		}
 		delta := a.computeWhatIfDeltaFromStats(id, stats)

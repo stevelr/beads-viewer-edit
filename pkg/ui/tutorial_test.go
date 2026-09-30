@@ -514,9 +514,9 @@ func TestTutorialViewProgressBar(t *testing.T) {
 
 	view := m.View()
 
-	// Should contain progress indicator format [1/N]
-	if !strings.Contains(view, "[1/") {
-		t.Error("View should contain progress indicator [1/N] format")
+	// Should contain the documented progress indicator "Page N/M · X%"
+	if !strings.Contains(view, "Page 1/") {
+		t.Error("View should contain progress indicator 'Page 1/M' format")
 	}
 
 	// Should contain progress bar characters
@@ -527,8 +527,8 @@ func TestTutorialViewProgressBar(t *testing.T) {
 	// Navigate to page 2 and verify progress updates
 	m.NextPage()
 	view = m.View()
-	if !strings.Contains(view, "[2/") {
-		t.Error("View should show [2/N] on second page")
+	if !strings.Contains(view, "Page 2/") {
+		t.Error("View should show 'Page 2/M' on second page")
 	}
 }
 

@@ -52,7 +52,7 @@ pub fn parallel_cut_suggestions(
         .filter(|&v| {
             !closed_set.get(v).copied().unwrap_or(false)
                 && graph
-                    .predecessors_slice(v)
+                    .successors_slice(v)
                     .iter()
                     .all(|&p| closed_set.get(p).copied().unwrap_or(false))
         })
@@ -69,13 +69,13 @@ pub fn parallel_cut_suggestions(
         .map(|v| {
             // Count how many dependents would become actionable if v is closed
             let new_actionable = graph
-                .successors_slice(v)
+                .predecessors_slice(v)
                 .iter()
                 .filter(|&&w| {
                     // w must be open
                     !closed_set.get(w).copied().unwrap_or(false)
-                    // All of w's other predecessors must be closed
-                    && graph.predecessors_slice(w).iter()
+                    // All of w's other prerequisites must be closed
+                    && graph.successors_slice(w).iter()
                         .filter(|&&p| p != v)
                         .all(|&p| closed_set.get(p).copied().unwrap_or(false))
                 })
@@ -121,12 +121,12 @@ pub fn unblock_ranking(graph: &DiGraph, closed_set: &[bool], limit: usize) -> Ve
         .filter(|&v| !closed_set.get(v).copied().unwrap_or(false))
         .map(|v| {
             let unblocks = graph
-                .successors_slice(v)
+                .predecessors_slice(v)
                 .iter()
                 .filter(|&&w| {
                     !closed_set.get(w).copied().unwrap_or(false)
                         && graph
-                            .predecessors_slice(w)
+                            .successors_slice(w)
                             .iter()
                             .filter(|&&p| p != v)
                             .all(|&p| closed_set.get(p).copied().unwrap_or(false))
@@ -182,21 +182,26 @@ mod tests {
 
     #[test]
     fn test_chain_no_gain() {
-        // Chain: 0 -> 1 -> 2 -> 3
+        // Chain: 0 <- 1 <- 2 <- 3 (dependent -> prerequisite)
         // Completing any node only unblocks 1 dependent (gain = 0)
-        let g = make_graph(&[(0, 1), (1, 2), (2, 3)]);
+        let g = make_graph(&[(1, 0), (2, 1), (3, 2)]);
         let closed = vec![false; 4];
         let result = parallel_cut_suggestions(&g, &closed, 10);
 
         // No node has gain > 0 in a simple chain
         assert!(result.items.is_empty());
+        assert_eq!(result.current_actionable, 1);
+        assert_eq!(
+            unblock_ranking(&g, &closed, 4),
+            vec![(0, 1), (1, 1), (2, 1), (3, 0)]
+        );
     }
 
     #[test]
     fn test_fork_has_gain() {
-        // Fork: 0 -> 1, 0 -> 2, 0 -> 3
+        // Fork: 1 -> 0, 2 -> 0, 3 -> 0
         // Completing 0 unblocks 3 nodes, gain = 3 - 1 = 2
-        let g = make_graph(&[(0, 1), (0, 2), (0, 3)]);
+        let g = make_graph(&[(1, 0), (2, 0), (3, 0)]);
         let closed = vec![false; 4];
         let result = parallel_cut_suggestions(&g, &closed, 10);
 
@@ -208,38 +213,43 @@ mod tests {
 
     #[test]
     fn test_partially_closed() {
-        // Diamond: 0 -> 1, 0 -> 2, 1 -> 3, 2 -> 3
+        // Diamond: 1 -> 0, 2 -> 0, 3 -> 1, 3 -> 2
         // If 0 is closed, then 1 and 2 are actionable
-        // Completing 1 unblocks 0 (3 still blocked by 2)
-        // Completing 2 unblocks 0 (3 still blocked by 1)
-        let g = make_graph(&[(0, 1), (0, 2), (1, 3), (2, 3)]);
+        // Completing either 1 or 2 alone unblocks zero nodes.
+        let g = make_graph(&[(1, 0), (2, 0), (3, 1), (3, 2)]);
         let closed = vec![true, false, false, false];
         let result = parallel_cut_suggestions(&g, &closed, 10);
 
         // Neither 1 nor 2 alone unblocks 3 (needs both)
         // So no positive gain
         assert!(result.items.is_empty());
+        assert_eq!(result.current_actionable, 2);
+        assert_eq!(
+            unblock_ranking(&g, &closed, 4),
+            vec![(1, 0), (2, 0), (3, 0)]
+        );
     }
 
     #[test]
     fn test_diamond_with_one_closed() {
-        // Diamond: 0 -> 1, 0 -> 2, 1 -> 3, 2 -> 3
+        // Diamond: 1 -> 0, 2 -> 0, 3 -> 1, 3 -> 2
         // If 0 and 1 are closed, completing 2 unblocks 3
-        let g = make_graph(&[(0, 1), (0, 2), (1, 3), (2, 3)]);
+        let g = make_graph(&[(1, 0), (2, 0), (3, 1), (3, 2)]);
         let closed = vec![true, true, false, false];
         let result = parallel_cut_suggestions(&g, &closed, 10);
 
         // Node 2 is actionable and completing it unblocks 3
         // But gain = 1 - 1 = 0 (not positive)
         assert!(result.items.is_empty());
+        assert_eq!(unblock_ranking(&g, &closed, 4), vec![(2, 1), (3, 0)]);
     }
 
     #[test]
     fn test_multiple_forks() {
-        // Two forks: 0 -> {1,2}, 3 -> {4,5,6}
+        // Two forks: {1,2} depend on 0; {4,5,6} depend on 3.
         // Node 0 has gain = 2 - 1 = 1
         // Node 3 has gain = 3 - 1 = 2
-        let g = make_graph(&[(0, 1), (0, 2), (3, 4), (3, 5), (3, 6)]);
+        let g = make_graph(&[(1, 0), (2, 0), (4, 3), (5, 3), (6, 3)]);
         let closed = vec![false; 7];
         let result = parallel_cut_suggestions(&g, &closed, 10);
 
@@ -253,26 +263,26 @@ mod tests {
     fn test_limit_respected() {
         // Many forks
         let g = make_graph(&[
-            (0, 1),
-            (0, 2),
-            (3, 4),
-            (3, 5),
-            (6, 7),
-            (6, 8),
-            (9, 10),
-            (9, 11),
+            (1, 0),
+            (2, 0),
+            (4, 3),
+            (5, 3),
+            (7, 6),
+            (8, 6),
+            (10, 9),
+            (11, 9),
         ]);
         let closed = vec![false; 12];
         let result = parallel_cut_suggestions(&g, &closed, 2);
 
-        assert!(result.items.len() <= 2);
+        assert_eq!(result.items.len(), 2);
     }
 
     #[test]
     fn test_current_actionable_count() {
-        // Fork: 0 -> 1, 0 -> 2
+        // Fork: 1 -> 0, 2 -> 0
         // Initially only 0 is actionable
-        let g = make_graph(&[(0, 1), (0, 2)]);
+        let g = make_graph(&[(1, 0), (2, 0)]);
         let closed = vec![false; 3];
         let result = parallel_cut_suggestions(&g, &closed, 10);
 

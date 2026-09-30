@@ -1,6 +1,7 @@
 package version
 
 import (
+	"regexp"
 	"runtime/debug"
 	"strings"
 )
@@ -14,7 +15,7 @@ var version string
 
 // fallback is the hardcoded version kept in sync with the latest release tag.
 // Used only when both ldflags and debug.ReadBuildInfo fail to provide a version.
-const fallback = "v0.22.0"
+const fallback = "v0.25.0"
 
 // Version is the resolved application version, populated by init().
 var Version string
@@ -93,18 +94,26 @@ func versionFromBuildInfo() string {
 	if !ok {
 		return ""
 	}
-	v := info.Main.Version
+	return releaseModuleVersion(info.Main.Version)
+}
+
+// Go stamps three pseudo-version forms: no base tag, a release base, or a
+// prerelease base. Match the complete timestamp/revision form so ordinary
+// prerelease tags such as v1.2.3-0.alpha remain usable.
+// See https://go.dev/ref/mod#pseudo-versions. Build-info module versions have
+// already been validated by Go; this pattern only classifies their form.
+var pseudoVersionPattern = regexp.MustCompile(`^v[0-9]+\.(0\.0-|[0-9]+\.[0-9]+-([0-9A-Za-z-]+\.)*0\.)[0-9]{14}-[0-9A-Za-z]+(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
+
+// releaseModuleVersion accepts tagged module versions, excluding development builds.
+func releaseModuleVersion(v string) string {
 	if v == "" || v == "(devel)" {
-		return ""
-	}
-	// Filter out pseudo-versions (e.g., v0.14.5-0.20260212...-abcdef123456)
-	// and dirty builds. These come from local "go build" or "go run", not
-	// from "go install ...@vX.Y.Z" which produces clean semver tags.
-	if strings.Contains(v, "-0.") || strings.HasSuffix(v, "+dirty") {
 		return ""
 	}
 	if v[0] != 'v' {
 		v = "v" + v
+	}
+	if pseudoVersionPattern.MatchString(v) || strings.HasSuffix(v, "+dirty") {
+		return ""
 	}
 	return v
 }

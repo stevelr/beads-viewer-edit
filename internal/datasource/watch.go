@@ -181,22 +181,29 @@ func (sw *SourceWatcher) run() {
 // AddSource adds a new source to watch
 func (sw *SourceWatcher) AddSource(source DataSource) error {
 	sw.mu.Lock()
-	defer sw.mu.Unlock()
 
 	// Check if already watching
 	for _, s := range sw.sources {
 		if s.Path == source.Path {
+			sw.mu.Unlock()
 			return nil
 		}
 	}
 
 	if err := sw.watcher.Add(source.Path); err != nil {
+		sw.mu.Unlock()
 		return fmt.Errorf("failed to watch %s: %w", source.Path, err)
 	}
 
 	sw.sources = append(sw.sources, source)
-	if sw.verbose {
-		sw.logger(fmt.Sprintf("Added watch: %s", source.Path))
+	verbose := sw.verbose
+	logger := sw.logger
+	sw.mu.Unlock()
+
+	// SAFETY: logger is caller-controlled and may re-enter Sources, AddSource,
+	// or RemoveSource. Invoke it only after releasing the non-reentrant mutex.
+	if verbose {
+		logger(fmt.Sprintf("Added watch: %s", source.Path))
 	}
 
 	return nil
@@ -205,9 +212,9 @@ func (sw *SourceWatcher) AddSource(source DataSource) error {
 // RemoveSource stops watching a source
 func (sw *SourceWatcher) RemoveSource(path string) error {
 	sw.mu.Lock()
-	defer sw.mu.Unlock()
 
 	if err := sw.watcher.Remove(path); err != nil {
+		sw.mu.Unlock()
 		return fmt.Errorf("failed to remove watch %s: %w", path, err)
 	}
 
@@ -220,8 +227,13 @@ func (sw *SourceWatcher) RemoveSource(path string) error {
 	}
 
 	delete(sw.lastChange, path)
-	if sw.verbose {
-		sw.logger(fmt.Sprintf("Removed watch: %s", path))
+	verbose := sw.verbose
+	logger := sw.logger
+	sw.mu.Unlock()
+
+	// SAFETY: see AddSource. No external callback may run while sw.mu is held.
+	if verbose {
+		logger(fmt.Sprintf("Removed watch: %s", path))
 	}
 
 	return nil
@@ -315,10 +327,14 @@ func (m *AutoRefreshManager) handleChange(changed DataSource) {
 		}
 	}
 
-	// Re-select best source
-	newSelected, err := SelectBestSourceWithOptions(m.sources, m.opts)
+	// Re-select best source. SelectionOptions.Logger is caller-controlled and
+	// may re-enter CurrentSource, so buffer its messages while m.mu is held and
+	// deliver them only after releasing the non-reentrant lock.
+	selectionOpts, flushSelectionLogs := bufferSelectionLogging(m.opts)
+	newSelected, err := SelectBestSourceWithOptions(m.sources, selectionOpts)
 	if err != nil {
 		m.mu.Unlock()
+		flushSelectionLogs()
 		return
 	}
 
@@ -326,6 +342,7 @@ func (m *AutoRefreshManager) handleChange(changed DataSource) {
 	if m.currentSource != nil && m.currentSource.Path == newSelected.Path &&
 		m.currentSource.ModTime.Equal(newSelected.ModTime) {
 		m.mu.Unlock()
+		flushSelectionLogs()
 		return
 	}
 
@@ -343,6 +360,7 @@ func (m *AutoRefreshManager) handleChange(changed DataSource) {
 	}
 	m.mu.Unlock()
 
+	flushSelectionLogs()
 	if callback != nil {
 		callback(newSelected, reason)
 	}
@@ -358,23 +376,46 @@ func (m *AutoRefreshManager) ForceRefresh() error {
 		ValidateSource(&m.sources[i])
 	}
 
-	// Re-select
-	newSelected, err := SelectBestSourceWithOptions(m.sources, m.opts)
+	// Re-select without invoking caller-controlled logging under m.mu. See
+	// handleChange for the re-entrancy hazard.
+	selectionOpts, flushSelectionLogs := bufferSelectionLogging(m.opts)
+	newSelected, err := SelectBestSourceWithOptions(m.sources, selectionOpts)
 	if err != nil {
 		m.mu.Unlock()
+		flushSelectionLogs()
 		return err
 	}
 
-	var callback func(newSource DataSource, reason string)
-	if m.currentSource == nil || m.currentSource.Path != newSelected.Path {
-		m.currentSource = &newSelected
-		callback = m.onSourceChange
-	}
+	// A forced refresh is also a forced publication. The selected path may be
+	// unchanged while its contents, validation result, modtime, or size changed;
+	// suppressing the callback in that case leaves the UI on the old snapshot
+	// and also leaves currentSource carrying stale metadata.
+	m.currentSource = &newSelected
+	callback := m.onSourceChange
 	m.mu.Unlock()
 
+	flushSelectionLogs()
 	if callback != nil {
 		callback(newSelected, "force refresh")
 	}
 
 	return nil
+}
+
+func bufferSelectionLogging(opts SelectionOptions) (SelectionOptions, func()) {
+	logger := opts.Logger
+	var logs []string
+	if opts.Verbose && logger != nil {
+		opts.Logger = func(message string) {
+			logs = append(logs, message)
+		}
+	}
+	return opts, func() {
+		if logger == nil {
+			return
+		}
+		for _, message := range logs {
+			logger(message)
+		}
+	}
 }

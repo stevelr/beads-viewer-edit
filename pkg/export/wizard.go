@@ -5,6 +5,7 @@
 package export
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/charmbracelet/huh"
 	"golang.org/x/term"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
 
 // WizardConfig holds configuration for the deployment wizard.
@@ -67,6 +70,7 @@ type Wizard struct {
 	beadsPath  string
 	bundlePath string
 	isUpdate   bool // true when updating an existing deployment
+	input      io.Reader
 }
 
 // NewWizard creates a new deployment wizard.
@@ -94,20 +98,96 @@ func newForm(groups ...*huh.Group) *huh.Form {
 	return form
 }
 
-// newReadCloserFromReader wraps an io.Reader as an *os.File-compatible ReadCloser.
-// Note: This creates a temporary wrapper - the returned value is not actually an *os.File,
-// but can be used with huh's accessible mode which only needs io.Reader.
-func newReadCloserFromReader(r io.Reader) *os.File {
-	// Create a pipe and copy data into it
-	pr, pw, err := os.Pipe()
-	if err != nil {
-		return os.Stdin // Fallback to original stdin
+func (w *Wizard) newForm(groups ...*huh.Group) *huh.Form {
+	form := newForm(groups...)
+	if w != nil && w.input != nil {
+		form = form.WithInput(w.input)
 	}
+	return form
+}
+
+// wizardInputReader prevents huh's per-field scanners from reading ahead into
+// later answers and discarding them when a field completes.
+type wizardInputReader struct {
+	data   []byte
+	offset int
+}
+
+func (r *wizardInputReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r == nil || r.offset >= len(r.data) {
+		return 0, io.EOF
+	}
+
+	remaining := r.data[r.offset:]
+	n := len(remaining)
+	if newline := bytes.IndexByte(remaining, '\n'); newline >= 0 {
+		n = newline + 1
+	}
+	if n > len(p) {
+		n = len(p)
+	}
+	copy(p, remaining[:n])
+	r.offset += n
+	return n, nil
+}
+
+// readWizardInput reads a non-terminal stdin without leaving an uncancellable
+// goroutine behind when the writer keeps the pipe open without sending data.
+func readWizardInput(input *os.File, timeout time.Duration) ([]byte, error) {
+	if input == nil {
+		return nil, fmt.Errorf("stdin is nil")
+	}
+	if timeout <= 0 {
+		return nil, fmt.Errorf("stdin read timeout must be positive")
+	}
+	if err := input.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		if errors.Is(err, os.ErrNoDeadline) {
+			// Some platforms cannot set deadlines on exec-inherited pipes
+			// (macOS returns ErrNoDeadline for os.Stdin in that case). Fall
+			// back to a goroutine read bounded by the same timeout.
+			return readWizardInputBlocking(input, timeout)
+		}
+		return nil, fmt.Errorf("set stdin read deadline: %w", err)
+	}
+
+	data, readErr := io.ReadAll(input)
+	clearErr := input.SetReadDeadline(time.Time{})
+	if readErr != nil {
+		return nil, readErr
+	}
+	if clearErr != nil {
+		return nil, fmt.Errorf("clear stdin read deadline: %w", clearErr)
+	}
+	return data, nil
+}
+
+// readWizardInputBlocking is the fallback for file types that do not support
+// read deadlines. It reads on a goroutine bounded by the caller's timeout; on
+// timeout the goroutine may linger blocked on stdin, which only happens when a
+// writer keeps the pipe open without producing input (the case the timeout
+// exists to report).
+func readWizardInputBlocking(input *os.File, timeout time.Duration) ([]byte, error) {
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	results := make(chan readResult, 1)
 	go func() {
-		io.Copy(pw, r)
-		pw.Close()
+		data, err := io.ReadAll(input)
+		results <- readResult{data: data, err: err}
 	}()
-	return pr
+	select {
+	case res := <-results:
+		if res.err != nil {
+			return nil, res.err
+		}
+		return res.data, nil
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("wizard stdin probe timed out: %w", os.ErrDeadlineExceeded)
+	}
 }
 
 // offerSavedConfig asks if the user wants to use previously saved settings
@@ -135,7 +215,7 @@ func (w *Wizard) offerSavedConfig(saved *WizardConfig) (bool, error) {
 	fmt.Println("")
 
 	var useSaved bool = true
-	form := newForm(
+	form := w.newForm(
 		huh.NewGroup(
 			huh.NewConfirm().
 				Title("Update existing deployment with these settings?").
@@ -168,47 +248,33 @@ func (w *Wizard) Run() (*WizardResult, error) {
 			if mode.IsRegular() && stat.Size() == 0 {
 				return nil, fmt.Errorf("wizard requires interactive input; stdin is empty")
 			}
-			// For pipes (e.g., strings.NewReader), check for immediate EOF.
-			// This prevents hanging forever when stdin is a pipe that returns EOF immediately.
-			// We use a goroutine with timeout to detect this case without blocking the main thread.
+			// For pipes, check for EOF without waiting forever for a writer that
+			// keeps the pipe open but has not produced any input.
 			isPipe := (mode & os.ModeCharDevice) == 0
 			if isPipe && !mode.IsRegular() {
-				// Read all available stdin into a buffer to check for EOF
-				// This is necessary because we can't "peek" at stdin in Go
-				inputCh := make(chan []byte, 1)
-				errCh := make(chan error, 1)
-				go func() {
-					data, err := io.ReadAll(os.Stdin)
-					if err != nil {
-						errCh <- err
-						return
+				// A read deadline makes the EOF probe synchronous and cancellable. The
+				// previous goroutine-based probe survived its timeout and kept consuming
+				// stdin after Run returned.
+				data, err := readWizardInput(os.Stdin, 100*time.Millisecond)
+				if err != nil {
+					if errors.Is(err, os.ErrDeadlineExceeded) {
+						return nil, fmt.Errorf("wizard requires interactive input; stdin did not provide data within timeout")
 					}
-					inputCh <- data
-				}()
-
-				select {
-				case data := <-inputCh:
-					if len(data) == 0 {
-						return nil, fmt.Errorf("wizard requires interactive input; stdin is closed")
-					}
-					// Replace stdin with a reader containing the data we read
-					// This ensures the data isn't lost
-					os.Stdin = newReadCloserFromReader(strings.NewReader(string(data)))
-				case err := <-errCh:
 					return nil, fmt.Errorf("wizard requires interactive input; stdin error: %w", err)
-				case <-time.After(100 * time.Millisecond):
-					// Timeout without receiving data or EOF.
-					// The goroutine is still running and will consume any stdin that arrives,
-					// which would race with wizard form input. Error out to be safe.
-					return nil, fmt.Errorf("wizard requires interactive input; stdin did not provide data within timeout")
 				}
+				if len(data) == 0 {
+					return nil, fmt.Errorf("wizard requires interactive input; stdin is closed")
+				}
+				// Every wizard form shares this finite reader. Keeping it on the Wizard
+				// avoids a pipe-copy goroutine and avoids mutating process-global stdin.
+				w.input = &wizardInputReader{data: data}
 			}
 		}
 	}
 
 	// Check for saved configuration first (unless BV_NO_SAVED_CONFIG is set)
 	savedConfig, err := LoadWizardConfig()
-	skipSaved := os.Getenv("BV_NO_SAVED_CONFIG") != ""
+	skipSaved := env.NoSavedConfig.Get() != ""
 	if !skipSaved && err == nil && savedConfig != nil && savedConfig.DeployTarget != "" {
 		// Found saved config - ask if user wants to use it
 		useSaved, err := w.offerSavedConfig(savedConfig)
@@ -290,7 +356,7 @@ func (w *Wizard) collectExportOptions() error {
 	defaultTitle := "Project Issues"
 	title := defaultTitle
 
-	form := newForm(
+	form := w.newForm(
 		huh.NewGroup(
 			huh.NewConfirm().
 				Title("Include closed issues?").
@@ -329,7 +395,7 @@ func (w *Wizard) collectDeployTarget() error {
 	fmt.Println("Step 2: Deployment Target")
 	fmt.Println("────────────────────────────")
 
-	form := newForm(
+	form := w.newForm(
 		huh.NewGroup(
 			huh.NewSelect[string]().
 				Title("Where do you want to deploy?").
@@ -376,7 +442,7 @@ func (w *Wizard) collectGitHubConfig() error {
 	repoName := suggestedName
 	description := "Issue tracker dashboard"
 
-	form := newForm(
+	form := w.newForm(
 		huh.NewGroup(
 			huh.NewInput().
 				Title("Repository name").
@@ -425,7 +491,7 @@ func (w *Wizard) collectCloudflareConfig() error {
 	projectName := suggestedName
 	branch := "main"
 
-	form := newForm(
+	form := w.newForm(
 		huh.NewGroup(
 			huh.NewInput().
 				Title("Cloudflare Pages project name").
@@ -465,7 +531,7 @@ func (w *Wizard) collectLocalConfig() error {
 	defaultPath := "./bv-pages"
 	outputPath := defaultPath
 
-	form := newForm(
+	form := w.newForm(
 		huh.NewGroup(
 			huh.NewInput().
 				Title("Output directory").
@@ -513,7 +579,7 @@ func (w *Wizard) checkPrerequisites() error {
 			fmt.Println("")
 
 			var doAuth bool
-			form := newForm(
+			form := w.newForm(
 				huh.NewGroup(
 					huh.NewConfirm().
 						Title("Would you like to authenticate now?").
@@ -569,7 +635,7 @@ func (w *Wizard) checkPrerequisites() error {
 			ShowWranglerInstallInstructions()
 
 			var doInstall bool
-			form := newForm(
+			form := w.newForm(
 				huh.NewGroup(
 					huh.NewConfirm().
 						Title("Would you like to install wrangler now?").
@@ -604,7 +670,7 @@ func (w *Wizard) checkPrerequisites() error {
 			fmt.Println("")
 
 			var doAuth bool
-			form := newForm(
+			form := w.newForm(
 				huh.NewGroup(
 					huh.NewConfirm().
 						Title("Would you like to authenticate now?").
@@ -659,7 +725,7 @@ func (w *Wizard) OfferPreview() (string, error) {
 	fmt.Println("────────────────────────────")
 
 	var doPreview bool = true
-	form := newForm(
+	form := w.newForm(
 		huh.NewGroup(
 			huh.NewConfirm().
 				Title("Preview the site before deploying?").
@@ -710,7 +776,7 @@ func (w *Wizard) OfferPreview() (string, error) {
 
 	// Wait for user to press enter with a simple huh form
 	var cont bool = true // Default to continue after preview
-	waitForm := newForm(
+	waitForm := w.newForm(
 		huh.NewGroup(
 			huh.NewConfirm().
 				Title("Done previewing?").
@@ -775,7 +841,7 @@ func (w *Wizard) PerformDeployWithIssueCount(expectedIssueCount int) (*WizardRes
 			fmt.Println("Would you like to try Cloudflare Pages instead?")
 
 			var tryCloudflare bool
-			form := newForm(
+			form := w.newForm(
 				huh.NewGroup(
 					huh.NewConfirm().
 						Title("Try Cloudflare Pages as fallback?").

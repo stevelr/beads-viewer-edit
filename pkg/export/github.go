@@ -15,6 +15,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
 
 const skipDeploymentIssueCountVerification = -1
@@ -645,21 +647,39 @@ func DeleteRepository(repoFullName string, confirm bool) error {
 // OpenInBrowser opens a URL in the default browser.
 // Set BV_NO_BROWSER=1 to suppress browser opening (useful for tests).
 func OpenInBrowser(url string) error {
-	// Skip browser opening in test mode or when explicitly disabled
-	if os.Getenv("BV_NO_BROWSER") != "" || os.Getenv("BV_TEST_MODE") != "" {
-		return nil
+	cmd, err := prepareBrowserOpen(url)
+	if err != nil || cmd == nil {
+		return err
 	}
+	return cmd.Start()
+}
 
-	return startBrowserURL(url)
+// prepareBrowserOpen resolves everything a browser launch depends on — the
+// BV_NO_BROWSER/BV_TEST_MODE gate, the platform command, its PATH lookup, and
+// the environment — at the moment it is called, and returns a ready command
+// (nil when opening is disabled). Callers that launch later from a goroutine
+// must prepare here first: deferring the lookup let a delayed opener run under
+// a different caller's environment (in the test suite, a previous test's
+// preview server opened a browser inside the next test's stubbed PATH).
+func prepareBrowserOpen(url string) (*exec.Cmd, error) {
+	if env.NoBrowser.Get() != "" || env.TestMode.Get() != "" {
+		return nil, nil
+	}
+	name, args, err := browserOpenCommandForGOOS(runtime.GOOS, url)
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(name, args...) // resolves PATH now
+	cmd.Env = os.Environ()             // snapshot the environment now
+	return cmd, nil
 }
 
 func startBrowserURL(url string) error {
-	name, args, err := browserOpenCommandForGOOS(runtime.GOOS, url)
-	if err != nil {
+	cmd, err := prepareBrowserOpen(url)
+	if err != nil || cmd == nil {
 		return err
 	}
-
-	return exec.Command(name, args...).Start()
+	return cmd.Start()
 }
 
 func browserOpenCommandForGOOS(goos, url string) (string, []string, error) {
@@ -749,16 +769,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
           path: '.'
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
 `
 
 // WriteGitHubActionsWorkflow creates the .github/workflows/static.yml file in the bundle.

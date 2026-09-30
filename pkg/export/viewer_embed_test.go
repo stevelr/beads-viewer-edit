@@ -1,11 +1,152 @@
 package export
 
 import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+func TestCopyEmbeddedAssets_BindsCompleteOfflineBundle(t *testing.T) {
+	out := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(out, "chunks"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"beads.sqlite3.config.json": `{"chunked":true,"chunk_count":1}`,
+		"chunks/00000.bin":          "database chunk",
+	} {
+		if err := os.WriteFile(filepath.Join(out, name), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := CopyEmbeddedAssets(out, "Offline test"); err != nil {
+		t.Fatal(err)
+	}
+	worker, err := os.ReadFile(filepath.Join(out, "coi-serviceworker.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	match := regexp.MustCompile(`const OFFLINE_ASSETS = (\[.*\]);`).FindSubmatch(worker)
+	if len(match) != 2 {
+		t.Fatal("exported worker has no offline file manifest")
+	}
+	var assets []struct {
+		Path string `json:"path"`
+		Hash string `json:"sha256"`
+	}
+	if err := json.Unmarshal(match[1], &assets); err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]bool)
+	for _, asset := range assets {
+		if seen[asset.Path] {
+			t.Fatalf("duplicate cache key %s", asset.Path)
+		}
+		seen[asset.Path] = true
+		data, err := os.ReadFile(filepath.Join(out, filepath.FromSlash(asset.Path)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash := sha256.Sum256(data)
+		if asset.Hash != fmt.Sprintf("%x", hash) {
+			t.Errorf("%s hash does not bind exported bytes", asset.Path)
+		}
+	}
+	for _, required := range []string{"index.html", "viewer.js", "vendor/sql-wasm.wasm", "vendor/bv_graph_bg.wasm", "beads.sqlite3.config.json", "chunks/00000.bin"} {
+		if !seen[required] {
+			t.Errorf("required offline asset missing: %s", required)
+		}
+	}
+	if seen["coi-serviceworker.js"] || seen["graph-demo.html"] {
+		t.Fatal("self-referential/development asset in offline manifest")
+	}
+	if strings.Contains(string(worker), "CACHE_REVISION = 'development'") {
+		t.Fatal("offline cache has no bundle revision")
+	}
+}
+
+// TestEmbeddedIndex_CSPHasNoInlineScripts guards the dashboard's script
+// policy: script-src carries no 'unsafe-inline', no <script> block is inline,
+// no element has an on*= handler, and every same-origin script or stylesheet
+// the page references is present in the embedded assets (so moving code out
+// of index.html cannot leave a dangling src).
+func TestEmbeddedIndex_CSPHasNoInlineScripts(t *testing.T) {
+	content, err := ViewerAssetsFS.ReadFile("viewer_assets/index.html")
+	if err != nil {
+		t.Fatalf("read embedded index.html: %v", err)
+	}
+	html := string(content)
+
+	m := regexp.MustCompile(`(?is)http-equiv="Content-Security-Policy"\s+content="([^"]*)"`).FindStringSubmatch(html)
+	if m == nil {
+		t.Fatal("index.html has no Content-Security-Policy meta tag")
+	}
+	var scriptSrc string
+	for _, directive := range strings.Split(m[1], ";") {
+		fields := strings.Fields(directive)
+		if len(fields) > 0 && fields[0] == "script-src" {
+			scriptSrc = strings.Join(fields[1:], " ")
+		}
+	}
+	if scriptSrc == "" {
+		t.Fatalf("CSP has no script-src directive: %q", m[1])
+	}
+	if strings.Contains(scriptSrc, "'unsafe-inline'") {
+		t.Errorf("script-src must not allow 'unsafe-inline': %q", scriptSrc)
+	}
+	if !strings.Contains(scriptSrc, "'wasm-unsafe-eval'") {
+		t.Errorf("script-src must allow 'wasm-unsafe-eval' (sql.js, bv_graph_bg.wasm): %q", scriptSrc)
+	}
+
+	scriptTags := regexp.MustCompile(`(?is)<script\b[^>]*>`).FindAllString(html, -1)
+	if len(scriptTags) == 0 {
+		t.Fatal("index.html has no script tags at all")
+	}
+	srcAttr := regexp.MustCompile(`(?i)\bsrc\s*=\s*["']([^"']+)["']`)
+	for _, tag := range scriptTags {
+		sm := srcAttr.FindStringSubmatch(tag)
+		if sm == nil {
+			t.Errorf("inline script block is forbidden by the CSP: %s", tag)
+			continue
+		}
+		assertEmbeddedAssetExists(t, sm[1])
+	}
+	if bad := regexp.MustCompile(`(?i)<[a-z][^>]*\son[a-z]+\s*=`).FindString(html); bad != "" {
+		t.Errorf("inline event handler attribute is forbidden by the CSP: %s", bad)
+	}
+
+	hrefAttr := regexp.MustCompile(`(?i)\bhref\s*=\s*["']([^"']+)["']`)
+	for _, tag := range regexp.MustCompile(`(?is)<link\b[^>]*rel=["']stylesheet["'][^>]*>`).FindAllString(html, -1) {
+		if hm := hrefAttr.FindStringSubmatch(tag); hm != nil {
+			assertEmbeddedAssetExists(t, hm[1])
+		}
+	}
+
+	// The bootstrap that used to be inline must be the file the page loads.
+	if !strings.Contains(html, `<script src="head_init.js"></script>`) {
+		t.Error("index.html must load head_init.js (theme default, tailwind.config, COI bootstrap)")
+	}
+}
+
+func assertEmbeddedAssetExists(t *testing.T, ref string) {
+	t.Helper()
+	if strings.Contains(ref, "://") || strings.HasPrefix(ref, "//") {
+		t.Errorf("index.html references a remote asset %q; the bundle must be self-contained", ref)
+		return
+	}
+	name := ref
+	if i := strings.IndexAny(name, "?#"); i >= 0 {
+		name = name[:i]
+	}
+	if _, err := ViewerAssetsFS.ReadFile("viewer_assets/" + name); err != nil {
+		t.Errorf("index.html references %q but it is not an embedded asset: %v", ref, err)
+	}
+}
 
 func TestReplaceTitle_Basic(t *testing.T) {
 	html := `<html><head><title>Beads Viewer</title></head><body><h1 class="text-xl font-semibold">Beads Viewer</h1></body></html>`
@@ -16,6 +157,28 @@ func TestReplaceTitle_Basic(t *testing.T) {
 	}
 	if !strings.Contains(result, `<h1 class="text-xl font-semibold">My Project</h1>`) {
 		t.Errorf("Expected h1 replacement, got: %s", result)
+	}
+}
+
+func TestCopyEmbeddedAssets_ExcludesDevOnlyAssets(t *testing.T) {
+	outDir := t.TempDir()
+	if err := CopyEmbeddedAssets(outDir, ""); err != nil {
+		t.Fatalf("CopyEmbeddedAssets failed: %v", err)
+	}
+
+	// graph-demo.html loads remote CDN scripts (unpkg/d3js.org) that would run
+	// on the exported dashboard's origin; it must never ship in a bundle.
+	for _, excluded := range []string{"graph-demo.html", "hybrid_scorer.test.js"} {
+		if _, err := os.Stat(filepath.Join(outDir, excluded)); !os.IsNotExist(err) {
+			t.Errorf("dev-only asset %s must not be exported", excluded)
+		}
+	}
+
+	// Production assets must still be present.
+	for _, required := range []string{"index.html", "viewer.js", "graph.js", "hybrid_scorer.js"} {
+		if _, err := os.Stat(filepath.Join(outDir, required)); err != nil {
+			t.Errorf("expected production asset %s in bundle: %v", required, err)
+		}
 	}
 }
 

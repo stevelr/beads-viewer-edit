@@ -100,12 +100,15 @@ type CacheStats struct {
 }
 
 // Global cache metrics for various caches.
+// Every counter here has a producer: GraphCache is fed by the analysis
+// in-memory and disk caches (pkg/analysis), CorrelationCache by the
+// correlation report/artifact caches (pkg/correlation), SearchCache by the
+// on-disk vector index (pkg/search), TriageCache by the TUI snapshot cache.
 var (
-	GraphCache   = newCacheMetric("graph_cache")
-	TriageCache  = newCacheMetric("triage_cache")
-	SearchCache  = newCacheMetric("search_cache")
-	MetricsCache = newCacheMetric("metrics_cache")
-	StyleCache   = newCacheMetric("style_cache")
+	GraphCache       = newCacheMetric("graph_cache")
+	TriageCache      = newCacheMetric("triage_cache")
+	SearchCache      = newCacheMetric("search_cache")
+	CorrelationCache = newCacheMetric("correlation_cache")
 )
 
 // AllCacheMetrics returns all registered cache metrics.
@@ -114,19 +117,19 @@ func AllCacheMetrics() []*CacheMetric {
 		GraphCache,
 		TriageCache,
 		SearchCache,
-		MetricsCache,
-		StyleCache,
+		CorrelationCache,
 	}
 }
 
-// AllCacheStats returns stats for all cache metrics.
+// AllCacheStats returns stats for every registered cache metric, including
+// the ones this process never consulted (hits and misses both 0): a reader
+// of --robot-metrics should see which caches exist and that they were idle,
+// not an empty list that looks like "no caches".
 func AllCacheStats() []CacheStats {
 	metrics := AllCacheMetrics()
 	stats := make([]CacheStats, 0, len(metrics))
 	for _, m := range metrics {
-		if m.Total() > 0 { // Only include caches with activity
-			stats = append(stats, m.Stats())
-		}
+		stats = append(stats, m.Stats())
 	}
 	return stats
 }

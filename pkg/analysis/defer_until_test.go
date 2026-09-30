@@ -130,10 +130,10 @@ func TestGetActionableIssues_ExcludesFutureDeferred(t *testing.T) {
 		t.Fatalf("actionable at deferral instant = %v, want [F N P]", got)
 	}
 
-	// A zero SetNow is ignored (clock unchanged).
+	// Go's zero time is a valid explicit reproducible epoch.
 	analyzer.SetNow(time.Time{})
-	if !analyzer.Now().Equal(future) {
-		t.Fatalf("SetNow(zero) must be a no-op, clock = %v", analyzer.Now())
+	if !analyzer.Now().IsZero() {
+		t.Fatalf("SetNow(zero) clock = %v, want zero", analyzer.Now())
 	}
 
 	// Plan output (what --robot-plan serves) follows the same set.
@@ -148,6 +148,35 @@ func TestGetActionableIssues_ExcludesFutureDeferred(t *testing.T) {
 				t.Fatalf("future-deferred bead leaked into execution plan: %#v", plan)
 			}
 		}
+	}
+}
+
+func TestTriageUnblocksMap_ExcludesFutureDeferredSuccessor(t *testing.T) {
+	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	issues := []model.Issue{
+		{ID: "BLOCKER", Status: model.StatusOpen},
+		{ID: "DEFERRED", Status: model.StatusOpen, DeferUntil: &future, Dependencies: []*model.Dependency{
+			{DependsOnID: "BLOCKER", Type: model.DepBlocks},
+		}},
+	}
+
+	analyzer := NewAnalyzer(issues)
+	analyzer.SetNow(now)
+	if got := NewTriageContext(analyzer).Unblocks("BLOCKER"); len(got) != 0 {
+		t.Fatalf("future-deferred successor leaked into unblocks: %v", got)
+	}
+
+	analyzer.SetNow(future)
+	if got := NewTriageContext(analyzer).Unblocks("BLOCKER"); len(got) != 1 || got[0] != "DEFERRED" {
+		t.Fatalf("elapsed successor should be unblocked, got %v", got)
+	}
+
+	issues[1].Status = model.StatusBlocked
+	parked := NewAnalyzer(issues)
+	parked.SetNow(future)
+	if got := NewTriageContext(parked).Unblocks("BLOCKER"); len(got) != 0 {
+		t.Fatalf("elapsed deferral must not resume explicitly parked status: %v", got)
 	}
 }
 

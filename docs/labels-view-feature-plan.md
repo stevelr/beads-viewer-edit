@@ -1,3 +1,6 @@
+> **Status (2026-09-02): historical plan, partially superseded**
+> Shipped: label dashboard (`[`), attention view (`]`), `--robot-label-health/-flow/-attention` with four equal 0.25 health components. Not built: `bv label-velocity`, `--include-graph-metrics`, `DownstreamImpact`, the velocity history chart, the Insights "Label Intelligence" section, and the 30/25/25/20 weights described here.
+
 # Labels View Feature Plan
 
 ## Overview

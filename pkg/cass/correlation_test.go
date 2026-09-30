@@ -2,6 +2,9 @@ package cass
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -177,19 +180,20 @@ func TestCorrelator_Correlate_IDMention(t *testing.T) {
 		for _, arg := range args {
 			if arg == `"bv-test123"` {
 				return []byte(`{
-					"results": [
+					"hits": [
 						{
 							"source_path": "/home/user/project/sessions/s1.json",
+							"workspace": "/home/user/project",
 							"title": "Working on bv-test123",
 							"score": 0.95,
-							"snippet": "Discussing bv-test123 implementation"
+							"content": "Discussing bv-test123 implementation"
 						}
 					],
-					"meta": {"total": 1}
+					"total_matches": 1
 				}`), nil
 			}
 		}
-		return []byte(`{"results": [], "meta": {"total": 0}}`), nil
+		return []byte(`{"hits": [], "total_matches": 0}`), nil
 	}
 
 	cache := NewCache()
@@ -240,20 +244,21 @@ func TestCorrelator_Correlate_Keywords(t *testing.T) {
 			if i > 0 && args[i-1] == "search" && !contains(arg, `"bv-`) {
 				if contains(arg, "authentication") || contains(arg, "oauth") {
 					return []byte(`{
-						"results": [
+						"hits": [
 							{
 								"source_path": "/home/user/project/sessions/s2.json",
+								"workspace": "/home/user/project",
 								"title": "OAuth implementation session",
 								"score": 0.8,
-								"snippet": "Working on authentication flow with OAuth"
+								"content": "Working on authentication flow with OAuth"
 							}
 						],
-						"meta": {"total": 1}
+						"total_matches": 1
 					}`), nil
 				}
 			}
 		}
-		return []byte(`{"results": [], "meta": {"total": 0}}`), nil
+		return []byte(`{"hits": [], "total_matches": 0}`), nil
 	}
 
 	cache := NewCache()
@@ -305,7 +310,7 @@ func TestCorrelator_Correlate_CacheHit(t *testing.T) {
 	searchCalled := false
 	searcher.runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
 		searchCalled = true
-		return []byte(`{"results": [], "meta": {"total": 0}}`), nil
+		return []byte(`{"hits": [], "total_matches": 0}`), nil
 	}
 
 	cache := NewCache()
@@ -314,8 +319,8 @@ func TestCorrelator_Correlate_CacheHit(t *testing.T) {
 	cache.Set("bv-cached", &CorrelationHint{
 		BeadID:      "bv-cached",
 		ResultCount: 1,
-		Results: []SearchResult{
-			{Title: "Cached result", Score: 0.9},
+		Results: []ScoredResult{
+			{SearchResult: SearchResult{Title: "Cached result", Score: 0.9}},
 		},
 		QueryUsed: string(StrategyIDMention),
 	})
@@ -347,7 +352,7 @@ func TestCorrelator_GetCached(t *testing.T) {
 	cache := NewCache()
 	hint := &CorrelationHint{
 		BeadID:      "bv-cached",
-		Results:     []SearchResult{{Agent: "claude", Snippet: "Test"}},
+		Results:     []ScoredResult{{SearchResult: SearchResult{Agent: "claude", Snippet: "Test"}}},
 		QueryUsed:   "test query",
 		ResultCount: 3,
 	}
@@ -381,6 +386,185 @@ func TestCorrelator_GetCached(t *testing.T) {
 			t.Error("Expected nil for nil cache")
 		}
 	})
+}
+
+func TestCorrelator_CachePreservesScoredResults(t *testing.T) {
+	now := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name       string
+		query      string
+		strategy   CorrelationStrategy
+		baseScore  float64
+		finalScore float64
+	}{
+		{"id", `"bv-roundtrip"`, StrategyIDMention, 100, 240},
+		{"keywords", "oauth authentication", StrategyKeywords, 50, 140},
+		{"timestamp", "*", StrategyTimestamp, 50, 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			detector := NewDetector()
+			detector.lookPath = func(string) (string, error) { return "/usr/bin/cass", nil }
+			detector.runCommand = func(context.Context, string, ...string) (int, error) { return 0, nil }
+			searcher := NewSearcher(detector)
+			calls := 0
+			searcher.runCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+				calls++
+				if args[1] != tc.query {
+					return []byte(`{"hits":[],"total_matches":0}`), nil
+				}
+				return []byte(fmt.Sprintf(`{"hits":[{
+					"source_path":"/archive/session.jsonl","line_number":42,
+					"workspace":"/work/project","agent":"codex",
+					"title":"OAuth authentication","content":"OAuth authentication flow",
+					"score":26.75,"created_at":%d
+				}],"total_matches":7}`, now.Add(-2*time.Hour).UnixMilli())), nil
+			}
+			cache := NewCache()
+			correlator := NewCorrelator(searcher, cache, "/work/project")
+			correlator.now = func() time.Time { return now }
+			issue := &model.Issue{
+				ID: "bv-roundtrip", Title: "OAuth authentication",
+				CreatedAt: now.Add(-time.Hour),
+			}
+
+			cold := correlator.Correlate(context.Background(), issue)
+			if cold.Error != "" {
+				t.Fatalf("successful correlation diagnostic = %q", cold.Error)
+			}
+			if len(cold.TopSessions) != 1 {
+				t.Fatalf("cold sessions = %v, want one scored session", cold.TopSessions)
+			}
+			if cold.Strategy != tc.strategy || cold.TopSessions[0].Strategy != tc.strategy {
+				t.Errorf("cold strategy = %q/%q, want %q", cold.Strategy, cold.TopSessions[0].Strategy, tc.strategy)
+			}
+			if got := cold.TopSessions[0]; got.BaseScore != tc.baseScore || got.FinalScore != tc.finalScore {
+				t.Errorf("cold score = base %v/final %v, want %v/%v", got.BaseScore, got.FinalScore, tc.baseScore, tc.finalScore)
+			}
+			if cold.TotalFound != 7 {
+				t.Errorf("TotalFound = %d, want producer total 7", cold.TotalFound)
+			}
+			callsBeforeCache := calls
+			warm := correlator.Correlate(context.Background(), issue)
+			if calls != callsBeforeCache {
+				t.Errorf("cache hit executed %d extra searches", calls-callsBeforeCache)
+			}
+			if !reflect.DeepEqual(warm, cold) {
+				t.Errorf("cache changed correlation:\ncold = %#v\nwarm = %#v", cold, warm)
+			}
+		})
+	}
+}
+
+func TestCorrelator_FailedSearchIsRetryable(t *testing.T) {
+	now := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name            string
+		failedQuery     string
+		fallbackQuery   string
+		partial         bool
+		wantFirstResult bool
+	}{
+		{name: "id failure", failedQuery: `"bv-retry"`},
+		{name: "keyword failure", failedQuery: "oauth authentication"},
+		{name: "timestamp failure", failedQuery: "*"},
+		{name: "partial id result", failedQuery: `"bv-retry"`, partial: true, wantFirstResult: true},
+		{name: "partial keyword result", failedQuery: "oauth authentication", partial: true, wantFirstResult: true},
+		{name: "partial timestamp result", failedQuery: "*", partial: true, wantFirstResult: true},
+		{name: "failed id with keyword fallback", failedQuery: `"bv-retry"`, fallbackQuery: "oauth authentication", wantFirstResult: true},
+		{name: "failed keyword with timestamp fallback", failedQuery: "oauth authentication", fallbackQuery: "*", wantFirstResult: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			detector := NewDetector()
+			detector.lookPath = func(string) (string, error) { return "/usr/bin/cass", nil }
+			detector.runCommand = func(context.Context, string, ...string) (int, error) { return 0, nil }
+			searcher := NewSearcher(detector)
+			recovered := false
+			calls := 0
+			searcher.runCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+				calls++
+				query := args[1]
+				if !recovered && query == tc.failedQuery && !tc.partial {
+					return nil, errors.New("temporary search failure")
+				}
+				if recovered || query == tc.fallbackQuery || (query == tc.failedQuery && tc.partial) {
+					return []byte(fmt.Sprintf(`{"hits":[{
+						"source_path":"/archive/session.jsonl","workspace":"/work/project",
+						"title":"OAuth authentication","content":"OAuth authentication flow",
+						"score":26.75,"created_at":%d
+					}],"total_matches":1,"budget":{"timed_out":%t}}`, now.UnixMilli(), !recovered && tc.partial)), nil
+				}
+				return []byte(`{"hits":[],"total_matches":0}`), nil
+			}
+			cache := NewCache()
+			correlator := NewCorrelator(searcher, cache, "/work/project")
+			correlator.now = func() time.Time { return now }
+			issue := &model.Issue{ID: "bv-retry", Title: "OAuth authentication", CreatedAt: now}
+
+			first := correlator.Correlate(context.Background(), issue)
+			if first.Error == "" {
+				t.Error("failed or partial search lost its diagnostic")
+			}
+			if got := len(first.TopSessions) > 0; got != tc.wantFirstResult {
+				t.Errorf("first result presence = %v, want %v", got, tc.wantFirstResult)
+			}
+			if cache.Get(issue.ID) != nil {
+				t.Error("failed or partial correlation was cached")
+			}
+			firstCalls := calls
+			recovered = true
+			second := correlator.Correlate(context.Background(), issue)
+			if second.Error != "" {
+				t.Errorf("successful retry diagnostic = %q", second.Error)
+			}
+			if calls <= firstCalls {
+				t.Error("retry did not execute a new search")
+			}
+			if len(second.TopSessions) != 1 || second.Strategy != StrategyIDMention {
+				t.Errorf("retry did not recover ID result: %#v", second)
+			}
+			if cache.Get(issue.ID) == nil {
+				t.Error("successful retry was not cached")
+			}
+		})
+	}
+}
+
+func TestCorrelator_EmptySuccessIsCached(t *testing.T) {
+	detector := NewDetector()
+	detector.lookPath = func(string) (string, error) { return "/usr/bin/cass", nil }
+	detector.runCommand = func(context.Context, string, ...string) (int, error) { return 0, nil }
+	searcher := NewSearcher(detector)
+	calls := 0
+	searcher.runCommand = func(context.Context, string, ...string) ([]byte, error) {
+		calls++
+		return []byte(`{"hits":[],"total_matches":0}`), nil
+	}
+	cache := NewCache()
+	correlator := NewCorrelator(searcher, cache, "")
+	now := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	correlator.now = func() time.Time { return now }
+	issue := &model.Issue{ID: "bv-empty", Title: "OAuth authentication", CreatedAt: now}
+
+	cold := correlator.Correlate(context.Background(), issue)
+	if cold.Error != "" {
+		t.Fatalf("successful empty correlation diagnostic = %q", cold.Error)
+	}
+	if len(cold.TopSessions) != 0 || cold.TotalFound != 0 {
+		t.Fatalf("expected empty successful correlation, got %#v", cold)
+	}
+	if calls != 3 {
+		t.Errorf("search count = %d, want all three strategies", calls)
+	}
+	if cache.Get(issue.ID) == nil {
+		t.Error("successful empty correlation was not cached")
+	}
+	warm := correlator.Correlate(context.Background(), issue)
+	if calls != 3 {
+		t.Errorf("cached empty result executed another search: %d calls", calls)
+	}
+	if !reflect.DeepEqual(warm, cold) {
+		t.Errorf("cache changed empty correlation:\ncold = %#v\nwarm = %#v", cold, warm)
+	}
 }
 
 func TestCorrelator_Scoring(t *testing.T) {
@@ -607,7 +791,7 @@ func TestCorrelator_EmptyResults(t *testing.T) {
 
 	// Return empty results for everything
 	searcher.runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-		return []byte(`{"results": [], "meta": {"total": 0}}`), nil
+		return []byte(`{"hits": [], "total_matches": 0}`), nil
 	}
 
 	correlator := NewCorrelator(searcher, nil, "")

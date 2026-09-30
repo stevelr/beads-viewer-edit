@@ -1,6 +1,7 @@
 package main_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -70,6 +71,11 @@ func TestRobotBurndown_CurrentSprint(t *testing.T) {
 		IdealLine []struct {
 			Remaining int `json:"remaining"`
 		} `json:"ideal_line"`
+		AtRisk []struct {
+			ID      string   `json:"id"`
+			Signals []string `json:"signals"`
+			Detail  string   `json:"detail"`
+		} `json:"at_risk"`
 	}
 	if err := json.Unmarshal(out, &payload); err != nil {
 		t.Fatalf("json decode: %v\nout=%s", err, out)
@@ -96,5 +102,69 @@ func TestRobotBurndown_CurrentSprint(t *testing.T) {
 	}
 	if payload.IdealLine[len(payload.IdealLine)-1].Remaining != 0 {
 		t.Fatalf("ideal_line should end at 0 remaining, got %d", payload.IdealLine[len(payload.IdealLine)-1].Remaining)
+	}
+	// C was touched yesterday and is not blocked: nothing is at risk, and the
+	// field must still be present as an empty array rather than omitted.
+	if !bytes.Contains(out, []byte(`"at_risk":[]`)) {
+		t.Fatalf("expected an empty at_risk array in payload:\n%s", out)
+	}
+	if len(payload.AtRisk) != 0 {
+		t.Fatalf("at_risk=%+v; want none", payload.AtRisk)
+	}
+}
+
+func TestRobotBurndown_AtRiskFlagsStalledBlockedBead(t *testing.T) {
+	bv := buildBvBinary(t)
+	env := t.TempDir()
+
+	now := time.Now().UTC()
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -10)
+	end := start.AddDate(0, 0, 20)
+	stale := start.Format(time.RFC3339)
+	fresh := now.Add(-time.Hour).Format(time.RFC3339)
+
+	writeBeads(t, env, fmt.Sprintf(
+		`{"id":"STUCK","title":"Stuck","status":"blocked","priority":2,"issue_type":"task","created_at":"%s","updated_at":"%s"}
+{"id":"FRESH","title":"Fresh","status":"in_progress","priority":2,"issue_type":"task","created_at":"%s","updated_at":"%s"}
+{"id":"OUTSIDE","title":"Stuck but not in sprint","status":"blocked","priority":0,"issue_type":"task","created_at":"%s","updated_at":"%s"}`,
+		stale, stale,
+		stale, fresh,
+		stale, stale,
+	))
+	writeSprints(t, env, fmt.Sprintf(
+		`{"id":"sprint-2","name":"Sprint 2","start_date":"%s","end_date":"%s","bead_ids":["STUCK","FRESH"]}`,
+		start.Format(time.RFC3339),
+		end.Format(time.RFC3339),
+	))
+
+	cmd := exec.Command(bv, "--robot-burndown", "sprint-2")
+	cmd.Dir = env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("--robot-burndown failed: %v\n%s", err, out)
+	}
+
+	var payload struct {
+		AtRisk []struct {
+			ID      string   `json:"id"`
+			Signals []string `json:"signals"`
+			Detail  string   `json:"detail"`
+		} `json:"at_risk"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("json decode: %v\nout=%s", err, out)
+	}
+	if len(payload.AtRisk) != 1 || payload.AtRisk[0].ID != "STUCK" {
+		t.Fatalf("at_risk=%+v; want only STUCK (FRESH is active, OUTSIDE is not in the sprint)", payload.AtRisk)
+	}
+	signals := map[string]bool{}
+	for _, s := range payload.AtRisk[0].Signals {
+		signals[s] = true
+	}
+	if !signals["blocked_too_long"] || !signals["no_activity"] {
+		t.Fatalf("STUCK signals=%v; want blocked_too_long and no_activity", payload.AtRisk[0].Signals)
+	}
+	if payload.AtRisk[0].Detail == "" {
+		t.Fatalf("at_risk detail should explain the flags: %+v", payload.AtRisk[0])
 	}
 }

@@ -2,11 +2,14 @@ package ui_test
 
 import (
 	"fmt"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/ui"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // TestGraphModelEmpty verifies behavior with no issues
@@ -215,6 +218,145 @@ func TestGraphModelScrollBounds(t *testing.T) {
 
 	// View should not panic
 	_ = g.View(80, 24)
+}
+
+// This must fail against the original empty ScrollLeft/ScrollRight methods:
+// changing a footer or scroll counter without moving content is insufficient.
+func TestGraphModelPanningRevealsClippedContent(t *testing.T) {
+	g := ui.NewGraphModel([]model.Issue{{ID: "A", Title: "Viewport marker 界界👩‍💻 é", Status: model.StatusOpen}}, nil, createTheme())
+	body := func(view string) string {
+		lines := strings.Split(ansi.Strip(view), "\n")
+		if len(lines) < 3 {
+			t.Fatalf("missing graph body: %q", view)
+		}
+		return strings.Join(lines[:len(lines)-2], "\n")
+	}
+	initial := g.View(30, 20)
+	g.ScrollRight()
+	right := g.View(30, 20)
+	if body(initial) == body(right) {
+		t.Fatalf("right pan did not move actual graph content:\n%s", right)
+	}
+	if got := g.SelectedIssue(); got == nil || got.ID != "A" {
+		t.Fatalf("panning changed selection: %+v", got)
+	}
+	g.ScrollLeft()
+	if got := g.View(30, 20); got != initial {
+		t.Fatalf("reverse pan did not restore original frame:\n%s\nwant:\n%s", got, initial)
+	}
+	g.ScrollLeft()
+	if got := g.View(30, 20); got != initial {
+		t.Fatal("left pan escaped the origin")
+	}
+	for i := 0; i < 50; i++ {
+		g.ScrollRight()
+	}
+	end := g.View(30, 20)
+	g.ScrollRight()
+	if got := g.View(30, 20); got != end {
+		t.Fatal("right pan escaped the content boundary")
+	}
+	for _, view := range []string{initial, right, end} {
+		if !utf8.ValidString(view) {
+			t.Fatal("panning broke UTF-8")
+		}
+		for _, line := range strings.Split(view, "\n") {
+			if w := ansi.StringWidth(line); w > 30 {
+				t.Errorf("panned line occupies %d cells, want <=30: %q", w, line)
+			}
+		}
+	}
+	// Resizing and removing the old overflow must clamp the old position.
+	wide := g.View(200, 80)
+	g.ScrollLeft()
+	if got := g.View(200, 80); got != wide {
+		t.Fatal("wide resize retained a stale horizontal offset")
+	}
+}
+
+func TestGraphModelViewportDimensions(t *testing.T) {
+	issues := []model.Issue{{ID: "界界👩‍💻", Title: strings.Repeat("Wide界", 20), Status: model.StatusOpen}}
+	for _, size := range [][2]int{{0, 0}, {-1, 4}, {1, 1}, {5, 3}, {30, 10}, {80, 5}, {140, 40}} {
+		t.Run(fmt.Sprintf("%dx%d", size[0], size[1]), func(t *testing.T) {
+			g := ui.NewGraphModel(issues, nil, createTheme())
+			for i := 0; i < 6; i++ {
+				if i == 2 {
+					g.SetIssues(nil, nil)
+				} else if i == 4 {
+					g = ui.NewGraphModel(nil, nil, createTheme())
+				}
+				view := g.View(size[0], size[1])
+				if size[0] <= 0 || size[1] <= 0 {
+					if view != "" {
+						t.Fatalf("non-positive viewport returned %q", view)
+					}
+					continue
+				}
+				lines := strings.Split(view, "\n")
+				if len(lines) > size[1] || !utf8.ValidString(view) {
+					t.Fatalf("invalid viewport height/UTF-8: %q", view)
+				}
+				for _, line := range lines {
+					if ansi.StringWidth(line) > size[0] {
+						t.Errorf("line exceeds %d cells: %q", size[0], line)
+					}
+				}
+				g.ScrollRight()
+			}
+		})
+	}
+}
+
+func TestGraphModelHighlightsActualCriticalChain(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "C", Type: model.DepBlocks}}},
+		{ID: "C", Status: model.StatusOpen},
+		{ID: "D", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+	}
+	stats := analysis.NewAnalyzer(issues).Analyze()
+	insights := stats.GenerateInsights(5)
+	g := ui.NewGraphModel(issues, &insights, createTheme())
+	if !g.SelectByID("B") {
+		t.Fatal("chain midpoint missing")
+	}
+	view := ansi.Strip(g.View(200, 100))
+	for _, marker := range []string{"◆ 🔵 A", "◆ 🔵 C"} {
+		if !strings.Contains(view, marker) {
+			t.Errorf("longest chain marker %q missing:\n%s", marker, view)
+		}
+	}
+	if strings.Contains(view, "◆ 🔵 D") {
+		t.Fatal("equally long alternative branch was marked as part of the chosen chain")
+	}
+}
+
+func TestGraphModelHighlightsVisibleScope(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen},
+		{ID: "B", Status: model.StatusOpen},
+		{ID: "C", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "D", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "C", Type: model.DepBlocks}}},
+	}
+	previous := "A"
+	for i := 0; i < 8; i++ {
+		id := fmt.Sprintf("hidden-%d", i)
+		issues = append(issues, model.Issue{ID: id, Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: previous, Type: model.DepBlocks}}})
+		previous = id
+	}
+	stats := analysis.NewAnalyzer(issues).Analyze()
+	insights := stats.GenerateInsights(20)
+	g := ui.NewGraphModel(issues[:4], &insights, createTheme())
+	g.SelectByID("C")
+	view := ansi.Strip(g.View(200, 100))
+	if !strings.Contains(view, "◆ 🔵 B") || !strings.Contains(view, "◆ 🔵 D") {
+		t.Fatalf("full-project scores displaced the longest displayed chain:\n%s", view)
+	}
+	g.SelectByID("A")
+	view = ansi.Strip(g.View(200, 100))
+	if strings.Contains(view, "◆ 🔵") {
+		t.Fatal("isolated visible node inherited a hidden critical chain")
+	}
 }
 
 // TestGraphModelSetIssuesClearsGraph verifies SetIssues resets the graph

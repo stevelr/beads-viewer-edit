@@ -99,3 +99,53 @@ func TestRobotTriage_CleanLoad_NoLoadStats(t *testing.T) {
 		t.Fatalf("expected no load_stats on a clean load, got %s", string(*payload.LoadStats))
 	}
 }
+
+// TestRobotMetrics_ReportsRealCounters (B5): --robot-metrics reflects the
+// work the process actually did: the issue load it performed is timed, and
+// only counters with real producers are listed.
+func TestRobotMetrics_ReportsRealCounters(t *testing.T) {
+	bv := buildBvBinary(t)
+	env := t.TempDir()
+	writeBeads(t, env, `{"id":"M-1","title":"one","status":"open","priority":1,"issue_type":"task"}
+{"id":"M-2","title":"two","status":"open","priority":2,"issue_type":"task","dependencies":[{"issue_id":"M-2","depends_on_id":"M-1","type":"blocks"}]}`)
+
+	cmd := exec.Command(bv, "--robot-metrics")
+	cmd.Dir = env
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("--robot-metrics failed: %v", err)
+	}
+	var payload struct {
+		Timing []struct {
+			Name  string `json:"name"`
+			Count int64  `json:"count"`
+		} `json:"timing"`
+		Cache []struct {
+			Name string `json:"name"`
+		} `json:"cache"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("decode: %v\n%s", err, out)
+	}
+	timings := map[string]int64{}
+	for _, tm := range payload.Timing {
+		timings[tm.Name] = tm.Count
+	}
+	if timings["loader.parse"] < 1 {
+		t.Fatalf("loader.parse should be recorded by the process's own issue load: %v\n%s", timings, out)
+	}
+	caches := map[string]bool{}
+	for _, c := range payload.Cache {
+		caches[c.Name] = true
+	}
+	for _, want := range []string{"graph_cache", "correlation_cache", "search_cache", "triage_cache"} {
+		if !caches[want] {
+			t.Errorf("cache metric %s missing from --robot-metrics: %v", want, caches)
+		}
+	}
+	for _, gone := range []string{"metrics_cache", "style_cache"} {
+		if caches[gone] {
+			t.Errorf("%s has no producer and must not be reported", gone)
+		}
+	}
+}

@@ -1,13 +1,142 @@
 package main_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"encoding/xml"
+	"fmt"
+	"image/png"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
+
+func TestGraphExport_RecipeScope(t *testing.T) {
+	dir := recipeProject(t)
+	// The resolved prerequisite sits outside both the sprint label and SP repo.
+	// The missing prerequisite must still block SP-3 after either filter.
+	writeIssuesJSONL(t, dir, strings.Join([]string{
+		`{"id":"SP-1","title":"Sprint root","status":"open","priority":1,"issue_type":"task","labels":["sprint"],"dependencies":[{"issue_id":"SP-1","depends_on_id":"DONE-1","type":"blocks"}]}`,
+		`{"id":"SP-2","title":"Sprint follow-up","status":"open","priority":2,"issue_type":"task","labels":["sprint"],"dependencies":[{"issue_id":"SP-2","depends_on_id":"SP-1","type":"blocks"}]}`,
+		`{"id":"SP-3","title":"Missing prerequisite","status":"open","priority":3,"issue_type":"task","labels":["sprint"],"dependencies":[{"issue_id":"SP-3","depends_on_id":"absent","type":"blocks"}]}`,
+		`{"id":"BL-1","title":"Backlog item","status":"open","priority":0,"issue_type":"task","labels":["backlog"]}`,
+		`{"id":"SP-9","title":"Sprint done","status":"closed","priority":1,"issue_type":"task","labels":["sprint"]}`,
+		`{"id":"DONE-1","title":"Resolved prerequisite","status":"closed","priority":1,"issue_type":"task"}`,
+	}, "\n")+"\n")
+	writeRecipeFile(t, dir, "limited.yaml", "filters:\n  status: [open]\n  tags: [sprint]\nsort:\n  field: priority\n  direction: desc\nview:\n  max_items: 1\n")
+	writeRecipeFile(t, dir, "empty.yaml", "filters:\n  tags: [absent]\n")
+	allIDs := []string{"BL-1", "DONE-1", "SP-1", "SP-2", "SP-3", "SP-9"}
+	for _, tc := range []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"unfiltered", nil, allIDs},
+		{"actionable", []string{"--recipe", "actionable"}, []string{"BL-1", "SP-1"}},
+		{"label-intersection", []string{"--recipe", "actionable", "--label", "sprint"}, []string{"SP-1"}},
+		{"repo-intersection", []string{"--recipe", "actionable", "--repo", "SP"}, []string{"SP-1"}},
+		{"file-recipe", []string{"--recipe", ".beads/recipes/sprint.yaml"}, []string{"SP-1", "SP-2", "SP-3"}},
+		{"sort-and-limit", []string{"--recipe", "limited"}, []string{"SP-3"}},
+		{"empty-recipe", []string{"--recipe", "empty"}, nil},
+		{"empty-label", []string{"--recipe", "actionable", "--label", "absent"}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, format := range []string{"html", "svg", "png"} {
+				t.Run(format, func(t *testing.T) {
+					path := filepath.Join(dir, tc.name+"."+format)
+					args := append([]string{"--export-graph", path}, tc.args...)
+					stdout, stderr, err := runBVSplit(t, dir, args...)
+					if len(tc.want) == 0 {
+						if err == nil || !strings.Contains(stderr, "No issues to export (check filters)") {
+							t.Fatalf("empty graph must fail clearly: %v\nstdout=%s\nstderr=%s", err, stdout, stderr)
+						}
+						if _, err := os.Stat(path); !os.IsNotExist(err) {
+							t.Fatalf("empty graph created an artifact: %v", err)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("graph export: %v\nstdout=%s\nstderr=%s", err, stdout, stderr)
+					}
+					if !strings.Contains(stdout, fmt.Sprintf("(%d nodes", len(tc.want))) {
+						t.Errorf("wrong exported node count: %s", stdout)
+					}
+					raw, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var got []string
+					switch format {
+					case "html":
+						_, data, found := strings.Cut(string(raw), "const DATA = ")
+						if !found {
+							t.Fatal("missing embedded graph data")
+						}
+						var graph struct {
+							Nodes []struct{ ID string }
+							Links []struct{ Source, Target string }
+						}
+						if err := json.NewDecoder(strings.NewReader(data)).Decode(&graph); err != nil {
+							t.Fatal(err)
+						}
+						for _, node := range graph.Nodes {
+							got = append(got, node.ID)
+						}
+						for _, link := range graph.Links {
+							if !slices.Contains(tc.want, link.Source) || !slices.Contains(tc.want, link.Target) {
+								t.Errorf("link to excluded node: %+v", link)
+							}
+						}
+					case "svg", "png":
+						var pngWidth, pngHeight int
+						if format == "png" {
+							img, err := png.Decode(bytes.NewReader(raw))
+							if err != nil {
+								t.Fatal(err)
+							}
+							pngWidth, pngHeight = img.Bounds().Dx(), img.Bounds().Dy()
+							// Export the matching vector layout here so the PNG
+							// subtest can also run independently of its siblings.
+							svgPath := filepath.Join(dir, tc.name+"-png-layout.svg")
+							svgArgs := append([]string{"--export-graph", svgPath}, tc.args...)
+							stdout, stderr, err := runBVSplit(t, dir, svgArgs...)
+							if err != nil {
+								t.Fatalf("PNG reference layout: %v\nstdout=%s\nstderr=%s", err, stdout, stderr)
+							}
+							raw, err = os.ReadFile(svgPath)
+							if err != nil {
+								t.Fatal(err)
+							}
+						}
+						var svg struct {
+							Width  int      `xml:"width,attr"`
+							Height int      `xml:"height,attr"`
+							Texts  []string `xml:"text"`
+						}
+						if err := xml.Unmarshal(raw, &svg); err != nil {
+							t.Fatal(err)
+						}
+						if format == "png" && (pngWidth != svg.Width || pngHeight != svg.Height) {
+							t.Errorf("PNG %dx%d differs from SVG %dx%d", pngWidth, pngHeight, svg.Width, svg.Height)
+						}
+						for _, label := range svg.Texts {
+							if slices.Contains(allIDs, label) {
+								got = append(got, label)
+							}
+						}
+					}
+					slices.Sort(got)
+					if !slices.Equal(got, tc.want) {
+						t.Fatalf("exported IDs=%v want=%v", got, tc.want)
+					}
+				})
+			}
+		})
+	}
+}
 
 // ============================================================================
 // E2E: Graph Export Format Validation (bv-yc2v)
@@ -601,16 +730,20 @@ func TestGraphExport_DataHash(t *testing.T) {
 	}
 }
 
-// TestGraphExport_DeterministicOutput tests output is deterministic
+// TestGraphExport_DeterministicOutput tests the reproducibility contract:
+// with SOURCE_DATE_EPOCH set, two runs on the same data are byte-identical.
+// The payload's generated_at is second-granular wall-clock time otherwise, so
+// two runs that straddle a second boundary differ by design; comparing them
+// without the epoch pinned is what made this test flake under load.
 func TestGraphExport_DeterministicOutput(t *testing.T) {
 	bv := buildBvBinary(t)
 	repoDir := createGraphTestRepo(t)
 
-	// Run twice and compare
 	var outputs []string
 	for i := 0; i < 2; i++ {
 		cmd := exec.Command(bv, "--robot-graph", "--graph-format=dot")
 		cmd.Dir = repoDir
+		cmd.Env = append(os.Environ(), "SOURCE_DATE_EPOCH=1700000000")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("--robot-graph run %d failed: %v\n%s", i+1, err, out)
@@ -618,8 +751,11 @@ func TestGraphExport_DeterministicOutput(t *testing.T) {
 		outputs = append(outputs, string(out))
 	}
 
+	if !strings.Contains(outputs[0], `"generated_at":"2023-11-14T22:13:20Z"`) {
+		t.Errorf("SOURCE_DATE_EPOCH must pin generated_at; got: %.200s", outputs[0])
+	}
 	if outputs[0] != outputs[1] {
-		t.Error("graph export is not deterministic - outputs differ between runs")
+		t.Error("graph export is not deterministic - outputs differ between runs with SOURCE_DATE_EPOCH pinned")
 	}
 }
 

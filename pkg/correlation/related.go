@@ -67,6 +67,13 @@ func DefaultRelatedWorkOptions() RelatedWorkOptions {
 
 // FindRelatedWork discovers beads related to a target bead
 func (hr *HistoryReport) FindRelatedWork(targetID string, opts RelatedWorkOptions) *RelatedWorkResult {
+	return hr.FindRelatedWorkAt(targetID, opts, time.Now())
+}
+
+// FindRelatedWorkAt discovers related work using a caller-owned reference
+// instant for open activity windows and result metadata. The zero instant is
+// valid and is preserved.
+func (hr *HistoryReport) FindRelatedWorkAt(targetID string, opts RelatedWorkOptions, now time.Time) *RelatedWorkResult {
 	target, exists := hr.Histories[targetID]
 	if !exists {
 		return nil
@@ -79,7 +86,7 @@ func (hr *HistoryReport) FindRelatedWork(targetID string, opts RelatedWorkOption
 		CommitOverlap:     []RelatedWorkBead{},
 		DependencyCluster: []RelatedWorkBead{},
 		Concurrent:        []RelatedWorkBead{},
-		GeneratedAt:       time.Now(),
+		GeneratedAt:       now,
 	}
 
 	// Build file lookup if not provided
@@ -126,7 +133,7 @@ func (hr *HistoryReport) FindRelatedWork(targetID string, opts RelatedWorkOption
 	}
 
 	// 4. Concurrent Detection (same time window)
-	concurrentCandidates := hr.findConcurrent(targetID, target, opts, seen)
+	concurrentCandidates := hr.findConcurrent(targetID, target, opts, seen, now)
 	result.Concurrent = concurrentCandidates
 
 	// Calculate total
@@ -381,17 +388,17 @@ func (hr *HistoryReport) findDependencyCluster(targetID string, opts RelatedWork
 }
 
 // findConcurrent finds beads active in the same time window
-func (hr *HistoryReport) findConcurrent(targetID string, target BeadHistory, opts RelatedWorkOptions, seen map[string]bool) []RelatedWorkBead {
+func (hr *HistoryReport) findConcurrent(targetID string, target BeadHistory, opts RelatedWorkOptions, seen map[string]bool, now time.Time) []RelatedWorkBead {
 	// Determine target's activity window
 	var targetStart, targetEnd time.Time
 
 	if target.Milestones.Created != nil {
 		targetStart = target.Milestones.Created.Timestamp
 	}
-	if target.Milestones.Closed != nil {
+	if isClosedHistoryStatus(target.Status) && target.Milestones.Closed != nil {
 		targetEnd = target.Milestones.Closed.Timestamp
 	} else {
-		targetEnd = time.Now()
+		targetEnd = now
 	}
 
 	// If no start time, use first commit time
@@ -402,6 +409,9 @@ func (hr *HistoryReport) findConcurrent(targetID string, target BeadHistory, opt
 	// If still no times, can't determine concurrency
 	if targetStart.IsZero() {
 		return []RelatedWorkBead{}
+	}
+	if targetEnd.Before(targetStart) {
+		targetEnd = targetStart
 	}
 
 	// Expand window by concurrency window option
@@ -426,10 +436,10 @@ func (hr *HistoryReport) findConcurrent(targetID string, target BeadHistory, opt
 		if history.Milestones.Created != nil {
 			beadStart = history.Milestones.Created.Timestamp
 		}
-		if history.Milestones.Closed != nil {
+		if isClosedHistoryStatus(history.Status) && history.Milestones.Closed != nil {
 			beadEnd = history.Milestones.Closed.Timestamp
 		} else {
-			beadEnd = time.Now()
+			beadEnd = now
 		}
 
 		// Use first commit if no created timestamp
@@ -439,6 +449,9 @@ func (hr *HistoryReport) findConcurrent(targetID string, target BeadHistory, opt
 
 		if beadStart.IsZero() {
 			continue
+		}
+		if beadEnd.Before(beadStart) {
+			beadEnd = beadStart
 		}
 
 		// Check for overlap

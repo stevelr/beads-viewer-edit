@@ -15,6 +15,13 @@ type AnalysisConfig struct {
 	// cache. This is useful for profiling and validation that require fresh work.
 	DisableCache bool `json:"-"`
 
+	// RunToCompletion removes wall-clock races from otherwise deterministic
+	// metric algorithms. ApplyEnvOverrides enables it when SOURCE_DATE_EPOCH is
+	// a valid base-10 int64, which is the CLI's signal for reproducible output.
+	// It is execution state rather than robot output, so the disk-cache codec
+	// persists it separately while ComputeConfigHash still binds it into the key.
+	RunToCompletion bool `json:"-"`
+
 	// Betweenness centrality (expensive: O(V*E))
 	ComputeBetweenness       bool
 	BetweennessTimeout       time.Duration
@@ -33,7 +40,7 @@ type AnalysisConfig struct {
 	HITSTimeout    time.Duration
 	HITSSkipReason string
 
-	// Cycle detection (potentially exponential)
+	// Representative cycles from strongly connected components (not full enumeration)
 	ComputeCycles    bool
 	CyclesTimeout    time.Duration
 	MaxCyclesToStore int
@@ -84,14 +91,17 @@ func DefaultConfig() AnalysisConfig {
 // Larger graphs get more aggressive timeouts and may use approximate algorithms.
 //
 // Size tiers:
-//   - Small (<100 nodes): Full analysis with exact algorithms, generous timeouts
-//   - Medium (100-500 nodes): Exact algorithms with standard timeouts
-//   - Large (500-2000 nodes): Approximate betweenness for sparse graphs, skip for dense
-//   - XL (>2000 nodes): Approximate betweenness, skip cycles and HITS for dense graphs
+//   - Small (<100 nodes): Exact betweenness, generous timeouts
+//   - Medium (100-499 nodes): Exact betweenness with standard timeouts
+//   - Large (500-1999 nodes): Approximate betweenness for sparse graphs, skip for dense
+//   - XL (>=2000 nodes): Approximate betweenness, skip cycles and HITS for dense graphs
 func ConfigForSize(nodeCount, edgeCount int) AnalysisConfig {
 	density := 0.0
 	if nodeCount > 1 {
-		density = float64(edgeCount) / float64(nodeCount*(nodeCount-1))
+		// Convert before multiplying. The graph can never contain enough nodes
+		// to overflow an int in practice, but ConfigForSize is a public helper
+		// and callers may pass synthetic counts (for planning or tests).
+		density = float64(edgeCount) / (float64(nodeCount) * float64(nodeCount-1))
 	}
 
 	var cfg AnalysisConfig
@@ -343,6 +353,9 @@ const (
 	EnvSkipPhase2 = "BV_SKIP_PHASE2"
 	// EnvPhase2TimeoutSeconds overrides per-metric Phase 2 timeouts when set (>0).
 	EnvPhase2TimeoutSeconds = "BV_PHASE2_TIMEOUT_S"
+	// EnvSourceDateEpoch requests reproducible output when it contains a valid
+	// base-10 int64 Unix timestamp, matching the robot CLI clock contract.
+	EnvSourceDateEpoch = "SOURCE_DATE_EPOCH"
 )
 
 // ApplyEnvOverrides applies environment-variable tunables to the analysis config.
@@ -351,7 +364,13 @@ const (
 //   - BV_SKIP_PHASE2=1: skip expensive Phase 2 metrics (PageRank, Betweenness, HITS, Cycles,
 //     Eigenvector, Critical Path). (k-core/articulation/slack remain enabled.)
 //   - BV_PHASE2_TIMEOUT_S=N: override per-metric timeouts to N seconds (must be >0).
+//   - SOURCE_DATE_EPOCH=N: in robot mode, run timeout-raced metrics to completion
+//     when N is a valid base-10 int64, making their result state reproducible.
 func ApplyEnvOverrides(cfg AnalysisConfig) AnalysisConfig {
+	// SOURCE_DATE_EPOCH is a robot-output reproducibility contract. Do not let a
+	// process-wide build timestamp silently remove the TUI/library latency bounds.
+	cfg.RunToCompletion = envBool("BV_ROBOT") && validSourceDateEpoch()
+
 	if envBool(EnvSkipPhase2) {
 		cfg.ComputeBetweenness = false
 		cfg.BetweennessMode = BetweennessSkip
@@ -370,8 +389,7 @@ func ApplyEnvOverrides(cfg AnalysisConfig) AnalysisConfig {
 		cfg.ComputeCriticalPath = false
 	}
 
-	if seconds, ok := envPositiveInt(EnvPhase2TimeoutSeconds); ok {
-		timeout := time.Duration(seconds) * time.Second
+	if timeout, ok := envPositiveSeconds(EnvPhase2TimeoutSeconds); ok {
 		if cfg.ComputeBetweenness {
 			cfg.BetweennessTimeout = timeout
 		}
@@ -389,16 +407,34 @@ func ApplyEnvOverrides(cfg AnalysisConfig) AnalysisConfig {
 	return cfg
 }
 
-func envPositiveInt(name string) (int, bool) {
+func validSourceDateEpoch() bool {
+	v := strings.TrimSpace(os.Getenv(EnvSourceDateEpoch))
+	if v == "" {
+		return false
+	}
+	seconds, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return false
+	}
+	// Keep this activation contract aligned with cmd/bv's pinned robot clock:
+	// RFC3339 and time.Time's JSON encoding require a four-digit year. An
+	// unencodable epoch must not silently remove every analysis timeout while
+	// the rest of the robot output falls back to wall-clock time.
+	year := time.Unix(seconds, 0).UTC().Year()
+	return year >= 0 && year < 10000
+}
+
+func envPositiveSeconds(name string) (time.Duration, bool) {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
 		return 0, false
 	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
+	seconds, err := strconv.ParseInt(v, 10, 64)
+	maxSeconds := int64(time.Duration(1<<63-1) / time.Second)
+	if err != nil || seconds <= 0 || seconds > maxSeconds {
 		return 0, false
 	}
-	return n, true
+	return time.Duration(seconds) * time.Second, true
 }
 
 func envBool(name string) bool {

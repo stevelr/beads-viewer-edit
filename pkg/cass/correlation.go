@@ -84,6 +84,7 @@ type CorrelationResult struct {
 	Strategy      CorrelationStrategy // Primary strategy that produced results
 	Keywords      []string            // Keywords used (for display)
 	ComputeTimeMs int                 // Time spent computing correlation
+	Error         string              // Diagnostic if any search failed or returned partial results
 }
 
 // Correlator intelligently matches cass sessions to beads using multiple strategies.
@@ -152,10 +153,10 @@ func (c *Correlator) Correlate(ctx context.Context, issue *model.Issue) Correlat
 		if hint := c.cache.Get(issue.ID); hint != nil {
 			return CorrelationResult{
 				BeadID:        issue.ID,
-				TopSessions:   convertHintToScoredResults(hint),
+				TopSessions:   hint.Results,
 				TotalFound:    hint.ResultCount,
-				Strategy:      StrategyCombined,
-				Keywords:      extractKeywordsFromHint(hint),
+				Strategy:      CorrelationStrategy(hint.QueryUsed),
+				Keywords:      hint.Keywords,
 				ComputeTimeMs: 0, // Cache hit
 			}
 		}
@@ -164,16 +165,24 @@ func (c *Correlator) Correlate(ctx context.Context, issue *model.Issue) Correlat
 	result := CorrelationResult{
 		BeadID: issue.ID,
 	}
-
-	// Strategy 1: ID mention search (definitive match)
-	idResults := c.searchByID(ctx, issue.ID)
-	if len(idResults) > 0 {
-		result.TopSessions = idResults
-		result.TotalFound = len(idResults)
-		result.Strategy = StrategyIDMention
+	var diagnostics []string
+	finish := func() CorrelationResult {
+		result.Error = strings.Join(diagnostics, "; ")
 		result.ComputeTimeMs = int(c.now().Sub(start).Milliseconds())
 		c.cacheResult(issue.ID, &result)
 		return result
+	}
+
+	// Strategy 1: ID mention search (definitive match)
+	idResults, idMeta := c.searchByID(ctx, issue.ID)
+	result.TotalFound = idMeta.Total
+	if idMeta.Error != "" {
+		diagnostics = append(diagnostics, "ID search: "+idMeta.Error)
+	}
+	if len(idResults) > 0 {
+		result.TopSessions = idResults
+		result.Strategy = StrategyIDMention
+		return finish()
 	}
 
 	// Strategy 2: Keyword extraction and search
@@ -181,34 +190,36 @@ func (c *Correlator) Correlate(ctx context.Context, issue *model.Issue) Correlat
 	result.Keywords = keywords
 
 	if len(keywords) > 0 {
-		keywordResults := c.searchByKeywords(ctx, issue, keywords)
+		keywordResults, keywordMeta := c.searchByKeywords(ctx, issue, keywords)
+		result.TotalFound = keywordMeta.Total
+		if keywordMeta.Error != "" {
+			diagnostics = append(diagnostics, "keyword search: "+keywordMeta.Error)
+		}
 		if len(keywordResults) > 0 {
 			result.TopSessions = keywordResults
-			result.TotalFound = len(keywordResults)
 			result.Strategy = StrategyKeywords
-			result.ComputeTimeMs = int(c.now().Sub(start).Milliseconds())
-			c.cacheResult(issue.ID, &result)
-			return result
+			return finish()
 		}
 	}
 
 	// Strategy 3: Timestamp proximity (for closed beads)
 	if issue.ClosedAt != nil || !issue.CreatedAt.IsZero() {
-		timestampResults := c.searchByTimestamp(ctx, issue)
+		timestampResults, timestampMeta := c.searchByTimestamp(ctx, issue)
+		result.TotalFound = timestampMeta.Total
+		if timestampMeta.Error != "" {
+			diagnostics = append(diagnostics, "timestamp search: "+timestampMeta.Error)
+		}
 		if len(timestampResults) > 0 {
 			result.TopSessions = timestampResults
-			result.TotalFound = len(timestampResults)
 			result.Strategy = StrategyTimestamp
 		}
 	}
 
-	result.ComputeTimeMs = int(c.now().Sub(start).Milliseconds())
-	c.cacheResult(issue.ID, &result)
-	return result
+	return finish()
 }
 
 // searchByID searches for the bead ID literally in sessions.
-func (c *Correlator) searchByID(ctx context.Context, beadID string) []ScoredResult {
+func (c *Correlator) searchByID(ctx context.Context, beadID string) ([]ScoredResult, SearchMeta) {
 	// Quote the ID for exact matching
 	query := `"` + beadID + `"`
 
@@ -219,14 +230,14 @@ func (c *Correlator) searchByID(ctx context.Context, beadID string) []ScoredResu
 	})
 
 	if len(resp.Results) == 0 {
-		return nil
+		return nil, resp.Meta
 	}
 
 	scored := make([]ScoredResult, 0, len(resp.Results))
 	for _, r := range resp.Results {
 		score := float64(ScoreIDMention)
 		score = c.applyTimeDecay(score, r.Timestamp)
-		score = c.applyWorkspaceBoost(score, r.SourcePath)
+		score = c.applyWorkspaceBoost(score, r.Workspace)
 
 		if score >= MinScoreThreshold {
 			scored = append(scored, ScoredResult{
@@ -238,15 +249,15 @@ func (c *Correlator) searchByID(ctx context.Context, beadID string) []ScoredResu
 		}
 	}
 
-	return c.rankAndLimit(scored)
+	return c.rankAndLimit(scored), resp.Meta
 }
 
 // searchByKeywords searches for extracted keywords with time filtering.
-func (c *Correlator) searchByKeywords(ctx context.Context, issue *model.Issue, keywords []string) []ScoredResult {
+func (c *Correlator) searchByKeywords(ctx context.Context, issue *model.Issue, keywords []string) ([]ScoredResult, SearchMeta) {
 	// Build query from keywords
 	query := strings.Join(keywords, " ")
 	if query == "" {
-		return nil
+		return nil, SearchMeta{}
 	}
 
 	// Calculate search window based on bead activity
@@ -260,7 +271,7 @@ func (c *Correlator) searchByKeywords(ctx context.Context, issue *model.Issue, k
 	})
 
 	if len(resp.Results) == 0 {
-		return nil
+		return nil, resp.Meta
 	}
 
 	scored := make([]ScoredResult, 0, len(resp.Results))
@@ -268,7 +279,7 @@ func (c *Correlator) searchByKeywords(ctx context.Context, issue *model.Issue, k
 		// Score based on how well keywords match
 		baseScore := c.scoreKeywordMatch(r, keywords)
 		score := c.applyTimeDecay(baseScore, r.Timestamp)
-		score = c.applyWorkspaceBoost(score, r.SourcePath)
+		score = c.applyWorkspaceBoost(score, r.Workspace)
 
 		if score >= MinScoreThreshold {
 			matchedKeywords := c.findMatchedKeywords(r, keywords)
@@ -282,11 +293,11 @@ func (c *Correlator) searchByKeywords(ctx context.Context, issue *model.Issue, k
 		}
 	}
 
-	return c.rankAndLimit(scored)
+	return c.rankAndLimit(scored), resp.Meta
 }
 
 // searchByTimestamp finds sessions near bead activity dates.
-func (c *Correlator) searchByTimestamp(ctx context.Context, issue *model.Issue) []ScoredResult {
+func (c *Correlator) searchByTimestamp(ctx context.Context, issue *model.Issue) ([]ScoredResult, SearchMeta) {
 	// Use a broader search when we have no keywords
 	days := c.calculateSearchDays(issue)
 	if days == 0 {
@@ -302,13 +313,13 @@ func (c *Correlator) searchByTimestamp(ctx context.Context, issue *model.Issue) 
 	})
 
 	if len(resp.Results) == 0 {
-		return nil
+		return nil, resp.Meta
 	}
 
 	scored := make([]ScoredResult, 0, len(resp.Results))
 	for _, r := range resp.Results {
 		baseScore := c.scoreTimestampProximity(r.Timestamp, issue)
-		score := c.applyWorkspaceBoost(baseScore, r.SourcePath)
+		score := c.applyWorkspaceBoost(baseScore, r.Workspace)
 
 		if score >= MinScoreThreshold {
 			scored = append(scored, ScoredResult{
@@ -320,7 +331,7 @@ func (c *Correlator) searchByTimestamp(ctx context.Context, issue *model.Issue) 
 		}
 	}
 
-	return c.rankAndLimit(scored)
+	return c.rankAndLimit(scored), resp.Meta
 }
 
 // ExtractKeywords extracts meaningful search keywords from text.
@@ -560,59 +571,20 @@ func (c *Correlator) rankAndLimit(results []ScoredResult) []ScoredResult {
 
 // cacheResult stores correlation result in cache.
 func (c *Correlator) cacheResult(beadID string, result *CorrelationResult) {
-	if c.cache == nil {
+	if c.cache == nil || result.Error != "" {
 		return
 	}
 
 	// Convert to CorrelationHint for caching
 	hint := &CorrelationHint{
 		BeadID:      beadID,
+		Results:     result.TopSessions,
+		QueryUsed:   string(result.Strategy),
+		Keywords:    result.Keywords,
 		ResultCount: result.TotalFound,
 	}
 
-	// Convert ScoredResults back to SearchResults
-	if len(result.TopSessions) > 0 {
-		hint.Results = make([]SearchResult, len(result.TopSessions))
-		for i, sr := range result.TopSessions {
-			hint.Results[i] = sr.SearchResult
-		}
-		hint.QueryUsed = string(result.Strategy)
-	}
-
 	c.cache.Set(beadID, hint)
-}
-
-// convertHintToScoredResults converts cached hint back to scored results.
-func convertHintToScoredResults(hint *CorrelationHint) []ScoredResult {
-	if hint == nil || len(hint.Results) == 0 {
-		return nil
-	}
-
-	scored := make([]ScoredResult, len(hint.Results))
-	for i, r := range hint.Results {
-		scored[i] = ScoredResult{
-			SearchResult: r,
-			FinalScore:   r.Score * 100, // Approximate from original score
-			Strategy:     CorrelationStrategy(hint.QueryUsed),
-		}
-	}
-
-	return scored
-}
-
-// extractKeywordsFromHint extracts keywords from hint query.
-func extractKeywordsFromHint(hint *CorrelationHint) []string {
-	if hint == nil || hint.QueryUsed == "" {
-		return nil
-	}
-
-	// If the query used was keywords strategy, extract them
-	if hint.QueryUsed == string(StrategyKeywords) && len(hint.Results) > 0 {
-		// Try to infer keywords from results
-		return nil // Can't reliably extract without original query
-	}
-
-	return nil
 }
 
 // WorkspaceFromBeadsPath extracts the workspace directory from a beads.jsonl path.

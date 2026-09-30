@@ -1,3 +1,6 @@
+> **Status (2026-09-02): historical report, 2026-01-25**
+> Everything it lists as "planned, not implemented" (`--format`, `BV_OUTPUT_FORMAT`, TOON, `--robot-schema`) has since shipped; see README "Complete CLI Reference" for the current surface.
+
 # Agent-Friendliness Report: beads_viewer (bv)
 
 **Bead ID**: bd-c5g (re-underwriting)

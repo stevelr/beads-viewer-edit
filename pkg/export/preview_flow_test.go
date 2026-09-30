@@ -2,6 +2,7 @@ package export
 
 import (
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,6 +15,60 @@ func TestPreviewServer_StartWithGracefulShutdown_ReturnsStartError(t *testing.T)
 	server := NewPreviewServer("/path/does/not/exist", 9010)
 	if err := server.StartWithGracefulShutdown(); err == nil {
 		t.Fatal("Expected StartWithGracefulShutdown to return error for missing bundle path")
+	}
+}
+
+func TestPreviewServer_StartWithGracefulShutdown_ReturnsAfterExternalStop(t *testing.T) {
+	bundleDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bundleDir, "index.html"), []byte("<!doctype html><title>ok</title>"), 0644); err != nil {
+		t.Fatalf("WriteFile index.html: %v", err)
+	}
+
+	port, err := FindAvailablePort(19091, 19110)
+	if err != nil {
+		t.Fatalf("FindAvailablePort: %v", err)
+	}
+	server := NewPreviewServer(bundleDir, port)
+	t.Cleanup(func() { _ = server.Stop() })
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- server.StartWithGracefulShutdown()
+	}()
+
+	client := &http.Client{Timeout: 100 * time.Millisecond}
+	startupDeadline := time.NewTimer(2 * time.Second)
+	defer startupDeadline.Stop()
+	startupPoll := time.NewTicker(10 * time.Millisecond)
+	defer startupPoll.Stop()
+	for {
+		response, requestErr := client.Get(server.URL() + "/__preview__/status")
+		if requestErr == nil {
+			_ = response.Body.Close()
+			break
+		}
+
+		select {
+		case err := <-serverDone:
+			t.Fatalf("preview server exited before startup completed: %v", err)
+		case <-startupDeadline.C:
+			t.Fatal("preview server did not start before timeout")
+		case <-startupPoll.C:
+		}
+	}
+
+	if err := server.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	shutdownDeadline := time.NewTimer(time.Second)
+	defer shutdownDeadline.Stop()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("StartWithGracefulShutdown returned error after Stop: %v", err)
+		}
+	case <-shutdownDeadline.C:
+		t.Fatal("StartWithGracefulShutdown remained blocked after external Stop")
 	}
 }
 

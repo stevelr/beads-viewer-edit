@@ -1,13 +1,13 @@
                      ▲ BLOCKED BY (must complete first) ▲                     
                             ╭────────────────────╮                            
-                            │       🔵 n4        │                            
+                            │      ◆ 🔵 n4       │                            
                             │         n4         │                            
                             ╰────────────────────╯                            
                                       │                                       
                                       │                                       
                                       ▼                                       
                   ╔═══════════════════════════════════════╗                   
-                  ║              🔵 ⚡ 📝 n3              ║                   
+                  ║             ◆ 🔵 ⚡ 📝 n3             ║                   
                   ║                  n3                   ║                   
                   ║                ⬆1  ⬇2                 ║                   
                   ╚═══════════════════════════════════════╝                   
@@ -15,7 +15,7 @@
                                     ├─┼─┤                                     
                                       ▼                                       
                  ╭────────────────────╮╭────────────────────╮                 
-                 │       🔵 n1        ││       🔵 n2        │                 
+                 │      ◆ 🔵 n1       ││       🔵 n2        │                 
                  │         n1         ││         n2         │                 
                  ╰────────────────────╯╰────────────────────╯                 
                          ▼ BLOCKS (waiting on this) ▼                         
@@ -36,6 +36,5 @@
   In-Degree             2 ██████ #1
   Out-Degree            1 ███░░░ #4
 
-█ relative score │ #N rank of 5 issues                                    
-
-j/k: navigate • enter: view details • g: back to list
+n3 • collapsed • column 1/1 • row 1/2                                         
+H/L: pan • J/K: scroll • space: expand • j/k: select • enter: detail • ◆ criti

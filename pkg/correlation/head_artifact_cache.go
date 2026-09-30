@@ -1,12 +1,13 @@
 package correlation
 
 import (
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/debug"
 	json "github.com/goccy/go-json"
 )
 
@@ -16,11 +17,13 @@ import (
 // agent loop:
 //
 //   - The OUTER layer (disk_cache.go) caches the fully assembled HistoryReport,
-//     keyed on HEAD SHA + hashBeads(beads) + options. It is the fast path when
-//     NOTHING changed between invocations.
+//     keyed on repository/primary-history namespace + HEAD SHA +
+//     hashBeads(beads) + options. It is the fast path when NOTHING changed
+//     between invocations.
 //
 //   - This INNER layer caches only the expensive, purely-history-derived
-//     artifact, keyed on HEAD SHA + options + schema version — NOT hashBeads.
+//     artifact, keyed on repository/primary-history namespace + HEAD SHA +
+//     options + schema version — NOT hashBeads.
 //     A working-tree bead edit (`br update`/`br close`, even uncommitted) flips
 //     hashBeads and misses the outer report cache, but does NOT touch committed
 //     history, so the artifact is unchanged. On that path we load the cached
@@ -28,10 +31,11 @@ import (
 //     the current beads, skipping the 232MB git-blob extraction entirely.
 //
 // Correctness: Extract reads only committed history and ExtractAllCoCommits is a
-// pure function of its events, so the artifact depends solely on HEAD + extract
-// options (see historyArtifact / extractHistoryArtifact). The key is therefore
-// complete: a genuine HEAD change (a new commit) changes the SHA and invalidates
-// the entry. The schema version bumps invalidate stale entries on format change.
+// pure function of its events, so the artifact depends solely on the repository,
+// selected history path, HEAD, and extract options (see historyArtifact /
+// extractHistoryArtifact). A genuine HEAD change (a new commit) changes the SHA
+// and invalidates the entry. The schema version bumps invalidate stale entries
+// on format change.
 //
 // Storage discipline mirrors disk_cache.go exactly: same XDG cache dir
 // convention (BV_CACHE_DIR override, else UserCacheDir under "bv"), goccy JSON
@@ -39,11 +43,16 @@ import (
 // (a pure read does not rewrite the file just to bump AccessedAt).
 
 const (
-	headArtifactCacheVersion      = 1
-	headArtifactCacheFileName     = "correlation_head_artifact_cache.json"
-	headArtifactCacheMaxEntries   = 6
-	headArtifactCacheMaxAge       = 24 * time.Hour
-	headArtifactCacheMaxEntrySize = 64 << 20 // 64MB serialized artifact ceiling
+	// headArtifactCacheVersion is the cache FILE schema; the artifact payload
+	// additionally carries historyArtifactFormatVersion and an entry whose
+	// artifact was written by a different format is a miss (see
+	// getHeadArtifactCached). 3 = first file version storing v2 artifacts.
+	headArtifactCacheVersion            = 4
+	headArtifactCacheFileName           = "correlation_head_artifact_cache.json"
+	headArtifactCacheMaxEntries         = 6
+	headArtifactCacheMaxAge             = 24 * time.Hour
+	headArtifactCacheMaxEntrySize       = 64 << 20 // 64MB serialized artifact ceiling
+	headArtifactCacheMaxFileSize  int64 = headArtifactCacheMaxEntries*headArtifactCacheMaxEntrySize + (1 << 20)
 )
 
 type headArtifactCacheFile struct {
@@ -54,6 +63,7 @@ type headArtifactCacheFile struct {
 type headArtifactCacheEntry struct {
 	CreatedAt  time.Time        `json:"created_at"`
 	AccessedAt time.Time        `json:"accessed_at"`
+	Namespace  string           `json:"namespace"`
 	HeadSHA    string           `json:"head_sha"`
 	OptsHash   string           `json:"opts_hash"`
 	Artifact   *historyArtifact `json:"artifact"`
@@ -63,7 +73,7 @@ type headArtifactCacheEntry struct {
 // conventions as the report disk cache (BV_CACHE_DIR override, otherwise the
 // user cache dir which respects XDG_CACHE_HOME, under the shared "bv" subdir).
 func headArtifactCachePath(create bool) (string, error) {
-	base := os.Getenv("BV_CACHE_DIR")
+	base := env.CacheDir.Get()
 	if base == "" {
 		dir, err := os.UserCacheDir()
 		if err != nil {
@@ -79,10 +89,11 @@ func headArtifactCachePath(create bool) (string, error) {
 	return filepath.Join(base, headArtifactCacheFileName), nil
 }
 
-// headArtifactCacheKey keys purely on HEAD SHA + options (the only inputs the
-// artifact depends on). Deliberately excludes hashBeads so bead edits reuse it.
-func headArtifactCacheKey(headSHA, optsHash string) string {
-	return headSHA + ":" + optsHash
+// headArtifactCacheKey deliberately excludes hashBeads so working-tree bead
+// edits reuse committed history, but includes the repository/primary-path
+// namespace because those select which committed history is extracted.
+func headArtifactCacheKey(namespace, headSHA, optsHash string) string {
+	return namespace + ":" + headSHA + ":" + optsHash
 }
 
 func readHeadArtifactCacheLocked(f *os.File) headArtifactCacheFile {
@@ -90,8 +101,8 @@ func readHeadArtifactCacheLocked(f *os.File) headArtifactCacheFile {
 	if _, err := f.Seek(0, 0); err != nil {
 		return empty
 	}
-	data, err := io.ReadAll(f)
-	if err != nil || len(data) == 0 {
+	data, ok := readCacheFileBounded(f, headArtifactCacheMaxFileSize)
+	if !ok || len(data) == 0 {
 		return empty
 	}
 	var cf headArtifactCacheFile
@@ -126,7 +137,7 @@ func writeHeadArtifactCacheLocked(f *os.File, cf headArtifactCacheFile) error {
 
 func pruneHeadArtifactCacheEntries(now time.Time, entries map[string]headArtifactCacheEntry) {
 	for k, e := range entries {
-		if e.CreatedAt.IsZero() || now.Sub(e.CreatedAt) > headArtifactCacheMaxAge {
+		if !cacheCreatedAtIsFresh(e.CreatedAt, now, headArtifactCacheMaxAge) {
 			delete(entries, k)
 		}
 	}
@@ -166,7 +177,7 @@ func evictHeadArtifactCacheLRU(entries map[string]headArtifactCacheEntry) {
 // (pass-1 discipline): the artifact is multi-MB and the AccessedAt bookkeeping
 // is not load-bearing (eviction falls back to CreatedAt). Returns a deep-enough
 // copy is unnecessary because the caller (assembleReport) only reads the slices.
-func getHeadArtifactCached(headSHA, optsHash string) (*historyArtifact, bool) {
+func getHeadArtifactCached(namespace, headSHA, optsHash string) (*historyArtifact, bool) {
 	if !correlationDiskCacheEnabled() {
 		return nil, false
 	}
@@ -185,11 +196,22 @@ func getHeadArtifactCached(headSHA, optsHash string) (*historyArtifact, bool) {
 	defer func() { _ = unlockFile(f) }()
 
 	cf := readHeadArtifactCacheLocked(f)
-	entry, ok := cf.Entries[headArtifactCacheKey(headSHA, optsHash)]
+	entry, ok := cf.Entries[headArtifactCacheKey(namespace, headSHA, optsHash)]
 	if !ok || entry.Artifact == nil {
 		return nil, false
 	}
-	if entry.CreatedAt.IsZero() || time.Since(entry.CreatedAt) > headArtifactCacheMaxAge {
+	if entry.Namespace != namespace || entry.HeadSHA != headSHA || entry.OptsHash != optsHash {
+		return nil, false
+	}
+	now := time.Now().UTC()
+	if !cacheCreatedAtIsFresh(entry.CreatedAt, now, headArtifactCacheMaxAge) {
+		return nil, false
+	}
+	if entry.Artifact.FormatVersion != historyArtifactFormatVersion {
+		// No migration is attempted: the artifact is rebuilt lazily from git on
+		// this miss and the stale entry is overwritten by the next put.
+		debug.Log("correlation: head artifact cache entry for %s has format v%d, want v%d; treating as miss",
+			shortSHA(headSHA), entry.Artifact.FormatVersion, historyArtifactFormatVersion)
 		return nil, false
 	}
 	return entry.Artifact, true
@@ -197,9 +219,17 @@ func getHeadArtifactCached(headSHA, optsHash string) (*historyArtifact, bool) {
 
 // putHeadArtifactCached persists a freshly extracted artifact. Runs only after a
 // real extraction (a miss), so the rewrite cost is amortized against the
-// expensive git extraction it lets future bead-edit invocations skip.
-func putHeadArtifactCached(headSHA, optsHash string, art *historyArtifact) {
+// expensive git extraction it lets future bead-edit invocations skip. An
+// artifact assembled in-process without a version is stamped with the current
+// format; one carrying a foreign version is never persisted.
+func putHeadArtifactCached(namespace, headSHA, optsHash string, art *historyArtifact) {
 	if !correlationDiskCacheEnabled() || art == nil {
+		return
+	}
+	if art.FormatVersion == 0 {
+		art.FormatVersion = historyArtifactFormatVersion
+	}
+	if art.FormatVersion != historyArtifactFormatVersion {
 		return
 	}
 	data, err := json.Marshal(art)
@@ -227,9 +257,10 @@ func putHeadArtifactCached(headSHA, optsHash string, art *historyArtifact) {
 	if cf.Entries == nil {
 		cf.Entries = map[string]headArtifactCacheEntry{}
 	}
-	cf.Entries[headArtifactCacheKey(headSHA, optsHash)] = headArtifactCacheEntry{
+	cf.Entries[headArtifactCacheKey(namespace, headSHA, optsHash)] = headArtifactCacheEntry{
 		CreatedAt:  now,
 		AccessedAt: now,
+		Namespace:  namespace,
 		HeadSHA:    headSHA,
 		OptsHash:   optsHash,
 		Artifact:   art,

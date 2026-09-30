@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -171,45 +173,49 @@ func TestHandleListKeysFiltersAndTimeTravelPrompt(t *testing.T) {
 	m.focused = focusList
 	m.isSplitView = false
 
-	m = m.handleListKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	m, _ = m.handleListKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
 	if m.currentFilter != "open" {
 		t.Fatalf("expected filter 'open', got %s", m.currentFilter)
 	}
-	m = m.handleListKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m, _ = m.handleListKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
 	if m.currentFilter != "closed" {
 		t.Fatalf("expected filter 'closed', got %s", m.currentFilter)
 	}
-	m = m.handleListKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	m, _ = m.handleListKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
 	if m.currentFilter != "ready" {
 		t.Fatalf("expected filter 'ready', got %s", m.currentFilter)
 	}
 
 	// Paging up/down
 	m.list.Select(0)
-	m = m.handleListKeys(tea.KeyMsg{Type: tea.KeyCtrlD})
+	m, _ = m.handleListKeys(tea.KeyMsg{Type: tea.KeyCtrlD})
 	if m.list.Index() == 0 {
 		t.Fatalf("ctrl+d should move selection down")
 	}
-	m = m.handleListKeys(tea.KeyMsg{Type: tea.KeyCtrlU})
+	m, _ = m.handleListKeys(tea.KeyMsg{Type: tea.KeyCtrlU})
 	if m.list.Index() != 0 {
 		t.Fatalf("ctrl+u should move selection up")
 	}
 
 	// Enter should flip showDetails in mobile view
 	m.showDetails = false
-	m = m.handleListKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = m.handleListKeys(tea.KeyMsg{Type: tea.KeyEnter})
 	if !m.showDetails {
 		t.Fatalf("enter should show details when not split view")
 	}
 
 	// Time-travel prompt toggling
 	m.timeTravelMode = false
-	m = m.handleListKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	var focusCmd tea.Cmd
+	m, focusCmd = m.handleListKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
 	if !m.showTimeTravelPrompt || m.focused != focusTimeTravelInput {
 		t.Fatalf("time-travel prompt not activated")
 	}
+	if focusCmd == nil {
+		t.Fatal("time-travel prompt discarded its initial focus command")
+	}
 	// Cancel via Esc to avoid git dependency
-	m = m.handleTimeTravelInputKeys(tea.KeyMsg{Type: tea.KeyEsc})
+	m, _ = m.handleTimeTravelInputKeys(tea.KeyMsg{Type: tea.KeyEsc})
 	if m.showTimeTravelPrompt {
 		t.Fatalf("prompt should close on esc")
 	}
@@ -371,15 +377,15 @@ func TestHandleGraphBoardActionableKeys(t *testing.T) {
 	// Focus board navigation paths
 	m.isBoardView = true
 	m.focused = focusBoard
-	m = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
-	m = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
-	m = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
-	m = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	m, _ = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
+	m, _ = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	m, _ = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	m, _ = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
 	// Navigate back to Open column (with items) - Status mode shows all columns (bv-tf6j)
 	m.board.JumpToFirstColumn()
 	// Enter should exit board when selection exists
 	m.board.MoveToTop()
-	m = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyEnter})
 	if m.isBoardView {
 		t.Fatalf("enter should exit board view")
 	}
@@ -682,7 +688,7 @@ func TestGraphConnectorDown(t *testing.T) {
 
 func TestCopyIssueToClipboardNoSelection(t *testing.T) {
 	m := NewModel(nil, nil, "")
-	m.copyIssueToClipboard()
+	_ = m.copyIssueToClipboard()
 	if !m.statusIsError || !strings.Contains(m.statusMsg, "No issue selected") {
 		t.Fatalf("expected error status for missing selection")
 	}
@@ -709,42 +715,87 @@ func TestOpenInEditorTerminalEditorGuard(t *testing.T) {
 }
 
 func TestOpenInEditorWithArguments(t *testing.T) {
-	// Test that EDITOR with arguments (e.g., "cursor -w") works correctly
-	// This tests the fix for GitHub issue #47
-	if runtime.GOOS == "windows" {
-		t.Skip("shell execution test unreliable on Windows CI")
-	}
+	// GUI editor arguments must be parsed without treating the entire command
+	// as an executable name (GitHub #47). The allowlisted GUI launch contract
+	// supplies only the target path; terminal editors retain user arguments.
 	tmp := t.TempDir()
-	oldCwd, _ := os.Getwd()
-	defer os.Chdir(oldCwd)
-	_ = os.MkdirAll(filepath.Join(tmp, ".beads"), 0755)
-	_ = os.WriteFile(filepath.Join(tmp, ".beads", "beads.jsonl"), []byte("{}"), 0644)
-	_ = os.Chdir(tmp)
+	beadsFile := filepath.Join(tmp, "issues with spaces.jsonl")
+	if err := os.WriteFile(beadsFile, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	capture := installTestGUIEditor(t)
+	t.Setenv("EDITOR", "gedit --wait")
 
-	origEditor := os.Getenv("EDITOR")
-	defer os.Setenv("EDITOR", origEditor)
-
-	// Test with EDITOR containing arguments - "true" is a POSIX command that just exits 0
-	// Using "true --" simulates EDITOR with arguments like "cursor -w"
-	_ = os.Setenv("EDITOR", "true --")
-
-	m := NewModel(nil, nil, "")
+	m := NewModel(nil, nil, beadsFile)
 	m.openInEditor()
-	// Should succeed - the shell should parse "true --" correctly
 	if m.statusIsError {
 		t.Fatalf("expected success with EDITOR containing arguments, got error: %q", m.statusMsg)
 	}
 	if !strings.Contains(m.statusMsg, "Opened in") {
 		t.Fatalf("expected 'Opened in' message, got %q", m.statusMsg)
 	}
+	assertTestGUIEditorArgs(t, capture, []string{beadsFile})
 
 	// Also test terminal editor detection with arguments (e.g., "vim -u NONE")
 	// Now dispatches via TUI suspend (bv-134); with no issue selected, returns error
-	_ = os.Setenv("EDITOR", "vim -u NONE")
-	m2 := NewModel(nil, nil, "")
+	t.Setenv("EDITOR", "vim -u NONE")
+	m2 := NewModel(nil, nil, beadsFile)
 	m2.openInEditor()
 	if !m2.statusIsError || !strings.Contains(m2.statusMsg, "No issue selected") {
 		t.Fatalf("expected 'No issue selected' for 'vim -u NONE', got %q", m2.statusMsg)
+	}
+}
+
+// installTestGUIEditor controls both executable lookup and argv capture. No
+// installed desktop editor can be launched, and no shell is required.
+func installTestGUIEditor(t *testing.T) string {
+	t.Helper()
+	binDir := t.TempDir()
+	name := "gedit"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := os.Open(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	editor, err := os.OpenFile(filepath.Join(binDir, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, copyErr := io.Copy(editor, source)
+	closeErr := editor.Close()
+	if copyErr != nil || closeErr != nil {
+		t.Fatalf("copy controlled editor: copy=%v close=%v", copyErr, closeErr)
+	}
+	capture := filepath.Join(binDir, "argv.json")
+	t.Setenv("PATH", binDir)
+	t.Setenv("VISUAL", "")
+	t.Setenv("BV_TEST_EDITOR_CAPTURE", capture)
+	return capture
+}
+
+func assertTestGUIEditorArgs(t *testing.T, capture string, want []string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		data, readErr := os.ReadFile(capture)
+		var got []string
+		if readErr == nil && json.Unmarshal(data, &got) == nil {
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("editor argv = %q, want %q", got, want)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("editor did not record complete argv: read=%v data=%q", readErr, data)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -875,10 +926,10 @@ func TestBoardAndInsightsExtraKeys(t *testing.T) {
 	// Board page up/down coverage
 	m.isBoardView = true
 	m.focused = focusBoard
-	m = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyCtrlD})
-	m = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyCtrlU})
-	m = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyHome})
-	m = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyEnd})
+	m, _ = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyCtrlD})
+	m, _ = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyCtrlU})
+	m, _ = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyHome})
+	m, _ = m.handleBoardKeys(tea.KeyMsg{Type: tea.KeyEnd})
 
 	// Insights escape and tab navigation
 	m.focused = focusInsights
@@ -899,21 +950,23 @@ func TestBoardAndInsightsExtraKeys(t *testing.T) {
 	m.showTimeTravelPrompt = true
 	m.focused = focusTimeTravelInput
 	m.timeTravelInput.SetValue("HEAD~1")
-	m = m.handleTimeTravelInputKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = m.handleTimeTravelInputKeys(tea.KeyMsg{Type: tea.KeyEnter})
 	if !m.statusIsError && m.statusMsg == "" {
 		t.Fatalf("expected status message after attempting time-travel without git")
 	}
 }
 
 func TestOpenInEditorMissingAndGUI(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("openInEditor GUI path is unreliable on headless Windows CI")
-	}
 	// Missing beads file branch
 	tmp := t.TempDir()
 	origWD, _ := os.Getwd()
 	t.Cleanup(func() { _ = os.Chdir(origWD) })
-	_ = os.Chdir(tmp)
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("EDITOR", "gedit")
+	t.Setenv("VISUAL", "")
 
 	m := NewModel([]model.Issue{{ID: "1", Title: "x", Status: model.StatusOpen}}, nil, "")
 	m.openInEditor()
@@ -923,17 +976,26 @@ func TestOpenInEditorMissingAndGUI(t *testing.T) {
 
 	// Success branch with GUI-ish editor
 	beadsDir := filepath.Join(tmp, ".beads")
-	_ = os.Mkdir(beadsDir, 0o755)
-	_ = os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(`{}`), 0o644)
+	if err := os.Mkdir(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	beadsFile := filepath.Join(beadsDir, "beads.jsonl")
+	if err := os.WriteFile(beadsFile, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	origEditor := os.Getenv("EDITOR")
-	t.Cleanup(func() { _ = os.Setenv("EDITOR", origEditor) })
-	_ = os.Setenv("EDITOR", "true") // present on POSIX; not in terminal editor block
+	// A missing executable must fail even though the beads file exists.
+	m.openInEditor()
+	if !m.statusIsError || !strings.Contains(m.statusMsg, "Failed to open editor") {
+		t.Fatalf("expected missing editor error, got %q", m.statusMsg)
+	}
+	capture := installTestGUIEditor(t)
 
 	m.openInEditor()
 	if m.statusIsError || !strings.Contains(m.statusMsg, "Opened in") {
 		t.Fatalf("expected success opening editor, got %q", m.statusMsg)
 	}
+	assertTestGUIEditorArgs(t, capture, []string{beadsFile})
 }
 
 func TestExportToMarkdownCreatesFile(t *testing.T) {
@@ -984,6 +1046,37 @@ func TestWatchFileCmdDetectsChange(t *testing.T) {
 	msg := cmd()
 	if _, ok := msg.(FileChangedMsg); !ok {
 		t.Fatalf("expected FileChangedMsg, got %T", msg)
+	}
+}
+
+func TestWatchFileCmdReturnsWhenWatcherStops(t *testing.T) {
+	tmp := t.TempDir()
+	file := filepath.Join(tmp, "file.txt")
+	if err := os.WriteFile(file, []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	w, err := watcher.NewWatcher(file, watcher.WithForcePoll(true))
+	if err != nil {
+		t.Fatalf("new watcher: %v", err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatalf("start watcher: %v", err)
+	}
+
+	result := make(chan tea.Msg, 1)
+	go func() {
+		result <- WatchFileCmd(w)()
+	}()
+	w.Stop()
+
+	select {
+	case msg := <-result:
+		if msg != nil {
+			t.Fatalf("stopped watcher returned unexpected message %T", msg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WatchFileCmd remained blocked after watcher stop")
 	}
 }
 
@@ -1587,6 +1680,51 @@ Description.
 	}
 }
 
+func TestEditorExitMsgRunsBRUpdateAsynchronously(t *testing.T) {
+	original := `---
+title: Test
+priority: 1
+status: open
+assignee:
+type: task
+---
+
+Description.
+`
+	edited := strings.Replace(original, "title: Test", "title: Updated", 1)
+	tmpFile, err := os.CreateTemp("", "bv-test-*.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	if _, err := tmpFile.WriteString(edited); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewModel([]model.Issue{{
+		ID:        "t1",
+		Title:     "Test",
+		Priority:  1,
+		Status:    model.StatusOpen,
+		IssueType: model.TypeTask,
+	}}, nil, "")
+	result, cmd := m.Update(editorExitMsg{
+		issueID:  "t1",
+		tmpFile:  tmpFile.Name(),
+		original: original,
+	})
+	if cmd == nil {
+		t.Fatal("changed editor content should schedule br update asynchronously")
+	}
+	resultModel := result.(*Model)
+	if resultModel.statusIsError || !strings.Contains(resultModel.statusMsg, "Updating 1 field") {
+		t.Fatalf("expected in-progress update status, got %q", resultModel.statusMsg)
+	}
+}
+
 func TestEditorExitMsgWithError(t *testing.T) {
 	tmpFile, err := os.CreateTemp("", "bv-test-*.md")
 	if err != nil {
@@ -1651,7 +1789,19 @@ func TestEditorExitMsgSuccessTriggersReload(t *testing.T) {
 		t.Fatalf("expected successful update, got %q", resultModel.statusMsg)
 	}
 	if cmd == nil {
-		t.Fatal("expected reload command after successful editor update")
+		t.Fatal("expected br update command after successful editor exit")
+	}
+	updateMsg, ok := cmd().(brUpdateResultMsg)
+	if !ok {
+		t.Fatalf("expected brUpdateResultMsg from br update command")
+	}
+	result, cmd = resultModel.Update(updateMsg)
+	resultModel = result.(*Model)
+	if resultModel.statusIsError {
+		t.Fatalf("expected successful br update, got %q", resultModel.statusMsg)
+	}
+	if cmd == nil {
+		t.Fatal("expected reload command after successful br update")
 	}
 	if _, ok := cmd().(FileChangedMsg); !ok {
 		t.Fatalf("expected FileChangedMsg from reload command")

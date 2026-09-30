@@ -25,13 +25,15 @@ import (
 
 // SQLiteExporter exports bv data to a SQLite database for static deployment.
 type SQLiteExporter struct {
-	Issues  []*model.Issue
-	Deps    []*model.Dependency
-	Metrics map[string]*model.IssueMetrics
-	Stats   *analysis.GraphStats
-	Triage  *analysis.TriageResult
-	Config  SQLiteExportConfig
-	gitHash string
+	Issues      []*model.Issue
+	Deps        []*model.Dependency
+	Metrics     map[string]*model.IssueMetrics
+	Stats       *analysis.GraphStats
+	Triage      *analysis.TriageResult
+	Config      SQLiteExportConfig
+	gitHash     string
+	readiness   *model.ReadinessIndex
+	readinessAt time.Time
 }
 
 // NewSQLiteExporter creates a new exporter with the given data.
@@ -67,6 +69,36 @@ func (e *SQLiteExporter) SetGitHash(hash string) {
 
 // Export writes the SQLite database and supporting files to the output directory.
 func (e *SQLiteExporter) Export(outputDir string) error {
+	e.readiness = e.Config.Readiness
+	if e.readiness == nil {
+		// Standalone callers may supply relationships on issues, separately in
+		// Deps, or both. Copy slices before combining so export never mutates
+		// caller-owned issues. Repeated edges do not change readiness.
+		source := make([]model.Issue, 0, len(e.Issues))
+		positions := make(map[string]int, len(e.Issues))
+		for _, issue := range e.Issues {
+			if issue == nil {
+				continue
+			}
+			copyIssue := *issue
+			copyIssue.Dependencies = append([]*model.Dependency(nil), issue.Dependencies...)
+			positions[issue.ID] = len(source)
+			source = append(source, copyIssue)
+		}
+		for _, dep := range e.Deps {
+			if dep != nil {
+				if pos, exists := positions[dep.IssueID]; exists {
+					source[pos].Dependencies = append(source[pos].Dependencies, dep)
+				}
+			}
+		}
+		e.readiness = model.NewReadinessIndex(source)
+	}
+	e.readinessAt = e.Config.ReadinessAt
+	if e.readinessAt.IsZero() {
+		e.readinessAt = time.Now().UTC()
+	}
+
 	// Ensure output directory exists
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return fmt.Errorf("create output dir: %w", err)
@@ -80,13 +112,20 @@ func (e *SQLiteExporter) Export(outputDir string) error {
 
 	dbPath := filepath.Join(outputDir, "beads.sqlite3")
 
-	// Remove existing database if present
-	if err := os.Remove(dbPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove existing database: %w", err)
+	// Build a separate snapshot so readers never lock an in-progress export or
+	// observe a partial database. Construction or publication failures preserve
+	// the previous snapshot.
+	temporaryDir, err := os.MkdirTemp(outputDir, ".beads-*")
+	if err != nil {
+		return fmt.Errorf("create temporary database directory: %w", err)
 	}
+	defer os.RemoveAll(temporaryDir)
+	// SQLite applies its normal creation mode and the caller's umask. The
+	// private parent keeps the unfinished database and journal inaccessible.
+	temporaryPath := filepath.Join(temporaryDir, "beads.sqlite3")
 
 	// Open database
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", temporaryPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -137,6 +176,9 @@ func (e *SQLiteExporter) Export(outputDir string) error {
 	if err := CreateMaterializedViews(db); err != nil {
 		return fmt.Errorf("create materialized views: %w", err)
 	}
+	if err := e.populateOverviewReadiness(db); err != nil {
+		return fmt.Errorf("populate overview readiness: %w", err)
+	}
 
 	// Populate additional overview metrics (cycle flags)
 	if err := e.populateOverviewMetrics(db); err != nil {
@@ -158,6 +200,9 @@ func (e *SQLiteExporter) Export(outputDir string) error {
 		return fmt.Errorf("close database: %w", err)
 	}
 	dbClosed = true
+	if err := os.Rename(temporaryPath, dbPath); err != nil {
+		return fmt.Errorf("publish database: %w", err)
+	}
 
 	// Write robot JSON outputs
 	if e.Config.IncludeRobotOutputs {
@@ -455,6 +500,34 @@ func (e *SQLiteExporter) insertTriageRecommendations(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// populateOverviewReadiness records planning eligibility at the export clock.
+// Visible graph edges alone cannot establish readiness: missing references,
+// omitted prerequisites, inherited parent gates and deferral also matter.
+func (e *SQLiteExporter) populateOverviewReadiness(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin readiness: %w", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`UPDATE issue_overview_mv SET dependency_state = ?, is_actionable = ? WHERE id = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare readiness: %w", err)
+	}
+	defer stmt.Close()
+	for _, issue := range e.Issues {
+		if issue == nil {
+			continue
+		}
+		if _, err := stmt.Exec(e.readiness.DependencyState(issue.ID), e.readiness.Ready(issue.ID, e.readinessAt), issue.ID); err != nil {
+			return fmt.Errorf("update readiness for %s: %w", issue.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit readiness: %w", err)
+	}
+	return nil
+}
+
 // populateOverviewMetrics updates issue_overview_mv with metrics derived from graph analysis.
 func (e *SQLiteExporter) populateOverviewMetrics(db *sql.DB) error {
 	if e.Stats == nil {
@@ -502,6 +575,7 @@ func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 		"issue_count":      fmt.Sprintf("%d", len(e.Issues)),
 		"dependency_count": fmt.Sprintf("%d", len(e.Deps)),
 		"schema_version":   fmt.Sprintf("%d", SchemaVersion),
+		"readiness_at":     e.readinessAt.UTC().Format(time.RFC3339Nano),
 	}
 
 	if e.gitHash != "" {
@@ -510,13 +584,31 @@ func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 	if e.Config.Title != "" {
 		meta["title"] = e.Config.Title
 	}
+	if resolvedIDs := e.readiness.ResolvedIDs(); len(resolvedIDs) > 0 {
+		resolved, err := json.Marshal(resolvedIDs)
+		if err != nil {
+			return fmt.Errorf("encode resolved issue IDs: %w", err)
+		}
+		meta["resolved_issue_ids"] = string(resolved)
+	}
+
+	// Metadata belongs to one snapshot. Commit it together to avoid partial
+	// updates on failure and a separate durable commit for every key.
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin metadata: %w", err)
+	}
+	defer tx.Rollback()
 
 	for key, value := range meta {
-		if err := InsertMetaValue(db, key, value); err != nil {
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO export_meta (key, value) VALUES (?, ?)`, key, value); err != nil {
 			return fmt.Errorf("insert meta %s: %w", key, err)
 		}
 	}
 
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit metadata: %w", err)
+	}
 	return nil
 }
 
@@ -524,12 +616,12 @@ func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 func (e *SQLiteExporter) writeRobotOutputs(dataDir string) error {
 	// Write triage output
 	if e.Triage != nil {
-		if err := writeJSON(filepath.Join(dataDir, "triage.json"), e.Triage); err != nil {
+		if err := e.writeRobotJSON(filepath.Join(dataDir, "triage.json"), e.Triage); err != nil {
 			return fmt.Errorf("write triage.json: %w", err)
 		}
 
 		// Also emit a compact project_health.json for fast robot consumption
-		if err := writeJSON(filepath.Join(dataDir, "project_health.json"), e.Triage.ProjectHealth); err != nil {
+		if err := e.writeRobotJSON(filepath.Join(dataDir, "project_health.json"), e.Triage.ProjectHealth); err != nil {
 			return fmt.Errorf("write project_health.json: %w", err)
 		}
 	}
@@ -543,11 +635,34 @@ func (e *SQLiteExporter) writeRobotOutputs(dataDir string) error {
 		DepCount:    len(e.Deps),
 		Title:       e.Config.Title,
 	}
-	if err := writeJSON(filepath.Join(dataDir, "meta.json"), meta); err != nil {
+	if err := e.writeRobotJSON(filepath.Join(dataDir, "meta.json"), meta); err != nil {
 		return fmt.Errorf("write meta.json: %w", err)
 	}
 
 	return nil
+}
+
+func (e *SQLiteExporter) writeRobotJSON(path string, payload any) error {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encoding export payload: %w", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return fmt.Errorf("reading export payload fields: %w", err)
+	}
+	for key, value := range e.Config.RobotEnvelope {
+		// A payload may record its own generation instant with nanosecond
+		// precision. Keep that value instead of replacing it with the shared
+		// analysis timestamp; payloads without one still inherit the envelope.
+		if key == "generated_at" {
+			if _, present := fields[key]; present {
+				continue
+			}
+		}
+		fields[key] = value
+	}
+	return writeJSON(path, fields)
 }
 
 // chunkIfNeeded splits the database into chunks if it exceeds the threshold.
@@ -850,7 +965,7 @@ func (e *SQLiteExporter) ExportToJSON(path string) error {
 		Issues: issues,
 	}
 
-	return writeJSON(path, output)
+	return e.writeRobotJSON(path, output)
 }
 
 // stringSliceContains checks if a string slice contains a value.
@@ -1005,5 +1120,5 @@ func (e *SQLiteExporter) writeGraphLayout(dataDir string) error {
 		EdgeCount:   len(links),
 	}
 
-	return writeJSON(filepath.Join(dataDir, "graph_layout.json"), layout)
+	return e.writeRobotJSON(filepath.Join(dataDir, "graph_layout.json"), layout)
 }

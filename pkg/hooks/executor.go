@@ -120,8 +120,17 @@ func (e *Executor) runHook(hook Hook, phase HookPhase) HookResult {
 	shell, flag := getShellCommand()
 	cmd := exec.CommandContext(ctx, shell, flag, hook.Command)
 
-	// Build environment
-	cmd.Env = os.Environ()
+	// Build environment.
+	// The full (unfiltered) environment is used only for ${VAR} expansion in
+	// hook-specific env declarations; the subprocess itself gets a scrubbed
+	// environment with credential-bearing variables removed. Hooks live in the
+	// project's .bv/hooks.yaml, which may come from an untrusted repository, so
+	// ambient tokens must not leak into them by default. A hook that
+	// legitimately needs a credential can re-grant it explicitly, e.g.:
+	//   env:
+	//     GITHUB_TOKEN: "${GITHUB_TOKEN}"
+	fullEnv := append(os.Environ(), e.context.ToEnv()...)
+	cmd.Env = scrubEnviron(os.Environ())
 
 	// Add export context variables
 	cmd.Env = append(cmd.Env, e.context.ToEnv()...)
@@ -134,11 +143,16 @@ func (e *Executor) runHook(hook Hook, phase HookPhase) HookResult {
 	}
 	sort.Strings(envKeys)
 
+	expansionEnv := fullEnv
 	for _, key := range envKeys {
 		value := hook.Env[key]
-		// Use custom expansion that sees both OS env and context variables
-		expandedValue := expandEnv(value, cmd.Env)
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", key, expandedValue))
+		// Use custom expansion that sees both OS env and context variables,
+		// including scrubbed credentials (explicit re-grant by the hook author),
+		// plus hook env vars declared earlier in sorted order.
+		expandedValue := expandEnv(value, expansionEnv)
+		pair := fmt.Sprintf("%s=%s", key, expandedValue)
+		cmd.Env = append(cmd.Env, pair)
+		expansionEnv = append(expansionEnv, pair)
 	}
 
 	// Capture output
@@ -164,6 +178,56 @@ func (e *Executor) runHook(hook Hook, phase HookPhase) HookResult {
 	}
 
 	return result
+}
+
+// sensitiveEnvMarkers are substrings that, when present in an (upper-cased)
+// environment variable name, mark it as credential-bearing. Matching variables
+// are stripped from hook subprocess environments; see runHook for the explicit
+// re-grant mechanism.
+var sensitiveEnvMarkers = []string{
+	"TOKEN",
+	"SECRET",
+	"PASSWORD",
+	"PASSWD",
+	"CREDENTIAL",
+	"API_KEY",
+	"APIKEY",
+	"ACCESS_KEY",
+	"PRIVATE_KEY",
+}
+
+// sensitiveEnvExact are exact environment variable names that are stripped from
+// hook subprocess environments in addition to marker matches.
+var sensitiveEnvExact = map[string]bool{
+	"SSH_AUTH_SOCK": true, // forwarding the SSH agent grants signing/auth capability
+}
+
+// isSensitiveEnvKey reports whether an environment variable name looks like it
+// carries a credential and should be withheld from project-controlled hooks.
+func isSensitiveEnvKey(key string) bool {
+	upper := strings.ToUpper(key)
+	if sensitiveEnvExact[upper] {
+		return true
+	}
+	for _, marker := range sensitiveEnvMarkers {
+		if strings.Contains(upper, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// scrubEnviron returns a copy of env with credential-bearing variables removed.
+func scrubEnviron(env []string) []string {
+	scrubbed := make([]string, 0, len(env))
+	for _, kv := range env {
+		key, _, ok := strings.Cut(kv, "=")
+		if ok && isSensitiveEnvKey(key) {
+			continue
+		}
+		scrubbed = append(scrubbed, kv)
+	}
+	return scrubbed
 }
 
 // expandEnv replaces ${VAR} or $VAR in the string using values from the env slice

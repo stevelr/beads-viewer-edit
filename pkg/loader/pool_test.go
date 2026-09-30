@@ -1,13 +1,121 @@
 package loader
 
 import (
+	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
+	"unsafe"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+func TestOpenIssuesFileRetriesChangedSnapshot(t *testing.T) {
+	for _, change := range []string{"append", "replace"} {
+		t.Run(change, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "issues.jsonl")
+			if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var opened []*os.File
+			openFile := func(path string) (*os.File, error) {
+				// Perform the real filesystem mutation after production's Stat
+				// and before its Open, making the narrow race deterministic.
+				if len(opened) == 0 {
+					if change == "append" {
+						writer, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+						if err != nil {
+							return nil, err
+						}
+						_, writeErr := writer.WriteString("new\n")
+						closeErr := writer.Close()
+						if writeErr != nil {
+							return nil, writeErr
+						}
+						if closeErr != nil {
+							return nil, closeErr
+						}
+					} else {
+						replacement := path + ".next"
+						if err := os.WriteFile(replacement, []byte("new\n"), 0o644); err != nil {
+							return nil, err
+						}
+						if err := os.Rename(replacement, path); err != nil {
+							return nil, err
+						}
+					}
+				}
+				file, err := os.Open(path)
+				if err == nil {
+					opened = append(opened, file)
+				}
+				return file, err
+			}
+			file, err := openIssuesFile(path, openFile)
+			if err != nil {
+				t.Fatalf("failed to reopen after %s: %v", change, err)
+			}
+			defer file.Close()
+			if len(opened) != 2 {
+				t.Fatalf("open attempts = %d, want one rejected snapshot and one fresh snapshot", len(opened))
+			}
+			if _, err := opened[0].Stat(); !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("rejected handle was not closed: %v", err)
+			}
+			got, err := io.ReadAll(file)
+			want := "new\n"
+			if change == "append" {
+				want = "old\nnew\n"
+			}
+			if err != nil || string(got) != want {
+				t.Fatalf("read latest snapshot = %q, %v; want %q", got, err, want)
+			}
+		})
+	}
+}
+
+func TestOpenIssuesFileDoesNotHidePersistentFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "issues.jsonl")
+	other := path + ".other"
+	for _, name := range []string{path, other} {
+		if err := os.WriteFile(name, []byte("data\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var rejected []*os.File
+	file, err := openIssuesFile(path, func(string) (*os.File, error) {
+		handle, err := os.Open(other)
+		if err == nil {
+			rejected = append(rejected, handle)
+		}
+		return handle, err
+	})
+	if file != nil || err == nil || !strings.Contains(err.Error(), "changed while being opened") || len(rejected) != 3 {
+		t.Fatalf("persistent replacement = file %v error %v attempts %d; want bounded refusal", file, err, len(rejected))
+	}
+	for _, handle := range rejected {
+		if _, err := handle.Stat(); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("persistent mismatch leaked a handle: %v", err)
+		}
+	}
+	permissionCalls := 0
+	file, err = openIssuesFile(path, func(path string) (*os.File, error) {
+		permissionCalls++
+		return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrPermission}
+	})
+	if file != nil || !errors.Is(err, os.ErrPermission) || permissionCalls != 1 {
+		t.Fatalf("permission failure was retried or hidden: file %v error %v attempts %d", file, err, permissionCalls)
+	}
+}
 
 // TestPooledIssueSliceIsolation verifies that after parsing with pooled issues,
 // returning pool refs to the pool does NOT affect the returned issues.
@@ -120,6 +228,8 @@ func TestIssueStringInterner_DeduplicatesAndStaysBounded(t *testing.T) {
 	}
 	if got := interner.intern(second); got != first {
 		t.Fatalf("duplicate intern=%q, want canonical %q", got, first)
+	} else if unsafe.StringData(got) != unsafe.StringData(first) {
+		t.Fatal("duplicate value did not reuse the canonical string backing storage")
 	}
 
 	occupied := 0
@@ -145,8 +255,11 @@ func TestIssueStringInterner_DeduplicatesAndStaysBounded(t *testing.T) {
 			occupied++
 		}
 	}
-	if occupied != issueStringInternerSlots {
-		t.Fatalf("occupied slots=%d, want bounded capacity %d", occupied, issueStringInternerSlots)
+	if occupied <= 0 || occupied > issueStringInternerSlots {
+		t.Fatalf("occupied slots=%d, want within 1..%d", occupied, issueStringInternerSlots)
+	}
+	if issueStringInternerMaxProbes >= issueStringInternerSlots {
+		t.Fatalf("probe budget=%d must remain below table capacity %d", issueStringInternerMaxProbes, issueStringInternerSlots)
 	}
 }
 
@@ -332,4 +445,161 @@ func TestDeepCopyIssueSlices_NilSlices(t *testing.T) {
 func TestDeepCopyIssueSlices_NilIssue(t *testing.T) {
 	// Should not panic
 	DeepCopyIssueSlices(nil)
+}
+
+// Use literal JSON and independent decoded values so retaining a decoder buffer
+// cannot silently change both the result and its expected value.
+func readerOwnershipFixture(marker string) (string, model.Issue) {
+	input := fmt.Sprintf(`{"id":"%[1]s","title":"%[1]s title 漢🙂","description":"%[1]s first\nsecond\u0000end","status":"open","priority":2,"issue_type":"task","labels":["%[1]s label","é\u0000"],"dependencies":[{"depends_on_id":"%[1]s-parent","type":"blocks","created_by":"%[1]s author"}],"comments":[{"id":"%[1]s-comment","issue_id":"%[1]s","author":"%[1]s writer","text":"%[1]s says \"hello\"\n漢🙂"}]}`, marker)
+	want := model.Issue{
+		ID: marker, Title: marker + " title 漢🙂", Description: marker + " first\nsecond\x00end",
+		Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+		Labels:       []string{marker + " label", "é\x00"},
+		Dependencies: []*model.Dependency{{IssueID: marker, DependsOnID: marker + "-parent", Type: model.DepBlocks, CreatedBy: marker + " author"}},
+		Comments:     []*model.Comment{{ID: marker + "-comment", IssueID: marker, Author: marker + " writer", Text: marker + " says \"hello\"\n漢🙂"}},
+	}
+	return input, want
+}
+
+func parseReaderFixture(r io.Reader, opts ParseOptions, pooled bool) ([]model.Issue, error) {
+	if !pooled {
+		return ParseIssuesWithOptions(r, opts)
+	}
+	result, err := ParseIssuesWithOptionsPooled(r, opts)
+	ReturnIssuePtrsToPool(result.PoolRefs)
+	return result.Issues, err
+}
+
+func TestParseReaderWarmAllocationBound(t *testing.T) {
+	input, want := readerOwnershipFixture("allocation")
+	for _, pooled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pooled=%v", pooled), func(t *testing.T) {
+			parse := func() {
+				issues, err := parseReaderFixture(strings.NewReader(input), ParseOptions{}, pooled)
+				if err != nil || len(issues) != 1 || !reflect.DeepEqual(issues[0], want) {
+					t.Fatalf("allocation fixture changed: issues=%d error=%v", len(issues), err)
+				}
+			}
+			parse() // Warm the decoder and any reusable reader before measuring.
+			const parses = 8
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			for i := 0; i < parses; i++ {
+				parse()
+			}
+			runtime.ReadMemStats(&after)
+			bytesPerParse := (after.TotalAlloc - before.TotalAlloc) / parses
+			t.Logf("parses=%d bytes/parse=%d", parses, bytesPerParse)
+			// A small decoded record may allocate normally, but a warmed parse
+			// must not allocate another 10 MiB default line buffer each time.
+			if bytesPerParse > 1024*1024 {
+				t.Fatalf("warmed parse allocated %d bytes; want at most 1 MiB", bytesPerParse)
+			}
+		})
+	}
+}
+
+func TestParseReaderRetainsValuesAcrossReuseAndConcurrency(t *testing.T) {
+	for _, pooled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pooled=%v", pooled), func(t *testing.T) {
+			input, want := readerOwnershipFixture("retained")
+			retained, err := parseReaderFixture(strings.NewReader(input), ParseOptions{}, pooled)
+			if err != nil || len(retained) != 1 || !reflect.DeepEqual(retained[0], want) {
+				t.Fatalf("initial decoded value differs: issues=%d error=%v", len(retained), err)
+			}
+			largeDescription := strings.Repeat("different bytes 漢🙂", 16384)
+			large := `{"id":"large","title":"Large","status":"open","issue_type":"task","description":"` + largeDescription + `"}`
+			later, err := parseReaderFixture(strings.NewReader(large), ParseOptions{}, pooled)
+			if err != nil || len(later) != 1 || later[0].Description != largeDescription {
+				t.Fatalf("later large parse differs: issues=%d error=%v", len(later), err)
+			}
+			if !reflect.DeepEqual(retained[0], want) {
+				t.Fatal("later parse changed retained issue/dependency/comment/label values")
+			}
+
+			const workers = 4
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			for worker := 0; worker < workers; worker++ {
+				wg.Add(1)
+				go func(worker int) {
+					defer wg.Done()
+					<-start
+					for iteration := 0; iteration < 2; iteration++ {
+						text, expected := readerOwnershipFixture(fmt.Sprintf("worker-%d-%d", worker, iteration))
+						issues, err := parseReaderFixture(strings.NewReader(text), ParseOptions{}, pooled)
+						if err != nil || len(issues) != 1 || !reflect.DeepEqual(issues[0], expected) {
+							t.Errorf("concurrent worker=%d iteration=%d result differs: issues=%d error=%v", worker, iteration, len(issues), err)
+						}
+						if !reflect.DeepEqual(retained[0], want) {
+							t.Errorf("concurrent parse changed the retained value in worker %d", worker)
+						}
+					}
+				}(worker)
+			}
+			close(start)
+			wg.Wait()
+
+			// A synchronous filter can parse another stream while the outer
+			// reader still holds unread lines. Both readers must remain owned.
+			second, secondWant := readerOwnershipFixture("second")
+			calls := 0
+			outer, err := parseReaderFixture(strings.NewReader(input+"\r\n"+second), ParseOptions{
+				IssueFilter: func(issue *model.Issue) bool {
+					calls++
+					innerText, innerWant := readerOwnershipFixture("nested")
+					inner, innerErr := parseReaderFixture(strings.NewReader(innerText), ParseOptions{}, pooled)
+					if innerErr != nil || len(inner) != 1 || !reflect.DeepEqual(inner[0], innerWant) {
+						t.Errorf("nested parse changed values: issues=%d error=%v", len(inner), innerErr)
+					}
+					return true
+				},
+			}, pooled)
+			if err != nil || calls != 2 || !reflect.DeepEqual(outer, []model.Issue{want, secondWant}) || !reflect.DeepEqual(retained[0], want) {
+				t.Fatalf("reentrant parse changed output/order/retained values: calls=%d issues=%d error=%v", calls, len(outer), err)
+			}
+		})
+	}
+}
+
+func TestParseReaderCallerOwnershipAndErrorRecovery(t *testing.T) {
+	input, want := readerOwnershipFixture("caller")
+	for _, size := range []int{64, DefaultMaxBufferSize, DefaultMaxBufferSize + 16} {
+		t.Run(fmt.Sprintf("caller-buffer=%d", size), func(t *testing.T) {
+			source := bytes.NewBufferString(input + "\r\n")
+			reader := bufio.NewReaderSize(source, size)
+			issues, err := ParseIssues(reader)
+			if err != nil || len(issues) != 1 || !reflect.DeepEqual(issues[0], want) {
+				t.Fatalf("caller reader parse differs: issues=%d error=%v", len(issues), err)
+			}
+			// Reading more data through the same caller-owned reader must work
+			// without a Reset: returning a borrowed reader must not detach it.
+			source.WriteString("caller still owns this stream")
+			remaining, err := io.ReadAll(reader)
+			if err != nil || string(remaining) != "caller still owns this stream" || reader.Size() != size {
+				t.Fatalf("caller reader was reset/replaced: remaining=%q size=%d error=%v", remaining, reader.Size(), err)
+			}
+		})
+	}
+	for _, pooled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("error-recovery-pooled=%v", pooled), func(t *testing.T) {
+			var stats ParseStats
+			// Deliberate read failure after one complete CRLF record; this is
+			// an I/O error control, not evidence about a live filesystem.
+			reader := io.MultiReader(strings.NewReader(input+"\r\n"), iotest.ErrReader(io.ErrUnexpectedEOF))
+			issues, err := parseReaderFixture(reader, ParseOptions{Stats: &stats}, pooled)
+			if !errors.Is(err, io.ErrUnexpectedEOF) || err.Error() != "error reading issues stream at line 2: unexpected EOF" || issues != nil || stats != (ParseStats{Valid: 1}) {
+				t.Fatalf("read failure lost error/line/accounting: issues=%d stats=%+v error=%v", len(issues), stats, err)
+			}
+			empty, err := parseReaderFixture(strings.NewReader(""), ParseOptions{}, pooled)
+			if err != nil || empty != nil {
+				t.Fatalf("empty parse after error = %#v, %v; want nil result", empty, err)
+			}
+			stats = ParseStats{}
+			issues, err = parseReaderFixture(strings.NewReader(input), ParseOptions{Stats: &stats}, pooled)
+			if err != nil || len(issues) != 1 || !reflect.DeepEqual(issues[0], want) || stats != (ParseStats{Valid: 1}) {
+				t.Fatalf("read error poisoned later parse: issues=%d stats=%+v error=%v", len(issues), stats, err)
+			}
+		})
+	}
 }

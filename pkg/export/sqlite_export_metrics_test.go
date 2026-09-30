@@ -165,11 +165,72 @@ func TestSQLiteExporter_InsertsMetricsAndTriageRecommendations(t *testing.T) {
 	}
 }
 
-// TestSQLiteExporter_ResolvedBlockerExcludedFromCounts is a regression test
-// for bv-issue#143/#144: closing a blocker must drop its dependents'
-// blocked_by_count to 0 so the materialized view stops surfacing them as
-// blocked, keeping the issues view, the graph view's effective coloring,
-// and the blocked_by_ids list aligned.
+// Exported ID lists must agree with counts for every blocking type and both
+// endpoint lifecycles; raw informational relationships still survive export.
+func TestSQLiteExporter_BlockingVocabularyMatchesOverview(t *testing.T) {
+	for _, edge := range []struct {
+		kind     model.DependencyType
+		blocking bool
+	}{{"", true}, {model.DepBlocks, true}, {model.DepConditionalBlocks, true}, {model.DepWaitsFor, true},
+		{model.DepRelated, false}, {model.DepParentChild, false}, {"relates-to", false}, {"team-reference", false}} {
+		for _, state := range []struct {
+			name               string
+			blocker, dependent model.Status
+			active             bool
+		}{{"active", model.StatusOpen, model.StatusOpen, true},
+			{"closed-blocker", model.StatusClosed, model.StatusOpen, false},
+			{"tombstone-blocker", model.StatusTombstone, model.StatusOpen, false},
+			{"closed-dependent", model.StatusOpen, model.StatusClosed, false},
+			{"tombstone-dependent", model.StatusOpen, model.StatusTombstone, false}} {
+			t.Run(string(edge.kind)+"/"+state.name, func(t *testing.T) {
+				issues := []*model.Issue{
+					makeTestIssue("blocker", "Prerequisite", state.blocker, 1, model.TypeTask),
+					makeTestIssue("dependent", "Dependent", state.dependent, 1, model.TypeTask),
+				}
+				deps := []*model.Dependency{{IssueID: "dependent", DependsOnID: "blocker", Type: edge.kind}}
+				issues[1].Dependencies = deps
+				stats := analysis.NewAnalyzer([]model.Issue{*issues[0], *issues[1]}).Analyze()
+				stats.WaitForPhase2()
+				out := t.TempDir()
+				if err := NewSQLiteExporter(issues, deps, &stats, nil).Export(out); err != nil {
+					t.Fatal(err)
+				}
+				db, err := sql.Open("sqlite", filepath.Join(out, "beads.sqlite3"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { db.Close() })
+				var kind string
+				if err := db.QueryRow(`SELECT type FROM dependencies`).Scan(&kind); err != nil || kind != string(edge.kind) {
+					t.Fatalf("raw relationship changed: kind=%q err=%v", kind, err)
+				}
+				want := 0
+				if edge.blocking && state.active {
+					want = 1
+				}
+				for _, endpoint := range []struct{ id, query, counterpart string }{
+					{"blocker", `SELECT dependent_count, blocks_ids FROM issue_overview_mv WHERE id = ?`, "dependent"},
+					{"dependent", `SELECT blocker_count, blocked_by_ids FROM issue_overview_mv WHERE id = ?`, "blocker"},
+				} {
+					var count int
+					var ids sql.NullString
+					if err := db.QueryRow(endpoint.query, endpoint.id).Scan(&count, &ids); err != nil {
+						t.Fatal(err)
+					}
+					wantIDs := ""
+					if want == 1 {
+						wantIDs = endpoint.counterpart
+					}
+					if count != want || ids.String != wantIDs {
+						t.Errorf("type=%q states=%s/%s endpoint=%s count=%d ids=%q; want count=%d ids=%q", edge.kind, state.blocker, state.dependent, endpoint.id, count, ids.String, want, wantIDs)
+					}
+				}
+			})
+		}
+	}
+}
+
+// Closing a blocker drops its dependent's count and active ID list together.
 func TestSQLiteExporter_ResolvedBlockerExcludedFromCounts(t *testing.T) {
 	now := time.Now().UTC()
 	issues := []*model.Issue{

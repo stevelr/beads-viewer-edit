@@ -111,7 +111,7 @@ func TestCurrentContext_Views(t *testing.T) {
 		},
 		{
 			name:     "attention view",
-			setup:    func(m *Model) { m.focused = focusInsights; m.showAttentionView = true },
+			setup:    func(m *Model) { m.focused = focusAttention },
 			expected: ContextAttention,
 		},
 		{

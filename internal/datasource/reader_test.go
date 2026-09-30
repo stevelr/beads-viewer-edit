@@ -1,9 +1,12 @@
 package datasource
 
 import (
+	"context"
 	"database/sql"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +19,156 @@ import (
 type readerFactory struct {
 	name  string
 	setup func(t *testing.T) IssueReader
+}
+
+func TestSQLiteLoadReportAccountsForReadLoss(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		extra      string
+		errors     int
+		readErrors int
+	}{
+		{"minimal_valid_without_optional_tables", "", 0, 0},
+		{"malformed_issue_row", `INSERT INTO issues VALUES ('bad', 'Unreadable priority', 'open', 'bad', NULL);`, 1, 0},
+		{"invalid_issue_row", `INSERT INTO issues VALUES ('bad', 'Empty status', '', 2, NULL);`, 1, 0},
+		{"malformed_dependency_row", `CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT); INSERT INTO dependencies VALUES ('safe', NULL, 'blocks');`, 0, 1},
+		{"malformed_dependency_table", `CREATE TABLE dependencies (issue_id TEXT, type TEXT);`, 0, 1},
+		{"legacy_dependency_without_type", `CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT); INSERT INTO dependencies VALUES ('safe', 'missing');`, 0, 0},
+		{"legacy_empty_dependency_type", `CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT); INSERT INTO dependencies VALUES ('safe', 'missing', '');`, 0, 0},
+		{"blank_dependency_type", `CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT); INSERT INTO dependencies VALUES ('safe', 'missing', '   ');`, 0, 1},
+		{"invalid_deferral", `UPDATE issues SET defer_until = 'not-a-time';`, 0, 1},
+		{"invalid_creation_time", `ALTER TABLE issues ADD COLUMN created_at TEXT; UPDATE issues SET created_at = 'not-a-time';`, 0, 1},
+		{"invalid_update_time", `ALTER TABLE issues ADD COLUMN updated_at TEXT; UPDATE issues SET updated_at = 'not-a-time';`, 0, 1},
+		{"reversed_issue_times", `ALTER TABLE issues ADD COLUMN created_at TEXT; ALTER TABLE issues ADD COLUMN updated_at TEXT; INSERT INTO issues VALUES ('bad', 'Reversed times', 'open', 2, NULL, '2026-01-02T00:00:00Z', '2026-01-01T00:00:00Z');`, 1, 0},
+		{"duplicate_issue_id", `INSERT INTO issues VALUES ('safe', 'Duplicate', 'open', 2, NULL);`, 1, 0},
+		{"malformed_label_row", `CREATE TABLE labels (issue_id TEXT, label TEXT); INSERT INTO labels VALUES ('safe', NULL);`, 0, 1},
+		{"malformed_label_json", `ALTER TABLE issues ADD COLUMN labels TEXT; UPDATE issues SET labels = '[invalid';`, 0, 1},
+		{"malformed_comments_table", `CREATE TABLE comments (issue_id TEXT, body TEXT);`, 0, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "beads.db")
+			db, err := sql.Open("sqlite", sqliteFileDSN(path, ""))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`CREATE TABLE issues (id TEXT, title TEXT, status TEXT, priority INTEGER, defer_until TEXT);
+INSERT INTO issues VALUES ('safe', 'Readable issue', 'open', 2, NULL);` + tc.extra); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := LoadFromSource(DataSource{Type: SourceTypeSQLite, Path: path})
+			if err != nil {
+				t.Fatalf("partial source must remain inspectable: %v", err)
+			}
+			if len(loaded.Issues) != 1 || loaded.Issues[0].ID != "safe" {
+				t.Fatalf("readable unique issue lost: %+v", loaded.Issues)
+			}
+			report := loaded.Report
+			if report.Valid != 1 || report.Errors != tc.errors || report.ReadErrors != tc.readErrors {
+				t.Fatalf("read-loss accounting = %+v; want valid=1 errors=%d read_errors=%d", report, tc.errors, tc.readErrors)
+			}
+			if report.WarningCount != tc.errors+tc.readErrors || len(report.Warnings) != report.WarningCount {
+				t.Fatalf("warning totals do not reconcile: %+v", report)
+			}
+			if strings.HasPrefix(tc.name, "legacy_") {
+				deps := loaded.Issues[0].Dependencies
+				if len(deps) != 1 || deps[0].DependsOnID != "missing" || !deps[0].Type.IsBlocking() {
+					t.Fatalf("legacy blocking edge was lost: %+v", deps)
+				}
+				if model.NewReadinessIndex(loaded.Issues).Ready("safe", time.Now()) {
+					t.Fatal("missing legacy blocker must withhold readiness")
+				}
+			}
+		})
+	}
+}
+
+// br permits custom workflow vocabulary. Loading it must preserve the source,
+// without treating a custom status as actionable or a blocking edge as related.
+func TestReaderPreservesBrWorkflowVocabulary(t *testing.T) {
+	for _, backend := range []string{"jsonl", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			dir := t.TempDir()
+			source := DataSource{Type: SourceTypeJSONLLocal, Path: filepath.Join(dir, "issues.jsonl")}
+			if backend == "jsonl" {
+				contents := `{"id":"custom","title":"Custom workflow","status":"qa-review","issue_type":"task"}
+{"id":"ready","title":"Ready work","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"custom","type":"relates-to"},{"depends_on_id":"absent","type":"team-reference"}]}
+{"id":"blocked","title":"Blocked work","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"custom","type":"conditional-blocks"}]}
+{"id":"waiting","title":"Waiting work","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"custom","type":"waits-for"}]}
+`
+				if err := os.WriteFile(source.Path, []byte(contents), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				source = DataSource{Type: SourceTypeSQLite, Path: filepath.Join(dir, "beads.db")}
+				db, err := sql.Open("sqlite", sqliteFileDSN(source.Path, ""))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { db.Close() })
+				if _, err := db.Exec(`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT, status TEXT, issue_type TEXT);
+CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT);
+INSERT INTO issues VALUES ('custom', 'Custom workflow', 'qa-review', 'task'), ('ready', 'Ready work', 'open', 'task'), ('blocked', 'Blocked work', 'open', 'task'), ('waiting', 'Waiting work', 'open', 'task');
+INSERT INTO dependencies VALUES ('ready', 'custom', 'relates-to'), ('ready', 'absent', 'team-reference'), ('blocked', 'custom', 'conditional-blocks'), ('waiting', 'custom', 'waits-for');`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			loaded, err := LoadFromSource(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(loaded.Issues) != 4 || loaded.Report.Valid != 4 || loaded.Report.Errors != 0 || loaded.Report.ReadErrors != 0 || loaded.Report.WarningCount != 0 {
+				t.Fatalf("valid br vocabulary lost source authority: issues=%+v report=%+v", loaded.Issues, loaded.Report)
+			}
+			byID := make(map[string]model.Issue)
+			for _, issue := range loaded.Issues {
+				byID[issue.ID] = issue
+			}
+			if byID["custom"].Status != "qa-review" {
+				t.Fatalf("custom status changed: %+v", byID["custom"])
+			}
+			wantEdges := map[string]map[string]model.DependencyType{
+				"ready":   {"custom": "relates-to", "absent": "team-reference"},
+				"blocked": {"custom": "conditional-blocks"},
+				"waiting": {"custom": "waits-for"},
+			}
+			for id, want := range wantEdges {
+				deps := byID[id].Dependencies
+				if len(deps) != len(want) {
+					t.Fatalf("%s lost edges: %+v", id, deps)
+				}
+				for _, dep := range deps {
+					if dep == nil || want[dep.DependsOnID] != dep.Type {
+						t.Fatalf("%s changed an edge: %+v", id, dep)
+					}
+				}
+			}
+			now := time.Now()
+			readiness := model.NewReadinessIndex(loaded.Issues)
+			if !readiness.Claimable("ready", now) {
+				t.Fatal("nonblocking references must allow the known ready issue")
+			}
+			for _, id := range []string{"custom", "blocked", "waiting"} {
+				if readiness.Ready(id, now) || readiness.Claimable(id, now) {
+					t.Fatalf("%s must not be offered as ready work", id)
+				}
+			}
+			// Completing the actual blocker must release both blocking variants.
+			for i := range loaded.Issues {
+				if loaded.Issues[i].ID == "custom" {
+					loaded.Issues[i].Status = model.StatusClosed
+				}
+			}
+			readiness = model.NewReadinessIndex(loaded.Issues)
+			for _, id := range []string{"blocked", "waiting"} {
+				if !readiness.Claimable(id, now) {
+					t.Fatalf("%s must become claimable after its blocker closes", id)
+				}
+			}
+		})
+	}
 }
 
 // readerFactories returns factories for every IssueReader backend under test.
@@ -76,6 +229,87 @@ func TestReaderContract_LoadIssues(t *testing.T) {
 			for _, want := range []string{"CTR-1", "CTR-2", "CTR-3"} {
 				if !ids[want] {
 					t.Errorf("missing issue %s", want)
+				}
+			}
+		})
+	}
+}
+
+func TestReaderContract_TombstonesRetainDependencyAuthority(t *testing.T) {
+	for _, backend := range []string{"jsonl", "sqlite-full", "sqlite-minimal"} {
+		t.Run(backend, func(t *testing.T) {
+			dir := t.TempDir()
+			source := DataSource{Type: SourceTypeJSONLLocal, Path: filepath.Join(dir, "issues.jsonl")}
+			if backend == "jsonl" {
+				contents := `{"id":"safe","title":"Safe","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"gone","type":"blocks"}]}
+{"id":"unknown","title":"Unknown","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"absent","type":"blocks"}]}
+{"id":"gone","title":"Deleted","status":"tombstone","issue_type":"task"}
+`
+				if err := os.WriteFile(source.Path, []byte(contents), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				source = DataSource{Type: SourceTypeSQLite, Path: filepath.Join(dir, "beads.db")}
+				if backend == "sqlite-full" {
+					createContractTestSQLiteDB(t, source.Path)
+				}
+				db, err := sql.Open("sqlite", sqliteFileDSN(source.Path, ""))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { db.Close() })
+				if backend == "sqlite-minimal" {
+					_, err = db.Exec(`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT, status TEXT, tombstone INTEGER);
+CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, dependency_type TEXT);`)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				_, err = db.Exec(`INSERT INTO issues (id, title, status, tombstone) VALUES
+('safe', 'Safe', 'open', 0), ('unknown', 'Unknown', 'open', 0), ('gone', 'Deleted', 'closed', 1);
+INSERT INTO dependencies VALUES ('safe', 'gone', 'blocks'), ('unknown', 'absent', 'blocks');`)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			reader, err := NewReader(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			visible, err := reader.LoadIssues()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, issue := range visible {
+				if issue.ID == "gone" {
+					t.Fatal("tombstone leaked into display rows")
+				}
+			}
+			report := reader.LoadReport()
+			if len(report.TombstoneIDs) != 1 || report.TombstoneIDs[0] != "gone" || report.Path != source.Path {
+				t.Fatalf("missing tombstone authority: %+v", report)
+			}
+			authority := append([]model.Issue(nil), visible...)
+			for _, id := range report.TombstoneIDs {
+				authority = append(authority, model.Issue{ID: id, Status: model.StatusTombstone})
+			}
+			index := model.NewReadinessIndex(authority)
+			if !index.Ready("safe", time.Now()) || index.Ready("unknown", time.Now()) {
+				t.Fatalf("tombstoned predecessor must be satisfied; missing predecessor must be unknown: safe=%s unknown=%s", index.DependencyState("safe"), index.DependencyState("unknown"))
+			}
+			report.TombstoneIDs[0] = "absent"
+			if reader.LoadReport().TombstoneIDs[0] != "gone" {
+				t.Fatal("caller mutated retained authority")
+			}
+			if backend != "jsonl" {
+				full, err := reader.(*SQLiteReader).LoadIssueAuthority()
+				if err != nil {
+					t.Fatal(err)
+				}
+				index = model.NewReadinessIndex(full)
+				if !index.Ready("safe", time.Now()) || index.Ready("unknown", time.Now()) {
+					t.Fatal("SQLite reload authority lost tombstone or fabricated missing record")
 				}
 			}
 		})
@@ -285,6 +519,50 @@ func TestSQLiteReader_EscapesURIControlCharsInPath(t *testing.T) {
 	}
 }
 
+func TestSQLiteReader_ConfiguresEveryPooledConnection(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "pool.db")
+	createContractTestSQLiteDB(t, dbPath)
+
+	r, err := NewSQLiteReader(DataSource{Type: SourceTypeSQLite, Path: dbPath})
+	if err != nil {
+		t.Fatalf("NewSQLiteReader: %v", err)
+	}
+	defer r.Close()
+
+	r.db.SetMaxOpenConns(2)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	first, err := r.db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("acquire first pooled connection: %v", err)
+	}
+	defer first.Close()
+	second, err := r.db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("acquire second pooled connection: %v", err)
+	}
+	defer second.Close()
+
+	for i, conn := range []*sql.Conn{first, second} {
+		var busyTimeout int
+		if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+			t.Fatalf("connection %d busy_timeout: %v", i+1, err)
+		}
+		if busyTimeout != 5000 {
+			t.Errorf("connection %d busy_timeout = %d, want 5000", i+1, busyTimeout)
+		}
+
+		var queryOnly int
+		if err := conn.QueryRowContext(ctx, "PRAGMA query_only").Scan(&queryOnly); err != nil {
+			t.Fatalf("connection %d query_only: %v", i+1, err)
+		}
+		if queryOnly != 1 {
+			t.Errorf("connection %d query_only = %d, want 1", i+1, queryOnly)
+		}
+	}
+}
+
 func TestSQLiteReader_FallbackSchemaLoadsGraphMetadata(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "export.db")
@@ -457,5 +735,108 @@ func createContractTestJSONL(t *testing.T, path string) {
 `
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// bv #198: url.URL{Scheme:"file", Path:p}.String() emits "file://" + p, so a
+// Windows drive path or a relative path put its first segment in the URI
+// authority slot and SQLite refused it with "invalid uri authority".
+func TestSQLiteURIPath(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	cases := []struct {
+		name    string
+		path    string
+		windows bool
+		want    string
+	}{
+		{
+			name:    "windows drive path",
+			path:    `E:\Shared\Workspaces\personal\wp-block-x\.beads\beads.db`,
+			windows: true,
+			want:    "/E:/Shared/Workspaces/personal/wp-block-x/.beads/beads.db",
+		},
+		{
+			name:    "windows drive path with forward slashes",
+			path:    "c:/repo/.beads/beads.db",
+			windows: true,
+			want:    "/c:/repo/.beads/beads.db",
+		},
+		{
+			name:    "windows UNC path",
+			path:    `\\server\share\repo\.beads\beads.db`,
+			windows: true,
+			want:    "//server/share/repo/.beads/beads.db",
+		},
+		{
+			name:    "posix absolute path unchanged",
+			path:    "/home/u/repo/.beads/beads.db",
+			windows: false,
+			want:    "/home/u/repo/.beads/beads.db",
+		},
+		{
+			name:    "posix path with URI control characters unchanged (escaped later by net/url)",
+			path:    "/home/u/odd?dir#x/beads.db",
+			windows: false,
+			want:    "/home/u/odd?dir#x/beads.db",
+		},
+		{
+			name:    "relative path is made absolute",
+			path:    filepath.Join(".beads", "beads.db"),
+			windows: false,
+			want:    filepath.Join(cwd, ".beads", "beads.db"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sqliteURIPath(tc.path, tc.windows); got != tc.want {
+				t.Fatalf("sqliteURIPath(%q, windows=%v) = %q, want %q", tc.path, tc.windows, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSQLiteFileDSN_WindowsDrivePathHasEmptyAuthority(t *testing.T) {
+	u := url.URL{
+		Scheme:   "file",
+		Path:     sqliteURIPath(`E:\Shared\Workspaces\personal\wp-block-x\.beads\beads.db`, true),
+		RawQuery: "mode=ro",
+	}
+	got := u.String()
+	want := "file:///E:/Shared/Workspaces/personal/wp-block-x/.beads/beads.db?mode=ro"
+	if got != want {
+		t.Fatalf("DSN = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "%5C") {
+		t.Fatalf("DSN still carries escaped backslashes: %q", got)
+	}
+}
+
+func TestSQLiteFileDSN_RelativePathIsRooted(t *testing.T) {
+	got := sqliteFileDSN(filepath.Join(".beads", "beads.db"), "mode=ro")
+	if !strings.HasPrefix(got, "file:///") {
+		t.Fatalf("relative path DSN must have an empty authority, got %q", got)
+	}
+}
+
+func TestSQLiteReader_OpensRelativePath(t *testing.T) {
+	dir := t.TempDir()
+	createContractTestSQLiteDB(t, filepath.Join(dir, "beads.db"))
+	t.Chdir(dir)
+
+	r, err := NewSQLiteReader(DataSource{Type: SourceTypeSQLite, Path: "beads.db"})
+	if err != nil {
+		t.Fatalf("NewSQLiteReader(relative path): %v", err)
+	}
+	defer r.Close()
+
+	issue, err := r.GetIssueByID("CTR-1")
+	if err != nil {
+		t.Fatalf("GetIssueByID: %v", err)
+	}
+	if issue.ID != "CTR-1" {
+		t.Fatalf("opened wrong SQLite database: got issue %q", issue.ID)
 	}
 }

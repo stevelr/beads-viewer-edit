@@ -17,21 +17,30 @@ jobs:
     timeout-minutes: 120  # 2 hour max to prevent runaway jobs
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
     - name: Set up Go
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
       with:
         go-version: '1.25.5'
 
     - name: Determine Fuzz Time
       id: fuzz-config
+      env:
+        # Pass the untrusted dispatch input via the environment (never string
+        # interpolation) so shell metacharacters cannot inject commands.
+        REQUESTED_FUZZ_TIME: ${{ github.event.inputs.fuzz_time }}
       run: |
         if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-          echo "fuzz_time=${{ github.event.inputs.fuzz_time }}" >> $GITHUB_OUTPUT
+          # Strict grammar: positive integer + s/m/h unit, bounded length.
+          if ! printf '%s' "$REQUESTED_FUZZ_TIME" | grep -Eq '^[1-9][0-9]{0,3}[smh]$'; then
+            echo "Invalid fuzz_time '$REQUESTED_FUZZ_TIME' (expected e.g. 30s, 10m, 1h)" >&2
+            exit 1
+          fi
+          echo "fuzz_time=$REQUESTED_FUZZ_TIME" >> "$GITHUB_OUTPUT"
         else
           # Nightly runs: 10 minutes per fuzz target
-          echo "fuzz_time=10m" >> $GITHUB_OUTPUT
+          echo "fuzz_time=10m" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Create Fuzz Results Directory
@@ -138,7 +147,7 @@ jobs:
         fi
 
     - name: Upload Fuzz Results
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       if: always()
       with:
         name: fuzz-results-${{ github.run_number }}
@@ -146,7 +155,7 @@ jobs:
         retention-days: 30
 
     - name: Upload Crashers (if any)
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       if: steps.crasher-check.outputs.has_crashers == 'true'
       with:
         name: fuzz-crashers-${{ github.run_number }}

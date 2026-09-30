@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -77,7 +78,7 @@ type DuplicatePair struct {
 // DetectDuplicates finds potential duplicate issues using keyword-based Jaccard similarity
 // Optimized with an inverted index for performance on large repositories.
 func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion {
-	if len(issues) < 2 {
+	if len(issues) < 2 || config.MaxSuggestions <= 0 {
 		return nil
 	}
 
@@ -154,9 +155,13 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 			// Reconstruct common keywords for display (only for passing pairs)
 			common := intersectKeywords(keywords[i], keywords[j])
 
+			issue1ID, issue2ID := issue1.ID, issue2.ID
+			if issue2ID < issue1ID {
+				issue1ID, issue2ID = issue2ID, issue1ID
+			}
 			pairs = append(pairs, DuplicatePair{
-				Issue1:     issue1.ID,
-				Issue2:     issue2.ID,
+				Issue1:     issue1ID,
+				Issue2:     issue2ID,
 				Similarity: similarity,
 				Method:     "jaccard",
 				Keywords:   common,
@@ -194,7 +199,7 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 
 		// Add action command if both are open
 		if !isClosedLikeDuplicateStatus(issue1.Status) && !isClosedLikeDuplicateStatus(issue2.Status) {
-			sug = sug.WithAction(fmt.Sprintf("br dep add %s %s --type=related", pair.Issue1, pair.Issue2))
+			sug = sug.withMutationAction(*issue1, model.MutationRelate, issue2, "")
 		}
 
 		suggestions = append(suggestions, sug)
@@ -260,7 +265,13 @@ func extractKeywords(title, description string) []string {
 // Uses sort.Slice for O(n log n) performance instead of bubble sort O(n²)
 func sortPairsBySimilarity(pairs []DuplicatePair) {
 	sort.Slice(pairs, func(i, j int) bool {
-		return pairs[i].Similarity > pairs[j].Similarity
+		if pairs[i].Similarity != pairs[j].Similarity {
+			return pairs[i].Similarity > pairs[j].Similarity
+		}
+		if pairs[i].Issue1 != pairs[j].Issue1 {
+			return pairs[i].Issue1 < pairs[j].Issue1
+		}
+		return pairs[i].Issue2 < pairs[j].Issue2
 	})
 }
 
@@ -275,6 +286,7 @@ func truncateStringSlice(s []string, max int) []string {
 // DuplicateDetector provides stateful duplicate detection with caching
 type DuplicateDetector struct {
 	config     DuplicateConfig
+	mu         sync.RWMutex
 	lastRun    time.Time
 	lastResult []Suggestion
 }
@@ -288,12 +300,18 @@ func NewDuplicateDetector(config DuplicateConfig) *DuplicateDetector {
 
 // Detect finds potential duplicates
 func (d *DuplicateDetector) Detect(issues []model.Issue) []Suggestion {
+	result := DetectDuplicates(issues, d.config)
+	d.mu.Lock()
 	d.lastRun = time.Now()
-	d.lastResult = DetectDuplicates(issues, d.config)
-	return d.lastResult
+	d.lastResult = result
+	d.mu.Unlock()
+	return result
 }
 
 // LastRun returns when detection was last performed
 func (d *DuplicateDetector) LastRun() time.Time {
-	return d.lastRun
+	d.mu.RLock()
+	lastRun := d.lastRun
+	d.mu.RUnlock()
+	return lastRun
 }

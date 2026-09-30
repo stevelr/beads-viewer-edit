@@ -10,7 +10,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 )
 
 func TestCacheKey_String(t *testing.T) {
@@ -655,6 +658,44 @@ func TestCachedCorrelator_DoesNotCacheWhenHeadChangesDuringGenerate(t *testing.T
 	}
 }
 
+func TestCachedCorrelator_XFetchUsesExpiry(t *testing.T) {
+	for _, maxAge := range []time.Duration{DefaultCacheMaxAge, 37 * time.Minute} {
+		t.Run(maxAge.String(), func(t *testing.T) {
+			correlator := NewCachedCorrelatorWithOptions(initTempGitRepo(t), maxAge, 10)
+			beads := []BeadInfo{{ID: "test-1", Status: "open"}}
+			opts := CorrelatorOptions{Limit: 10}
+			original, err := correlator.GenerateReport(beads, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			key, err := correlator.buildKey(beads, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			correlator.cache.PutWithDuration(key, original, time.Millisecond)
+			_, createdAt, _, ok := correlator.cache.GetWithMeta(key)
+			if !ok {
+				t.Fatal("expected writer-produced cache hit")
+			}
+			called := false
+			correlator.shouldRefreshFn = func(expiry time.Time, duration time.Duration, beta float64, now time.Time) bool {
+				called = true
+				if want := createdAt.Add(maxAge); !expiry.Equal(want) {
+					t.Errorf("XFetch expiry = %v, want %v", expiry, want)
+				}
+				if duration != time.Millisecond || beta != 1 || now.Before(createdAt) {
+					t.Errorf("invalid refresh metadata: duration=%v beta=%v now=%v", duration, beta, now)
+				}
+				return false
+			}
+			got, err := correlator.GenerateReport(beads, opts)
+			if err != nil || got != original || !called {
+				t.Fatalf("expected cached report and refresh decision: err=%v same=%v called=%v", err, got == original, called)
+			}
+		})
+	}
+}
+
 func TestCachedCorrelator_XFetchUsesClonedInputs(t *testing.T) {
 	repoPath := initTempGitRepo(t)
 	correlator := NewCachedCorrelator(repoPath)
@@ -727,103 +768,108 @@ func TestCachedCorrelator_XFetchUsesClonedInputs(t *testing.T) {
 
 func TestCachedCorrelator_SingleflightLogsSharedErrors(t *testing.T) {
 	repoPath := initTempGitRepo(t)
-	correlator := NewCachedCorrelator(repoPath)
-	beads := []BeadInfo{{ID: "test-1", Status: "open"}}
-	opts := CorrelatorOptions{Limit: 10}
+	synctest.Test(t, func(t *testing.T) {
+		correlator := NewCachedCorrelator(repoPath)
+		beads := []BeadInfo{{ID: "test-1", Status: "open"}}
+		opts := CorrelatorOptions{Limit: 10}
 
-	wantErr := errors.New("shared singleflight failure")
-	var calls atomic.Int32
-	var started atomic.Int32
-	generateStarted := make(chan struct{})
-	releaseGenerate := make(chan struct{})
+		wantErr := errors.New("shared singleflight failure")
+		var calls atomic.Int32
+		var started atomic.Int32
+		generateStarted := make(chan struct{})
+		releaseGenerate := make(chan struct{})
 
-	correlator.generateReportFn = func([]BeadInfo, CorrelatorOptions) (*HistoryReport, error) {
-		calls.Add(1)
+		correlator.generateReportFn = func([]BeadInfo, CorrelatorOptions) (*HistoryReport, error) {
+			calls.Add(1)
+			select {
+			case <-generateStarted:
+			default:
+				close(generateStarted)
+			}
+			<-releaseGenerate
+			return nil, wantErr
+		}
+
+		var logMu sync.Mutex
+		logs := make([]string, 0, 2)
+		originalLogf := correlationCacheLogf
+		correlationCacheLogf = func(format string, args ...any) {
+			logMu.Lock()
+			logs = append(logs, fmt.Sprintf(format, args...))
+			logMu.Unlock()
+		}
+		defer func() {
+			correlationCacheLogf = originalLogf
+		}()
+
+		const workers = 2
+		start := make(chan struct{})
+		var ready sync.WaitGroup
+		ready.Add(workers)
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		errCh := make(chan error, workers)
+
+		for i := 0; i < workers; i++ {
+			go func() {
+				defer wg.Done()
+				ready.Done()
+				<-start
+				started.Add(1)
+				_, err := correlator.GenerateReport(beads, opts)
+				errCh <- err
+			}()
+		}
+
+		ready.Wait()
+		close(start)
+
 		select {
 		case <-generateStarted:
-		default:
-			close(generateStarted)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for report generation to start")
 		}
-		<-releaseGenerate
-		return nil, wantErr
-	}
 
-	var logMu sync.Mutex
-	logs := make([]string, 0, 2)
-	originalLogf := correlationCacheLogf
-	correlationCacheLogf = func(format string, args ...any) {
+		deadline := time.Now().Add(2 * time.Second)
+		for started.Load() != workers {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for workers to start, got %d of %d", started.Load(), workers)
+			}
+			time.Sleep(time.Millisecond)
+		}
+
+		// Starting GenerateReport does not mean the caller has finished resolving
+		// Git HEAD or joined the flight. Wait for both callers to be blocked: the
+		// leader on releaseGenerate and the follower inside singleflight.
+		synctest.Wait()
+		close(releaseGenerate)
+		wg.Wait()
+		close(errCh)
+
+		for err := range errCh {
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("GenerateReport error = %v, want %v", err, wantErr)
+			}
+		}
+
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("underlying GenerateReport calls = %d, want 1", got)
+		}
+
 		logMu.Lock()
-		logs = append(logs, fmt.Sprintf(format, args...))
+		joinedLogs := strings.Join(logs, "\n")
+		logCount := len(logs)
 		logMu.Unlock()
-	}
-	defer func() {
-		correlationCacheLogf = originalLogf
-	}()
-
-	const workers = 2
-	start := make(chan struct{})
-	var ready sync.WaitGroup
-	ready.Add(workers)
-	var wg sync.WaitGroup
-	wg.Add(workers)
-	errCh := make(chan error, workers)
-
-	for i := 0; i < workers; i++ {
-		go func() {
-			defer wg.Done()
-			ready.Done()
-			<-start
-			started.Add(1)
-			_, err := correlator.GenerateReport(beads, opts)
-			errCh <- err
-		}()
-	}
-
-	ready.Wait()
-	close(start)
-
-	select {
-	case <-generateStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for report generation to start")
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for started.Load() != workers {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for workers to start, got %d of %d", started.Load(), workers)
+		if logCount == 0 {
+			t.Fatal("expected singleflight error to be logged")
 		}
-		time.Sleep(time.Millisecond)
-	}
-
-	time.Sleep(50 * time.Millisecond)
-	close(releaseGenerate)
-	wg.Wait()
-	close(errCh)
-
-	for err := range errCh {
-		if !errors.Is(err, wantErr) {
-			t.Fatalf("GenerateReport error = %v, want %v", err, wantErr)
+		if !strings.Contains(joinedLogs, "shared=true") {
+			t.Fatalf("expected shared singleflight error log, got %q", joinedLogs)
 		}
-	}
-
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("underlying GenerateReport calls = %d, want 1", got)
-	}
-
-	logMu.Lock()
-	joinedLogs := strings.Join(logs, "\n")
-	logCount := len(logs)
-	logMu.Unlock()
-	if logCount == 0 {
-		t.Fatal("expected singleflight error to be logged")
-	}
-	if !strings.Contains(joinedLogs, "shared=true") {
-		t.Fatalf("expected shared singleflight error log, got %q", joinedLogs)
-	}
-	if !strings.Contains(joinedLogs, wantErr.Error()) {
-		t.Fatalf("expected logged error %q, got %q", wantErr, joinedLogs)
-	}
+		if !strings.Contains(joinedLogs, wantErr.Error()) {
+			t.Fatalf("expected logged error %q, got %q", wantErr, joinedLogs)
+		}
+	})
 }
 
 func TestCachedCorrelator_XFetchRefreshLogsErrors(t *testing.T) {
@@ -997,5 +1043,73 @@ func TestHistoryCache_RemoveEntryOrdering(t *testing.T) {
 
 	if len(cache.order) != 0 {
 		t.Errorf("order after invalidate = %d, want 0", len(cache.order))
+	}
+}
+
+// TestCachedCorrelator_FeedbackFingerprintChangesCacheKey guards the C4 cache
+// contract: the git-walk artifact caches ignore feedback (it is applied at
+// assembly), but the in-memory report cache must key on the store so a fresh
+// decision is never answered with a pre-feedback report.
+func TestCachedCorrelator_FeedbackFingerprintChangesCacheKey(t *testing.T) {
+	repo := initTempGitRepo(t)
+	beads := []BeadInfo{{ID: "bv-1", Title: "one", Status: "open"}}
+	opts := CorrelatorOptions{Limit: 10}
+
+	c := NewCachedCorrelator(repo)
+	before, err := c.buildKey(beads, opts)
+	if err != nil {
+		t.Fatalf("buildKey without store: %v", err)
+	}
+	if before.Feedback != "" {
+		t.Fatalf("no store attached: key.Feedback should be empty, got %q", before.Feedback)
+	}
+
+	store := NewFeedbackStore(filepath.Join(repo, ".beads"))
+	if err := store.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	c.WithFeedbackStore(store)
+	empty, err := c.buildKey(beads, opts)
+	if err != nil {
+		t.Fatalf("buildKey with empty store: %v", err)
+	}
+	if err := store.Reject("abc123", "bv-1", "tester", 0.8, ""); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+	after, err := c.buildKey(beads, opts)
+	if err != nil {
+		t.Fatalf("buildKey after reject: %v", err)
+	}
+	if after.Feedback == "" || after.Feedback == empty.Feedback {
+		t.Fatalf("a new decision must change the key fingerprint: before=%q after=%q", empty.Feedback, after.Feedback)
+	}
+	if after.String() == empty.String() {
+		t.Fatalf("cache key string ignores feedback: %q", after.String())
+	}
+	if after.HeadSHA != before.HeadSHA || after.BeadsHash != before.BeadsHash || after.Options != before.Options {
+		t.Fatalf("feedback must not disturb the other key components: before=%+v after=%+v", before, after)
+	}
+}
+
+// TestMetrics_CorrelationCacheRecords (B5): the correlation report cache
+// feeds the correlation_cache counters: first report misses, the second hits.
+func TestMetrics_CorrelationCacheRecords(t *testing.T) {
+	metrics.SetEnabled(true)
+	repo := initTempGitRepo(t)
+	beads := []BeadInfo{{ID: "bv-1", Title: "one", Status: "open"}}
+	hitsBefore, missesBefore := metrics.CorrelationCache.Hits(), metrics.CorrelationCache.Misses()
+
+	c := NewCachedCorrelator(repo)
+	if _, err := c.GenerateReport(beads, CorrelatorOptions{Limit: 10}); err != nil {
+		t.Fatalf("first report: %v", err)
+	}
+	if _, err := c.GenerateReport(beads, CorrelatorOptions{Limit: 10}); err != nil {
+		t.Fatalf("second report: %v", err)
+	}
+	if got := metrics.CorrelationCache.Misses() - missesBefore; got < 1 {
+		t.Fatalf("correlation_cache misses did not increase (got %d)", got)
+	}
+	if got := metrics.CorrelationCache.Hits() - hitsBefore; got < 1 {
+		t.Fatalf("correlation_cache hits did not increase (got %d)", got)
 	}
 }

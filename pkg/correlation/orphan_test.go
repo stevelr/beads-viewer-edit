@@ -1,7 +1,11 @@
 package correlation
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 )
@@ -52,6 +56,86 @@ func TestNewOrphanDetector(t *testing.T) {
 	// Check that author -> beads mapping was built
 	if len(od.authorBeads["test@example.com"]) != 1 {
 		t.Errorf("Expected 1 bead for author, got %d", len(od.authorBeads["test@example.com"]))
+	}
+}
+
+func TestNewOrphanDetectorAtPinsOpenWindow(t *testing.T) {
+	pinned := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	claimed := pinned.Add(-48 * time.Hour)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-open": {
+			Title:      "Open work",
+			Status:     "in_progress",
+			Milestones: BeadMilestones{Claimed: &BeadEvent{Timestamp: claimed}},
+		},
+	}}
+
+	detector := NewOrphanDetectorAt(report, "", pinned)
+	window, ok := detector.beadWindows["bv-open"]
+	if !ok {
+		t.Fatal("open bead window missing")
+	}
+	if !window.End.Equal(pinned) {
+		t.Fatalf("open window end = %v, want %v", window.End, pinned)
+	}
+	if !detector.now.Equal(pinned) {
+		t.Fatalf("detector now = %v, want %v", detector.now, pinned)
+	}
+
+	zeroDetector := NewOrphanDetectorAt(report, "", time.Time{})
+	zeroWindow := zeroDetector.beadWindows["bv-open"]
+	if !zeroDetector.now.IsZero() || !zeroWindow.End.IsZero() {
+		t.Fatalf("zero instant was replaced: detector=%v window_end=%v", zeroDetector.now, zeroWindow.End)
+	}
+}
+
+func TestNewOrphanDetectorAtUsesReopenedWindowAndDataHash(t *testing.T) {
+	pinned := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	claimed := pinned.Add(-72 * time.Hour)
+	closed := pinned.Add(-48 * time.Hour)
+	reopened := pinned.Add(-24 * time.Hour)
+	report := &HistoryReport{DataHash: "source-hash", Histories: map[string]BeadHistory{
+		"bv-reopened": {
+			Status: " open ",
+			Milestones: BeadMilestones{
+				Claimed:  &BeadEvent{Timestamp: claimed},
+				Closed:   &BeadEvent{Timestamp: closed},
+				Reopened: &BeadEvent{Timestamp: reopened},
+			},
+		},
+	}}
+	detector := NewOrphanDetectorAt(report, "", pinned)
+	window := detector.beadWindows["bv-reopened"]
+	if !window.Start.Equal(reopened) || !window.End.Equal(pinned) {
+		t.Fatalf("reopened window=%v..%v, want %v..%v", window.Start, window.End, reopened, pinned)
+	}
+	if detector.dataHash != "source-hash" {
+		t.Fatalf("detector data hash=%q, want source-hash", detector.dataHash)
+	}
+}
+
+func TestScoreMentionedBeadRejectsAmbiguousCaseCollision(t *testing.T) {
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-AbCd": {BeadID: "bv-AbCd", Title: "First", Status: "open"},
+		"BV-aBcD": {BeadID: "BV-aBcD", Title: "Second", Status: "open"},
+	}}
+	detector := NewOrphanDetectorAt(report, "", time.Time{})
+
+	for _, mention := range []string{"bv-abcd", "bv-AbCd"} {
+		scores := make(map[string]*probableBeadBuilder)
+		detector.scoreMentionedBead(scores, mention)
+		if len(scores) != 0 {
+			t.Fatalf("ambiguous mention %q credited %+v", mention, scores)
+		}
+	}
+
+	unique := NewOrphanDetectorAt(&HistoryReport{Histories: map[string]BeadHistory{
+		"bv-AbCd": {BeadID: "bv-AbCd", Title: "Only", Status: "open"},
+	}}, "", time.Time{})
+	scores := make(map[string]*probableBeadBuilder)
+	unique.scoreMentionedBead(scores, "BV-ABCD")
+	if got := scores["bv-AbCd"]; got == nil || got.score != 35 {
+		t.Fatalf("unique case-insensitive match was not credited: %+v", scores)
 	}
 }
 
@@ -288,5 +372,126 @@ func TestOrphanDetector_CustomIDPatternMatchesProbableBead(t *testing.T) {
 	}
 	if !foundSignal {
 		t.Errorf("expected message signal from custom pattern, got %#v", candidate.Signals)
+	}
+}
+
+// TestOrphanDetector_WindowMatchesIndex (D4): orphan detection scans exactly
+// the commit window the correlation index was built from, reports it with
+// source "history_index" regardless of the options passed, skips beads-only
+// bookkeeping commits, and treats commits linked by any strategy (co-commit
+// or explicit bead id in the message) as correlated rather than orphaned.
+func TestOrphanDetector_WindowMatchesIndex(t *testing.T) {
+	repo := t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	runGit(t, repo, "init")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "user.name", "Test User")
+	jsonl := filepath.Join(beadsDir, "issues.jsonl")
+	writeBead := func(status string) {
+		t.Helper()
+		if err := os.WriteFile(jsonl, []byte(`{"id":"bv-1","title":"One","status":"`+status+`","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+			t.Fatalf("write issues.jsonl: %v", err)
+		}
+	}
+	writeCode := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	head := func() string {
+		t.Helper()
+		cmd := exec.Command("git", "rev-parse", "HEAD")
+		cmd.Dir = repo
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("rev-parse: %v", err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	writeBead("open") // 1: beads-only seed
+	runGit(t, repo, "add", ".beads/issues.jsonl")
+	runGit(t, repo, "commit", "-m", "seed tracker")
+
+	writeBead("in_progress") // 2: code + tracker in one commit (co-commit)
+	writeCode("a.go", "package a\n")
+	runGit(t, repo, "add", ".beads/issues.jsonl", "a.go")
+	runGit(t, repo, "commit", "-m", "start work")
+	coCommitSHA := head()
+
+	// 3: code only by a different author, so neither co-commit, explicit id
+	// nor temporal-author overlap can link it: the one true orphan.
+	writeCode("b.go", "package b\n")
+	runGit(t, repo, "add", "b.go")
+	otherAuthor := exec.Command("git", "commit", "-m", "wip: unrelated tidy-up")
+	otherAuthor.Dir = repo
+	otherAuthor.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=Other", "GIT_AUTHOR_EMAIL=other@example.com",
+		"GIT_COMMITTER_NAME=Other", "GIT_COMMITTER_EMAIL=other@example.com",
+	)
+	if out, err := otherAuthor.CombinedOutput(); err != nil {
+		t.Fatalf("commit as other author: %v\n%s", err, out)
+	}
+	orphanSHA := head()
+
+	writeBead("closed") // 4: beads-only bookkeeping (br sync)
+	runGit(t, repo, "add", ".beads/issues.jsonl")
+	runGit(t, repo, "commit", "-m", "chore: sync beads")
+
+	writeCode("c.go", "package c\n") // 5: code only but names the bead
+	runGit(t, repo, "add", "c.go")
+	runGit(t, repo, "commit", "-m", "fix(bv-1): follow-up")
+	explicitSHA := head()
+
+	beads := []BeadInfo{{ID: "bv-1", Title: "One", Status: "closed"}}
+	report, err := NewCorrelator(repo, jsonl).GenerateReport(beads, CorrelatorOptions{Limit: 500})
+	if err != nil {
+		t.Fatalf("GenerateReport: %v", err)
+	}
+	if report.Window == nil || report.Window.Commits != 5 {
+		t.Fatalf("report.Window=%+v; want the 5-commit walk recorded", report.Window)
+	}
+	if _, ok := report.CommitIndex[explicitSHA]; !ok {
+		t.Fatalf("explicit-id commit %s missing from the index (D1 strategy): %v", explicitSHA[:7], report.CommitIndex)
+	}
+
+	// Deliberately different options: the index window must win.
+	orphans, err := NewOrphanDetectorAt(report, repo, time.Now()).DetectOrphans(ExtractOptions{Limit: 2})
+	if err != nil {
+		t.Fatalf("DetectOrphans: %v", err)
+	}
+	t.Logf("window=%+v stats=%+v", orphans.Window, orphans.Stats)
+	if orphans.Window.Source != "history_index" || orphans.Window.Commits != 5 || orphans.Window.Limit != 500 {
+		t.Fatalf("orphan window=%+v; want source=history_index commits=5 limit=500", orphans.Window)
+	}
+	s := orphans.Stats
+	if s.BeadsOnlyCommits != 2 || s.TotalCommits != 3 || s.CorrelatedCount != 2 || s.OrphanCount != 1 {
+		t.Fatalf("stats=%+v; want beads_only=2 total=3 correlated=2 orphans=1", s)
+	}
+	if s.TotalCommits+s.BeadsOnlyCommits != orphans.Window.Commits {
+		t.Fatalf("total_commits+beads_only_commits=%d must equal window.commits=%d", s.TotalCommits+s.BeadsOnlyCommits, orphans.Window.Commits)
+	}
+	// Candidates are the scored subset of orphans; whatever scores, it can
+	// only ever be the unlinked commit.
+	for _, c := range orphans.Candidates {
+		if c.SHA != orphanSHA {
+			t.Fatalf("correlated commit %s reported as orphan candidate (orphan is %s)", c.SHA[:7], orphanSHA[:7])
+		}
+	}
+	if coCommitSHA == orphanSHA || explicitSHA == orphanSHA {
+		t.Fatalf("fixture SHAs collided")
+	}
+	var sawHint bool
+	for _, h := range orphans.UsageHints {
+		if strings.Contains(h, "beads_only_commits") {
+			sawHint = true
+		}
+	}
+	if !sawHint {
+		t.Fatalf("usage_hints should document beads_only_commits: %v", orphans.UsageHints)
 	}
 }

@@ -17,6 +17,127 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
+func TestComputeIssueFingerprintFrozenEncoding(t *testing.T) {
+	stamp := time.Date(2026, 1, 2, 3, 4, 5, 123456789, time.FixedZone("source", 3*60*60))
+	empty := ""
+	zero := 0
+	zeroTime := time.Time{}
+	issue := model.Issue{
+		ID: "日本語\x00id", Title: "title\x00suffix", Description: strings.Repeat("日本語 🚀 e\u0301\x00", 700),
+		Design: "design", AcceptanceCriteria: "criteria", Notes: "notes", Assignee: "agent", SourceRepo: "source",
+		ExternalRef: &empty, Status: model.StatusDeferred, IssueType: model.TypeTask, Priority: -3,
+		EstimatedMinutes: &zero, CreatedAt: stamp, UpdatedAt: stamp.Add(time.Second),
+		DueDate: &zeroTime, DeferUntil: &stamp, ClosedAt: &stamp,
+		CompactionLevel: 2, CompactedAt: &stamp, CompactedAtCommit: &empty, OriginalSize: 90000,
+		Labels:       []string{"z", "日本語", "a\x00b"},
+		Comments:     []*model.Comment{nil, {ID: "comment", IssueID: "日本語\x00id", Author: "author", Text: "text\x00日本語", CreatedAt: stamp}},
+		Dependencies: []*model.Dependency{nil, {IssueID: "日本語\x00id", DependsOnID: "other\x00id", Type: model.DepBlocks, CreatedAt: stamp, CreatedBy: "author"}},
+	}
+	cases := []struct {
+		name  string
+		issue model.Issue
+		want  analysis.IssueFingerprint
+	}{
+		{"full", issue, analysis.IssueFingerprint{ID: issue.ID, ContentHash: "409f52831c37769a082b292147e99152f3e29f24f1e395ec5f240b628d2d261c", DependencyHash: "b89e88e96400f10e7296f0319cfba764cb78245c27bc64b7bba291c4b3c752d3"}},
+		{"empty", model.Issue{ID: "empty"}, analysis.IssueFingerprint{ID: "empty", ContentHash: "015275e61fa0d0751c1d9f45541c7804c895404455470710ade3786f282f2da0", DependencyHash: "none"}},
+		{"present-empty", model.Issue{ID: "empty", ExternalRef: &empty, EstimatedMinutes: &zero, DueDate: &zeroTime}, analysis.IssueFingerprint{ID: "empty", ContentHash: "a0cc0a4c136fec7227b35a22316e2378b008333354da97463122196231c33b8f", DependencyHash: "none"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := analysis.ComputeIssueFingerprint(tc.issue); got != tc.want {
+				t.Fatalf("canonical fingerprint changed: got %#v want %#v", got, tc.want)
+			}
+		})
+	}
+
+	// Freeze the aggregate encoding too, including transitions from a long
+	// content/dependency digest to an empty issue and duplicate-ID ordering.
+	for _, tc := range []struct {
+		name   string
+		issues []model.Issue
+		want   string
+	}{
+		{"full", []model.Issue{cases[0].issue}, "353b785cb4435228d2432679d2ab999a79986b3faae1967919af4471fb8cbdc3"},
+		{"empty", []model.Issue{cases[1].issue}, "3468cdfcfb0298da8c7f4a442f2312449c131fdb822f11d2c50bb952fbede552"},
+		{"present-empty", []model.Issue{cases[2].issue}, "bc2a77f2da5867067daa54ae8ac7bfdcfa7e71fb48716464b14950a2f9418127"},
+		{"mixed", []model.Issue{cases[0].issue, cases[1].issue, cases[2].issue}, "a03a3dd4735909b3cd7f8deaac5324d1bb1ffd442a73d3b2225db9f0dd4a99b5"},
+		{"reversed-duplicates", []model.Issue{cases[2].issue, cases[0].issue, cases[1].issue}, "922ad9f2ae582c8638c34d7d64eb327c0867962894d07cd264a4642bf66c6954"},
+	} {
+		t.Run("aggregate/"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			before, err := json.Marshal(tc.issues)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := analysis.ComputeDataHash(tc.issues); got != tc.want {
+				t.Fatalf("canonical aggregate changed: got %s want %s", got, tc.want)
+			}
+			after, err := json.Marshal(tc.issues)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(before) != string(after) {
+				t.Fatal("fingerprinting changed caller-owned issue data")
+			}
+		})
+	}
+}
+
+func TestComputeDataHashAllocationBound(t *testing.T) {
+	issues := make([]model.Issue, 256)
+	for i := range issues {
+		issues[i] = model.Issue{ID: fmt.Sprint(i), Title: "allocation bound", Description: strings.Repeat("日本語\x00", 128)}
+	}
+	want := analysis.ComputeDataHash(issues)
+	allocs := testing.AllocsPerRun(5, func() {
+		if got := analysis.ComputeDataHash(issues); got != want {
+			t.Fatalf("repeated hash changed: got %s want %s", got, want)
+		}
+	})
+	t.Logf("256-issue aggregate: %.0f allocations", allocs)
+	// Allow four allocations per issue, including the aggregate's overhead.
+	// Recreating both the buffered writer and SHA state for every issue exceeds
+	// this bound even when the content itself is streamed without allocations.
+	if allocs > 4*float64(len(issues)) {
+		t.Fatalf("aggregate hashing allocated %.0f times; want at most %d", allocs, 4*len(issues))
+	}
+}
+
+func BenchmarkComputeDataHash(b *testing.B) {
+	for _, count := range []int{100, 10000} {
+		for _, dependencies := range []bool{false, true} {
+			b.Run(fmt.Sprintf("%d/dependencies=%t", count, dependencies), func(b *testing.B) {
+				issues := make([]model.Issue, count)
+				for i := range issues {
+					issues[i] = model.Issue{ID: fmt.Sprint(i), Title: "fingerprint benchmark", Description: strings.Repeat("日本語\x00", 128), Status: model.StatusOpen}
+					if dependencies && i > 0 {
+						issues[i].Dependencies = []*model.Dependency{{IssueID: issues[i].ID, DependsOnID: issues[i-1].ID, Type: model.DepBlocks}}
+					}
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					analysis.ComputeDataHash(issues)
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkComputeIssueFingerprintText(b *testing.B) {
+	for _, size := range []int{64, 512, 10000, 100000} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			issue := model.Issue{ID: "hash", Title: "Unicode fingerprint", Description: strings.Repeat("日本語🚀\x00", size/14+1), Status: model.StatusOpen}
+			b.ReportAllocs()
+			b.SetBytes(int64(len(issue.Description)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				analysis.ComputeIssueFingerprint(issue)
+			}
+		})
+	}
+}
+
 // robotCacheEntryPath mirrors the v3 per-entry disk-cache layout (issue #192):
 // one JSON file per key, named by the first 16 bytes of sha256(key), under
 // <cacheDir>/analysis_cache/.
@@ -49,6 +170,9 @@ func TestComputeDataHash_Deterministic(t *testing.T) {
 	if hash1 != hash2 {
 		t.Errorf("Hash should be deterministic: %s != %s", hash1, hash2)
 	}
+	if len(hash1) != sha256.Size*2 {
+		t.Errorf("Hash length = %d, want full SHA-256 hex length %d", len(hash1), sha256.Size*2)
+	}
 }
 
 func TestComputeDataHash_OrderIndependent(t *testing.T) {
@@ -66,6 +190,63 @@ func TestComputeDataHash_OrderIndependent(t *testing.T) {
 
 	if hash1 != hash2 {
 		t.Errorf("Hash should be order-independent: %s != %s", hash1, hash2)
+	}
+}
+
+func TestComputeDataHash_DuplicateIDOrderIsSemantic(t *testing.T) {
+	issues1 := []model.Issue{
+		{ID: "A", Title: "first"},
+		{ID: "A", Title: "second"},
+	}
+	issues2 := []model.Issue{issues1[1], issues1[0]}
+
+	if hash1, hash2 := analysis.ComputeDataHash(issues1), analysis.ComputeDataHash(issues2); hash1 == hash2 {
+		t.Fatalf("duplicate-ID reorder produced a false cache hit: %s", hash1)
+	}
+}
+
+func TestComputeDataHash_LengthPrefixesPreventEmbeddedNULCollision(t *testing.T) {
+	issues1 := []model.Issue{{ID: "A", Title: "a\x00b", Description: "c"}}
+	issues2 := []model.Issue{{ID: "A", Title: "a", Description: "b\x00c"}}
+
+	if hash1, hash2 := analysis.ComputeDataHash(issues1), analysis.ComputeDataHash(issues2); hash1 == hash2 {
+		t.Fatalf("structurally distinct embedded-NUL fields collided: %s", hash1)
+	}
+	fp1 := analysis.ComputeIssueFingerprint(issues1[0])
+	fp2 := analysis.ComputeIssueFingerprint(issues2[0])
+	if fp1.ContentHash == fp2.ContentHash {
+		t.Fatalf("content fingerprints collided across embedded-NUL field boundary: %s", fp1.ContentHash)
+	}
+}
+
+func TestComputeDataHash_CoversPointerPresenceAndCompactionFields(t *testing.T) {
+	empty := ""
+	zero := 0
+	zeroTime := time.Time{}
+	tests := []struct {
+		name   string
+		mutate func(*model.Issue)
+	}{
+		{name: "external ref presence", mutate: func(issue *model.Issue) { issue.ExternalRef = &empty }},
+		{name: "estimated minutes presence", mutate: func(issue *model.Issue) { issue.EstimatedMinutes = &zero }},
+		{name: "due date presence", mutate: func(issue *model.Issue) { issue.DueDate = &zeroTime }},
+		{name: "defer until presence", mutate: func(issue *model.Issue) { issue.DeferUntil = &zeroTime }},
+		{name: "closed at presence", mutate: func(issue *model.Issue) { issue.ClosedAt = &zeroTime }},
+		{name: "compaction level", mutate: func(issue *model.Issue) { issue.CompactionLevel = 1 }},
+		{name: "compacted at presence", mutate: func(issue *model.Issue) { issue.CompactedAt = &zeroTime }},
+		{name: "compacted commit presence", mutate: func(issue *model.Issue) { issue.CompactedAtCommit = &empty }},
+		{name: "original size", mutate: func(issue *model.Issue) { issue.OriginalSize = 1 }},
+	}
+
+	baseHash := analysis.ComputeDataHash([]model.Issue{{ID: "A"}})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issue := model.Issue{ID: "A"}
+			tt.mutate(&issue)
+			if got := analysis.ComputeDataHash([]model.Issue{issue}); got == baseHash {
+				t.Fatalf("field change did not change aggregate data hash %q", got)
+			}
+		})
 	}
 }
 
@@ -130,6 +311,59 @@ func TestCache_GetSet(t *testing.T) {
 	}
 	if cached != graphStats {
 		t.Error("Cached stats should match original")
+	}
+}
+
+func TestCacheRejectsCanceledPhase2AndAllowsLiveRetry(t *testing.T) {
+	t.Setenv("BV_ROBOT", "0")
+
+	cache := analysis.NewCache(5 * time.Minute)
+	issues := []model.Issue{
+		{
+			ID:           "outer-cache-cancel-dependent",
+			Status:       model.StatusOpen,
+			Dependencies: []*model.Dependency{{DependsOnID: "outer-cache-cancel-blocker", Type: model.DepBlocks}},
+		},
+		{ID: "outer-cache-cancel-blocker", Status: model.StatusOpen},
+	}
+	config := analysis.AnalysisConfig{
+		RunToCompletion: true,
+		ComputePageRank: true,
+	}
+
+	canceledAnalyzer := analysis.NewCachedAnalyzer(issues, cache)
+	canceledAnalyzer.SetConfig(&config)
+	canceledContext, cancel := context.WithCancel(context.Background())
+	cancel()
+	canceled := canceledAnalyzer.AnalyzeAsync(canceledContext)
+	canceled.WaitForPhase2()
+	if canceled.IsPhase2Ready() {
+		t.Fatal("canceled analysis unexpectedly published Phase 2")
+	}
+
+	// Exercise the public cache insertion guard deterministically as well as the
+	// CachedAnalyzer's asynchronous insertion attempt.
+	cacheKey := canceledAnalyzer.DataHash() + "|" + analysis.ComputeConfigHash(&config)
+	cache.SetByHash(cacheKey, canceled)
+	if _, ok := cache.GetByHash(cacheKey); ok {
+		t.Fatal("cache returned an incomplete Phase 2 result")
+	}
+	if _, _, hasData := cache.Stats(); hasData {
+		t.Fatal("cache stored an incomplete Phase 2 result")
+	}
+
+	liveAnalyzer := analysis.NewCachedAnalyzer(issues, cache)
+	liveAnalyzer.SetConfig(&config)
+	live := liveAnalyzer.AnalyzeAsync(context.Background())
+	if liveAnalyzer.WasCacheHit() || live == canceled {
+		t.Fatal("live retry reused canceled cache result")
+	}
+	live.WaitForPhase2()
+	if !live.IsPhase2Ready() {
+		t.Fatal("live retry did not complete Phase 2")
+	}
+	if len(live.PageRank()) != len(issues) {
+		t.Fatalf("live retry PageRank has %d entries, want %d", len(live.PageRank()), len(issues))
 	}
 }
 
@@ -372,6 +606,20 @@ func TestComputeIssueFingerprint_NilDependenciesIgnored(t *testing.T) {
 	}
 }
 
+func TestComputeIssueFingerprint_IncludesNestedIssueIDs(t *testing.T) {
+	commentA := model.Issue{ID: "A", Comments: []*model.Comment{{ID: "comment", IssueID: "A"}}}
+	commentB := model.Issue{ID: "A", Comments: []*model.Comment{{ID: "comment", IssueID: "B"}}}
+	if a, b := analysis.ComputeIssueFingerprint(commentA), analysis.ComputeIssueFingerprint(commentB); a.ContentHash == b.ContentHash {
+		t.Fatalf("comment IssueID change did not change content hash %q", a.ContentHash)
+	}
+
+	dependencyA := model.Issue{ID: "A", Dependencies: []*model.Dependency{{IssueID: "A", DependsOnID: "B"}}}
+	dependencyB := model.Issue{ID: "A", Dependencies: []*model.Dependency{{IssueID: "C", DependsOnID: "B"}}}
+	if a, b := analysis.ComputeIssueFingerprint(dependencyA), analysis.ComputeIssueFingerprint(dependencyB); a.DependencyHash == b.DependencyHash {
+		t.Fatalf("dependency IssueID change did not change dependency hash %q", a.DependencyHash)
+	}
+}
+
 func TestComputeIssueFingerprint_PointerPresenceChangesContentHash(t *testing.T) {
 	empty := ""
 	zero := 0
@@ -502,6 +750,52 @@ func TestComputeIssueDiff_ContentAndDependencyChange(t *testing.T) {
 	}
 }
 
+func TestComputeIssueDiff_DuplicateIDsForceFullRebuild(t *testing.T) {
+	tests := []struct {
+		name string
+		old  []model.Issue
+		new  []model.Issue
+	}{
+		{
+			name: "duplicate added",
+			old:  []model.Issue{{ID: "A", Title: "old"}},
+			new: []model.Issue{
+				{ID: "A", Title: "old"},
+				{ID: "B", Title: "first"},
+				{ID: "B", Title: "second"},
+			},
+		},
+		{
+			name: "duplicate removed",
+			old: []model.Issue{
+				{ID: "A", Title: "old"},
+				{ID: "A", Title: "shadow"},
+			},
+			new: []model.Issue{{ID: "A", Title: "old"}},
+		},
+		{
+			name: "duplicate unchanged",
+			old: []model.Issue{
+				{ID: "A", Title: "first"},
+				{ID: "A", Title: "second"},
+			},
+			new: []model.Issue{
+				{ID: "A", Title: "first"},
+				{ID: "A", Title: "second"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			diff := analysis.ComputeIssueDiff(tt.old, tt.new)
+			if !diff.HasDuplicateIDs {
+				t.Fatalf("duplicate IDs were not reported: %#v", diff)
+			}
+		})
+	}
+}
+
 func TestGlobalCache(t *testing.T) {
 	cache := analysis.GetGlobalCache()
 	if cache == nil {
@@ -564,8 +858,10 @@ func TestRobotDiskCache_WritesAndHits(t *testing.T) {
 	if err := json.Unmarshal(raw, &entry); err != nil {
 		t.Fatalf("parsing cache entry json: %v", err)
 	}
-	if entry.Version != 3 {
-		t.Fatalf("cache entry version: got %d, want %d", entry.Version, 3)
+	// Must track robotAnalysisDiskCacheVersion in cache.go (unexported; this is
+	// an external test package). Bumped to 5 with the SoA payload change.
+	if entry.Version != 5 {
+		t.Fatalf("cache entry version: got %d, want %d", entry.Version, 5)
 	}
 	if entry.Key != fullKey {
 		t.Fatalf("cache entry key: got %q, want %q", entry.Key, fullKey)
@@ -695,7 +991,7 @@ func TestRobotDiskCache_BeadsDBDirectoryUsesChildModTime(t *testing.T) {
 	}
 }
 
-func TestRobotDiskCache_XFetchRefreshRecomputes(t *testing.T) {
+func TestRobotDiskCache_ExpiredEntryRecomputes(t *testing.T) {
 	t.Setenv("BV_ROBOT", "1")
 	cacheDir := t.TempDir()
 	t.Setenv("BV_CACHE_DIR", cacheDir)
@@ -731,10 +1027,9 @@ func TestRobotDiskCache_XFetchRefreshRecomputes(t *testing.T) {
 	}
 
 	entry := readEntry()
-	// A year-old CreatedAt would trip the max-age prune, which reaps the entry
-	// instead of serving it; XFetch needs a *served* entry whose refresh window
-	// has certainly elapsed, so age it one hour with a 1ms compute duration.
-	staleCreatedAt := time.Now().Add(-time.Hour).UTC()
+	// The cache TTL is 24 hours. A one-hour-old entry is still fresh; age it
+	// past its actual expiry to require recomputation independently of RNG.
+	staleCreatedAt := time.Now().Add(-25 * time.Hour).UTC()
 	createdAtRaw, err := json.Marshal(staleCreatedAt)
 	if err != nil {
 		t.Fatalf("marshalling stale timestamp: %v", err)
@@ -754,8 +1049,6 @@ func TestRobotDiskCache_XFetchRefreshRecomputes(t *testing.T) {
 		t.Fatalf("writing cache entry file: %v", err)
 	}
 
-	time.Sleep(10 * time.Millisecond)
-
 	an2 := analysis.NewAnalyzer(issues)
 	stats2 := an2.AnalyzeAsyncWithConfig(context.Background(), config)
 	stats2.WaitForPhase2()
@@ -774,7 +1067,7 @@ func TestRobotDiskCache_XFetchRefreshRecomputes(t *testing.T) {
 		t.Fatalf("parsing refreshed cache entry json: %v", err)
 	}
 	if !refreshed.CreatedAt.After(staleCreatedAt) {
-		t.Fatalf("expected xfetch refresh to rewrite CreatedAt, got %v", refreshed.CreatedAt)
+		t.Fatalf("expected expired entry to rewrite CreatedAt, got %v", refreshed.CreatedAt)
 	}
 }
 

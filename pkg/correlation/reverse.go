@@ -2,8 +2,6 @@
 package correlation
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"sort"
@@ -228,44 +226,92 @@ type OrphanCommit struct {
 	Author      string    `json:"author"`
 	AuthorEmail string    `json:"author_email"`
 	Timestamp   time.Time `json:"timestamp"`
+	Files       []string  `json:"files,omitempty"` // Changed paths outside excluded dirs, from the walk
+}
+
+// OrphanWindow states which commits orphan detection considered: the same
+// bounded non-merge walk the explicit-ID and temporal strategies correlate
+// against (Source "history_index" when taken from the history report's
+// window, "options" when the caller supplied its own bounds). Commits counts
+// every walked commit, beads-only bookkeeping commits included; OrphanStats
+// counts only the code commits among them.
+type OrphanWindow struct {
+	Revision string     `json:"revision,omitempty"`
+	Commits  int        `json:"commits"`
+	Limit    int        `json:"limit"`
+	Since    *time.Time `json:"since,omitempty"`
+	Until    *time.Time `json:"until,omitempty"`
+	Source   string     `json:"source"`
 }
 
 // OrphanStats provides statistics about orphan commits.
 type OrphanStats struct {
-	TotalCommits   int     `json:"total_commits"`      // All code commits in period
-	OrphanCommits  int     `json:"orphan_commits"`     // Commits with no bead
-	CorrelatedCmts int     `json:"correlated_commits"` // Commits with at least one bead
-	OrphanRatio    float64 `json:"orphan_ratio"`       // orphan / total
+	TotalCommits     int          `json:"total_commits"`      // All code commits in period
+	OrphanCommits    int          `json:"orphan_commits"`     // Commits with no bead
+	CorrelatedCmts   int          `json:"correlated_commits"` // Commits with at least one bead
+	BeadsOnlyCommits int          `json:"beads_only_commits"` // Window commits that changed nothing outside .beads/ (skipped)
+	OrphanRatio      float64      `json:"orphan_ratio"`       // orphan / total
+	Window           OrphanWindow `json:"window"`             // Commit window scanned
 }
 
-// FindOrphanCommits finds commits that don't correlate to any bead.
+// FindOrphanCommits finds commits that don't correlate to any bead. It scans
+// exactly the window walkCommits defines for opts (the correlation index's
+// window when the caller passes the report's HistoryWindow bounds) and
+// ignores commits that changed nothing outside .beads/.
 func (rl *ReverseLookup) FindOrphanCommits(opts ExtractOptions) ([]OrphanCommit, *OrphanStats, error) {
 	if rl.repoPath == "" {
 		return nil, nil, fmt.Errorf("no repo path configured for orphan detection")
 	}
 
-	// Get all code commits in the time range
-	allCommits, err := rl.getAllCodeCommits(opts)
+	walk, err := walkCommits(rl.ctx, rl.repoPath, opts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("getting code commits: %w", err)
 	}
 
-	// Find orphans
 	var orphans []OrphanCommit
+	total := 0
 	correlated := 0
-
-	for _, commit := range allCommits {
-		if _, ok := rl.index[commit.SHA]; ok {
+	beadsOnly := 0
+	for _, wc := range walk {
+		if wc.beadsOnly() {
+			beadsOnly++
+			continue
+		}
+		total++
+		if _, ok := rl.index[wc.SHA]; ok {
 			correlated++
 			continue
 		}
-		orphans = append(orphans, commit)
+		var files []string
+		for _, f := range wc.Files {
+			if !isExcludedPath(f) {
+				files = append(files, f)
+			}
+		}
+		orphans = append(orphans, OrphanCommit{
+			SHA:         wc.SHA,
+			ShortSHA:    shortSHA(wc.SHA),
+			Message:     wc.Subject,
+			Author:      wc.Author,
+			AuthorEmail: wc.AuthorEmail,
+			Timestamp:   wc.Timestamp,
+			Files:       files,
+		})
 	}
 
 	stats := &OrphanStats{
-		TotalCommits:   len(allCommits),
-		OrphanCommits:  len(orphans),
-		CorrelatedCmts: correlated,
+		TotalCommits:     total,
+		OrphanCommits:    len(orphans),
+		CorrelatedCmts:   correlated,
+		BeadsOnlyCommits: beadsOnly,
+		Window: OrphanWindow{
+			Revision: opts.Revision,
+			Commits:  len(walk),
+			Limit:    opts.Limit,
+			Since:    opts.Since,
+			Until:    opts.Until,
+			Source:   "options",
+		},
 	}
 
 	if stats.TotalCommits > 0 {
@@ -273,71 +319,6 @@ func (rl *ReverseLookup) FindOrphanCommits(opts ExtractOptions) ([]OrphanCommit,
 	}
 
 	return orphans, stats, nil
-}
-
-// getAllCodeCommits gets all code commits (excluding merge commits and beads-only changes).
-func (rl *ReverseLookup) getAllCodeCommits(opts ExtractOptions) ([]OrphanCommit, error) {
-	args := []string{
-		"log",
-		"--no-merges",
-		"--format=" + gitLogHeaderFormat,
-	}
-
-	// Add time filters
-	if opts.Since != nil {
-		args = append(args, fmt.Sprintf("--since=%s", opts.Since.Format(time.RFC3339)))
-	}
-	if opts.Until != nil {
-		args = append(args, fmt.Sprintf("--until=%s", opts.Until.Format(time.RFC3339)))
-	}
-	if opts.Limit > 0 {
-		args = append(args, fmt.Sprintf("-n%d", opts.Limit))
-	}
-
-	// Exclude beads-only commits
-	args = append(args, "--", ":(exclude).beads/*")
-
-	cmd := gitCommand(rl.ctx, args...)
-	cmd.Dir = rl.repoPath
-
-	out, err := cmd.Output()
-	if err != nil {
-		// Try without exclusion pattern (older git versions)
-		args = args[:len(args)-2]
-		cmd = gitCommand(rl.ctx, args...)
-		cmd.Dir = rl.repoPath
-		out, err = cmd.Output()
-		if err != nil {
-			return nil, fmt.Errorf("git log failed: %w", err)
-		}
-	}
-
-	var commits []OrphanCommit
-	scanner := bufio.NewScanner(bytes.NewReader(out))
-	buf := make([]byte, 64*1024)
-	scanner.Buffer(buf, gitLogMaxScanTokenSize)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-
-		info, err := parseCommitInfo(line)
-		if err != nil {
-			continue
-		}
-
-		commits = append(commits, OrphanCommit{
-			SHA:         info.SHA,
-			ShortSHA:    shortSHA(info.SHA),
-			Message:     info.Message,
-			Author:      info.Author,
-			AuthorEmail: info.AuthorEmail,
-			Timestamp:   info.Timestamp,
-		})
-	}
-
-	return commits, scanner.Err()
 }
 
 // GetCorrelatedCommitCount returns the number of commits that have at least one bead association.

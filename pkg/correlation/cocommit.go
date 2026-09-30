@@ -185,8 +185,9 @@ func excludePathspecArgs() []string {
 // other, matching the two existing parsers byte-for-byte. The same exclude
 // pathspecs are applied, so a commit whose diff is empty under the pathspec is
 // omitted from the stream — identical to `git show` printing nothing (verified)
-// and yielding an empty file list for that SHA.
-func (c *CoCommitExtractor) primeBatch(shas []string) {
+// and yielding an empty file list for that SHA. Either git-pass failure is
+// returned before any missing SHA is marked complete or cached.
+func (c *CoCommitExtractor) primeBatch(shas []string) error {
 	if c.fileCache == nil {
 		c.fileCache = make(map[string][]FileChange)
 		c.statCache = make(map[string]map[string]lineStats)
@@ -194,6 +195,7 @@ func (c *CoCommitExtractor) primeBatch(shas []string) {
 	}
 
 	want := make([]string, 0, len(shas))
+	wantSet := make(map[string]struct{}, len(shas))
 	for _, sha := range shas {
 		if sha == "" {
 			continue
@@ -201,11 +203,14 @@ func (c *CoCommitExtractor) primeBatch(shas []string) {
 		if _, done := c.batchedSHAs[sha]; done {
 			continue
 		}
-		c.batchedSHAs[sha] = struct{}{}
+		if _, queued := wantSet[sha]; queued {
+			continue
+		}
+		wantSet[sha] = struct{}{}
 		want = append(want, sha)
 	}
 	if len(want) == 0 {
-		return
+		return nil
 	}
 
 	// Persistent layer: a commit's (files, lineStats) is a pure function of
@@ -226,19 +231,27 @@ func (c *CoCommitExtractor) primeBatch(shas []string) {
 			if e, ok := disk[sha]; ok {
 				c.fileCache[sha] = e.Files
 				c.statCache[sha] = fromLineStatsMap(e.LineStats)
+				c.batchedSHAs[sha] = struct{}{}
 				continue
 			}
 			missing = append(missing, sha)
 		}
 	}
 	if len(missing) == 0 {
-		return
+		return nil
 	}
 
 	atomic.AddInt64(&coCommitFetchedSHAsCounter, int64(len(missing)))
 
-	files, ferr := c.batchFilesChanged(missing)
-	stats, serr := c.batchLineStats(missing)
+	files, err := c.batchFilesChanged(missing)
+	if err != nil {
+		return fmt.Errorf("batching co-commit name-status: %w", err)
+	}
+	stats, err := c.batchLineStats(missing)
+	if err != nil {
+		return fmt.Errorf("batching co-commit numstat: %w", err)
+	}
+
 	fresh := make(map[string]perCommitCoCommitEntry, len(missing))
 	now := time.Now().UTC()
 	for _, sha := range missing {
@@ -253,6 +266,7 @@ func (c *CoCommitExtractor) primeBatch(shas []string) {
 			s = map[string]lineStats{}
 		}
 		c.statCache[sha] = s
+		c.batchedSHAs[sha] = struct{}{}
 		fresh[sha] = perCommitCoCommitEntry{
 			CreatedAt: now,
 			Files:     files[sha],
@@ -261,16 +275,11 @@ func (c *CoCommitExtractor) primeBatch(shas []string) {
 	}
 	// Persist only the freshly fetched SHAs (no-rewrite-on-pure-hit: when every
 	// requested SHA was already on disk, missing is empty and we returned above).
-	// CRITICAL: never persist when EITHER git pass failed — a transient git error
-	// (concurrent gc, OOM-killed subprocess, lock contention) would otherwise write
-	// definitive "empty diff" entries that are served as cache hits for 30 days,
-	// permanently dropping those commits' co-commit correlations. On failure the
-	// in-memory maps still degrade to empty for THIS run (matching the legacy
-	// per-commit path, which skipped the commit for the run), but disk stays clean
-	// so the next process retries.
-	if ferr == nil && serr == nil {
-		storePerCommitCoCommit(namespace, fresh)
-	}
+	// Both git passes succeeded before any missing SHA was memoized, so a transient
+	// failure can neither masquerade as an empty diff nor poison a higher-level
+	// history artifact/report cache.
+	storePerCommitCoCommit(namespace, fresh)
+	return nil
 }
 
 // batchLogArgs builds `git log --no-walk=unsorted <diffFlag> --format=<header>
@@ -647,7 +656,9 @@ func (c *CoCommitExtractor) ExtractAllCoCommits(events []BeadEvent) ([]Correlate
 		}
 		batchSHAs = append(batchSHAs, event.CommitSHA)
 	}
-	c.primeBatch(batchSHAs)
+	if err := c.primeBatch(batchSHAs); err != nil {
+		return nil, fmt.Errorf("priming co-commit batch: %w", err)
+	}
 
 	for _, event := range events {
 		// Only process status change events
@@ -661,8 +672,7 @@ func (c *CoCommitExtractor) ExtractAllCoCommits(events []BeadEvent) ([]Correlate
 			var err error
 			files, err = c.ExtractCoCommittedFiles(event)
 			if err != nil {
-				// Non-fatal: skip this commit
-				continue
+				return nil, fmt.Errorf("extracting co-committed files for %s: %w", event.CommitSHA, err)
 			}
 			fileCache[event.CommitSHA] = files
 		}

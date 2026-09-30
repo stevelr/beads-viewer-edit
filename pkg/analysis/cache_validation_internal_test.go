@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -12,6 +13,82 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+func TestRobotDiskCache_XFetchFreshEntryReused(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_NO_CACHE", "")
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+	t.Setenv("BEADS_DB", "")
+	t.Setenv("BEADS_DIR", filepath.Join(t.TempDir(), "missing-beads-dir"))
+	t.Setenv(EnvSourceDateEpoch, "")
+	t.Setenv(EnvSkipPhase2, "")
+	t.Setenv(EnvPhase2TimeoutSeconds, "")
+
+	issues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen},
+		{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "A", Type: model.DepBlocks},
+		}},
+	}
+	config := ConfigForSize(2, 1)
+	analyzer := NewAnalyzer(issues)
+	stats := analyzer.AnalyzeAsyncWithConfig(context.Background(), config)
+	stats.WaitForPhase2()
+	key := analyzer.DataHash() + "|" + ComputeConfigHash(&config)
+	dir, err := robotAnalysisDiskCacheDir(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, robotAnalysisEntryFileName(key))
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read writer-produced entry: %v", err)
+	}
+	var entry robotAnalysisDiskCacheEntry
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		t.Fatal(err)
+	}
+	// A minute-old entry with a 24-hour TTL and a 1ns regeneration time is
+	// nowhere near expiry. The old creation-time formula always refreshed it.
+	entry.CreatedAt = time.Now().Add(-time.Minute).UTC()
+	entry.ComputeDuration = time.Nanosecond
+	raw, err = json.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, refresh, hit := getRobotDiskCachedStats(key)
+	if !hit || got == nil || !got.IsPhase2Ready() {
+		t.Fatalf("writer-produced entry must hit: hit=%v stats=%p", hit, got)
+	}
+	if refresh {
+		t.Error("fresh 24-hour entry requested a refresh after only one minute")
+	}
+	second := NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	second.WaitForPhase2()
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, after) {
+		t.Error("fresh cache entry was recomputed and rewritten")
+	}
+
+	// At exactly the TTL boundary the entry is still a valid hit, but XFetch
+	// must ask for recomputation. One nanosecond later the normal TTL check
+	// rejects it. A fixed read clock exercises both paths without sleeping.
+	expiry := entry.CreatedAt.Add(robotAnalysisDiskCacheMaxAge)
+	got, refresh, hit = getRobotDiskCachedStatsWithClock(key, func() time.Time { return expiry })
+	if !hit || got == nil || !refresh {
+		t.Fatalf("at expiry: hit=%v stats=%p refresh=%v", hit, got, refresh)
+	}
+	got, refresh, hit = getRobotDiskCachedStatsWithClock(key, func() time.Time { return expiry.Add(time.Nanosecond) })
+	if hit || got != nil || refresh {
+		t.Fatalf("after expiry: hit=%v stats=%p refresh=%v", hit, got, refresh)
+	}
+}
 
 // Issue #192: cache validation must stay O(top-level entries). Journals and
 // snapshots under .beads/ subdirectories (.br_history/, .br_recovery/, …) can
@@ -67,6 +144,55 @@ func TestBeadsTreeModTime_OnlyConsultsTopLevelFiles(t *testing.T) {
 	}
 	if got := beadsTreeModTime(beadsDir); !got.Equal(newer) {
 		t.Fatalf("after in-place rewrite beadsTreeModTime = %v, want %v", got, newer)
+	}
+}
+
+func TestMemoryCachesRejectFutureTimestamps(t *testing.T) {
+	stats := NewGraphStatsForTest(nil, nil, nil, nil, nil, nil, nil, nil, nil, 0, nil)
+	now := time.Now()
+
+	cache := NewCache(time.Minute)
+	cache.SetByHash("future", stats)
+	cache.mu.Lock()
+	cache.computedAt = now.Add(time.Hour)
+	cache.mu.Unlock()
+	if _, ok := cache.GetByHash("future"); ok {
+		t.Fatal("ordinary cache accepted a future-dated entry")
+	}
+
+	const key = "future-incremental-entry"
+	incrementalGraphStatsCacheMu.Lock()
+	incrementalGraphStatsCache[key] = incrementalGraphStatsCacheEntry{
+		stats:      stats,
+		insertedAt: now.Add(time.Hour),
+	}
+	incrementalGraphStatsCacheMu.Unlock()
+	if _, ok := getIncrementalGraphStatsCache(key); ok {
+		t.Fatal("incremental graph cache accepted a future-dated entry")
+	}
+}
+
+func TestMemoryCachesRejectIncompleteAnalysisStates(t *testing.T) {
+	for _, state := range []string{"timeout", ""} {
+		stats := NewGraphStatsForTest(nil, nil, nil, nil, nil, nil, nil, nil, nil, 0, nil)
+		stats.mu.Lock()
+		stats.status.PageRank = statusEntry{State: state}
+		stats.mu.Unlock()
+
+		key := "unusable-" + state
+		cache := NewCache(time.Minute)
+		cache.SetByHash(key, stats)
+		if _, ok := cache.GetByHash(key); ok {
+			t.Fatalf("ordinary cache returned analysis with metric state %q", state)
+		}
+		if _, _, hasData := cache.Stats(); hasData {
+			t.Fatalf("ordinary cache stored analysis with metric state %q", state)
+		}
+
+		putIncrementalGraphStatsCache(key, stats)
+		if _, ok := getIncrementalGraphStatsCache(key); ok {
+			t.Fatalf("incremental graph cache stored analysis with metric state %q", state)
+		}
 	}
 }
 
@@ -137,11 +263,51 @@ func TestRobotDiskCache_MissWithoutPruneDoesNotRewriteFile(t *testing.T) {
 	}
 }
 
+func TestRobotDiskCacheAcceptsWriterProducedSelfLoopDensityAboveOne(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_NO_CACHE", "")
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DB", beadsDir)
+
+	issues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "A", Type: model.DepBlocks},
+			{DependsOnID: "B", Type: model.DepBlocks},
+		}},
+		{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "A", Type: model.DepBlocks},
+		}},
+	}
+	config := ConfigForSize(2, 3)
+	config.DisableCache = false
+	config.PageRankTimeout = time.Second
+	analyzer := NewAnalyzer(issues)
+	stats := analyzer.AnalyzeAsyncWithConfig(context.Background(), config)
+	stats.WaitForPhase2()
+	if stats.Density != 1.5 {
+		t.Fatalf("writer density=%g, want 1.5 for three unique edges over two nodes", stats.Density)
+	}
+
+	key := analyzer.DataHash() + "|" + ComputeConfigHash(&config)
+	cached, _, hit := getRobotDiskCachedStats(key)
+	if !hit || cached == nil {
+		t.Fatalf("writer-produced self-loop entry was rejected: hit=%v stats=%p", hit, cached)
+	}
+	if cached.Density != stats.Density || cached.EdgeCount != 3 {
+		t.Fatalf("cached graph shape density=%g edges=%d, want density=%g edges=3", cached.Density, cached.EdgeCount, stats.Density)
+	}
+}
+
 // Expired entry files are reaped by the write path's prune (any repo's put
 // clears the shared dir), the legacy v2 single-file cache is retired, and a
 // direct lookup of an expired key reaps its own file.
 func TestRobotDiskCache_PutPrunesExpiredEntriesAndLegacyFile(t *testing.T) {
 	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_NO_CACHE", "")
 	cacheDir := t.TempDir()
 	t.Setenv("BV_CACHE_DIR", cacheDir)
 	beadsDir := filepath.Join(t.TempDir(), ".beads")
@@ -155,16 +321,33 @@ func TestRobotDiskCache_PutPrunesExpiredEntriesAndLegacyFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// An expired entry (valid v3 body; both body CreatedAt and file mtime old)
-	// and a legacy v2 single-file cache.
-	const oldKey = "old|key"
+	// Start from a real writer-produced v3 entry, then age both its body and
+	// mtime. This keeps the key/config/result/status invariants valid so the
+	// direct-lookup assertion below genuinely reaches the expiry branch rather
+	// than passing because an independently corrupt fixture was reaped earlier.
+	oldIssues := []model.Issue{{ID: "OLD", Status: model.StatusOpen}}
+	oldConfig := ConfigForSize(1, 0)
+	oldConfig.DisableCache = false
+	oldConfig.ComputePageRank = true
+	oldConfig.PageRankTimeout = time.Second
+	oldAnalyzer := NewAnalyzer(oldIssues)
+	oldStats := oldAnalyzer.AnalyzeAsyncWithConfig(context.Background(), oldConfig)
+	oldStats.WaitForPhase2()
+	oldKey := oldAnalyzer.DataHash() + "|" + ComputeConfigHash(&oldConfig)
 	oldPath := filepath.Join(entryDir, robotAnalysisEntryFileName(oldKey))
-	oldEntry := robotAnalysisDiskCacheEntry{
-		Version:   robotAnalysisDiskCacheVersion,
-		Key:       oldKey,
-		CreatedAt: time.Now().Add(-2 * robotAnalysisDiskCacheMaxAge).UTC(),
+	raw, err := os.ReadFile(oldPath)
+	if err != nil {
+		t.Fatalf("read writer-produced cache entry: %v", err)
 	}
-	raw, err := json.Marshal(oldEntry)
+	var oldEntry robotAnalysisDiskCacheEntry
+	if err := json.Unmarshal(raw, &oldEntry); err != nil {
+		t.Fatalf("decode writer-produced cache entry: %v", err)
+	}
+	if got, _, hit := getRobotDiskCachedStats(oldKey); !hit || got == nil {
+		t.Fatalf("writer-produced control entry did not hit: hit=%v stats=%p", hit, got)
+	}
+	oldEntry.CreatedAt = time.Now().Add(-2 * robotAnalysisDiskCacheMaxAge).UTC()
+	raw, err = json.Marshal(oldEntry)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,8 +365,12 @@ func TestRobotDiskCache_PutPrunesExpiredEntriesAndLegacyFile(t *testing.T) {
 
 	// A put for unrelated data prunes the expired entry and retires the legacy file.
 	issues := []model.Issue{{ID: "FRESH", Status: model.StatusOpen}}
+	freshConfig := ConfigForSize(1, 0)
+	freshConfig.DisableCache = false
+	freshConfig.ComputePageRank = true
+	freshConfig.PageRankTimeout = time.Second
 	an := NewAnalyzer(issues)
-	stats := an.AnalyzeAsyncWithConfig(context.Background(), ConfigForSize(1, 0))
+	stats := an.AnalyzeAsyncWithConfig(context.Background(), freshConfig)
 	stats.WaitForPhase2()
 
 	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {

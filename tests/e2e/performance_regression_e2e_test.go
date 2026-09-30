@@ -2,14 +2,23 @@ package main_test
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"debug/buildinfo"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/testutil"
 )
 
 // Performance Regression Tests for bv-ut9x
@@ -27,8 +36,8 @@ const (
 	maxPlanLatencyMS         = 2000 // 2 seconds for plan
 	maxSmallDatasetLatencyMS = 1000 // 1 second for small datasets (<50 issues)
 
-	// Memory thresholds (not directly measurable in E2E, but latency correlates)
-	maxLargeDatasetLatencyMS = 5000 // 5 seconds for large datasets (1000 issues)
+	// A wall-time smoke bound, not a memory proxy or a tail-latency claim.
+	maxLargeDatasetLatencyMS = 5000
 )
 
 // =============================================================================
@@ -178,21 +187,730 @@ func TestPerf_LargeDatasetLatency(t *testing.T) {
 	}
 
 	bv := buildBvBinary(t)
-	env := t.TempDir()
-
-	createTestDataset(t, env, 500)
-
-	start := time.Now()
-	cmd := exec.Command(bv, "--robot-triage")
-	cmd.Dir = env
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("failed: %v", err)
+	for _, size := range []int{1000, 5000, 10000} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			dir := t.TempDir()
+			writePerformanceFixture(t, dir, "realistic", size)
+			output, elapsed := runPerformanceCLI(t, bv, dir, filepath.Join(dir, "cold-cache"), "smoke", "")
+			var result struct {
+				Triage struct {
+					Meta struct {
+						IssueCount int `json:"issue_count"`
+					} `json:"meta"`
+				} `json:"triage"`
+			}
+			if err := json.Unmarshal(output, &result); err != nil || result.Triage.Meta.IssueCount != size {
+				t.Fatalf("large fixture was not fully analyzed: count=%d want=%d, error=%v", result.Triage.Meta.IssueCount, size, err)
+			}
+			if _, err := performanceCLIBehavior(output); err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("large dataset (%d issues) cold application-cache latency: %v", size, elapsed)
+			if elapsed.Milliseconds() > maxLargeDatasetLatencyMS {
+				t.Errorf("large dataset too slow: %v > %dms threshold", elapsed, maxLargeDatasetLatencyMS)
+			}
+		})
 	}
-	elapsed := time.Since(start)
+}
 
-	t.Logf("large dataset (500 issues) latency: %v", elapsed)
-	if elapsed.Milliseconds() > maxLargeDatasetLatencyMS {
-		t.Errorf("large dataset too slow: %v > %dms threshold", elapsed, maxLargeDatasetLatencyMS)
+// TestParallelLoaderColdStartPreservesGraph exercises the decoder used by an
+// ordinary executable. go-json historically selected a different cache under
+// -race, and serial-before-parallel comparisons warmed that cache. Each child
+// below starts a new process with a large file as its first issue input. This
+// bounded cohort is future coverage, not a guarantee of reproducing every race
+// schedule; the observed production crash remains the original negative.
+func TestParallelLoaderColdStartPreservesGraph(t *testing.T) {
+	bv := buildBvBinary(t)
+	info, err := buildinfo.ReadFile(bv)
+	if err != nil {
+		t.Fatalf("read actual CLI build information: %v", err)
+	}
+	for _, setting := range info.Settings {
+		if setting.Key == "-race" && setting.Value != "false" {
+			t.Fatalf("cold decoder regression requires an ordinary non-race CLI: %+v", setting)
+		}
+		if setting.Key == "-tags" {
+			for _, tag := range strings.FieldsFunc(setting.Value, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+				if tag == "race" {
+					t.Fatal("explicit race build tag selects the wrong decoder implementation")
+				}
+			}
+		}
+	}
+	t.Logf("actual non-race CLI=%q go=%s", bv, info.GoVersion)
+
+	const issueCount, freshRuns = 2000, 8
+	type graphNode struct {
+		ID       string   `json:"id"`
+		Title    string   `json:"title"`
+		Status   string   `json:"status"`
+		Priority int      `json:"priority"`
+		Labels   []string `json:"labels"`
+	}
+	type graphEdge struct {
+		From string `json:"from"`
+		To   string `json:"to"`
+		Type string `json:"type"`
+	}
+	for _, kind := range []string{"issue-only", "explicit-type", "dependencies"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := t.TempDir()
+			beadsDir := filepath.Join(dir, ".beads")
+			if err := os.Mkdir(beadsDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			var data bytes.Buffer
+			encoder := json.NewEncoder(&data) // stdlib fixture encoding cannot warm a child decoder.
+			wantNodes := make([]graphNode, issueCount)
+			var wantEdges []graphEdge
+			for i := 0; i < issueCount; i++ {
+				id := fmt.Sprintf("cold-%04d", i)
+				node := graphNode{
+					ID: id, Title: fmt.Sprintf("Cold decode %04d α", i),
+					Status: []string{"open", "in_progress", "closed"}[i%3], Priority: i % 5,
+					Labels: []string{"cold", fmt.Sprintf("group-%d", i%7)},
+				}
+				wantNodes[i] = node
+				row := map[string]any{
+					"id": id, "title": node.Title, "status": node.Status, "priority": node.Priority,
+					"labels": node.Labels, "issue_type": "task",
+					"description": strings.Repeat("decoder padding ", 160),
+					"created_at":  "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+				}
+				if node.Status == "closed" {
+					row["closed_at"] = "2026-01-01T00:00:00Z"
+				}
+				if kind == "explicit-type" {
+					row["_type"] = "issue"
+				}
+				if kind == "dependencies" && i%2 == 1 {
+					target := fmt.Sprintf("cold-%04d", i-1)
+					edgeType := []string{"blocks", "related", "parent-child", "discovered-from"}[(i/2)%4]
+					dependency := map[string]any{
+						"issue_id": id, "type": edgeType,
+						"created_at": "2026-01-01T00:00:00Z", "created_by": "cold-start",
+					}
+					// All three accepted target spellings enter the custom dependency decoder.
+					dependency[[]string{"depends_on_id", "depends_on", "target_id"}[(i/2)%3]] = target
+					row["dependencies"] = []any{dependency}
+					wantEdges = append(wantEdges, graphEdge{From: id, To: target, Type: edgeType})
+				}
+				if err := encoder.Encode(row); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// These are the public loader's byte/line dispatch thresholds. Do not
+			// force an internal parser or warm a decoder before invoking the CLI.
+			if data.Len() <= 4<<20 || bytes.Count(data.Bytes(), []byte{'\n'}) != issueCount || issueCount <= 512 {
+				t.Fatalf("fixture does not reach parallel dispatch: bytes=%d rows=%d", data.Len(), issueCount)
+			}
+			path := filepath.Join(beadsDir, "issues.jsonl")
+			if err := os.WriteFile(path, data.Bytes(), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			inputHash := sha256.Sum256(data.Bytes())
+			for run := 0; run < freshRuns; run++ {
+				t.Run(fmt.Sprintf("fresh-%02d", run+1), func(t *testing.T) {
+					cache := t.TempDir()
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					cmd := exec.CommandContext(ctx, bv, "--robot-graph", "--graph-format=json", "--db", path)
+					cmd.Dir = dir
+					for _, value := range os.Environ() {
+						key, _, _ := strings.Cut(value, "=")
+						if !strings.HasPrefix(key, "BV_") && !strings.HasPrefix(key, "BEADS_") && !strings.HasPrefix(key, "BD_") && key != "SOURCE_DATE_EPOCH" {
+							cmd.Env = append(cmd.Env, value)
+						}
+					}
+					cmd.Env = append(cmd.Env, "BV_NO_BROWSER=1", "BV_TEST_MODE=1", "BV_NO_SAVED_CONFIG=1", "BV_CACHE_DIR="+cache)
+					var stderr bytes.Buffer
+					cmd.Stderr = &stderr
+					output, err := cmd.Output()
+					t.Logf("binary=%q argv=%q input_sha256=%x stdout_sha256=%x exit=%v stderr=%q", bv, cmd.Args[1:], inputHash, sha256.Sum256(output), err, stderr.String())
+					if err != nil || stderr.Len() != 0 {
+						t.Fatalf("fresh CLI failed: %v, deadline=%v\nstdout: %s\nstderr: %s", err, ctx.Err(), output, stderr.String())
+					}
+					var got struct {
+						Format          string         `json:"format"`
+						Nodes           int            `json:"nodes"`
+						Edges           int            `json:"edges"`
+						SourceAuthority map[string]any `json:"source_authority"`
+						Adjacency       struct {
+							Nodes []graphNode `json:"nodes"`
+							Edges []graphEdge `json:"edges"`
+						} `json:"adjacency"`
+					}
+					if err := json.Unmarshal(output, &got); err != nil {
+						t.Fatalf("invalid graph JSON: %v\n%s", err, output)
+					}
+					if got.Format != "json" || got.Nodes != issueCount || len(got.Adjacency.Nodes) != issueCount || got.Edges != len(wantEdges) || len(got.Adjacency.Edges) != len(wantEdges) {
+						t.Fatalf("incomplete graph: format=%s nodes=%d/%d edges=%d/%d, want %d nodes/%d edges", got.Format, got.Nodes, len(got.Adjacency.Nodes), got.Edges, len(got.Adjacency.Edges), issueCount, len(wantEdges))
+					}
+					for field, want := range map[string]any{
+						"state": "complete", "valid": float64(issueCount), "visible": float64(issueCount), "loaded": float64(1),
+						"failed": float64(0), "disabled": float64(0), "errors": float64(0), "skipped": float64(0),
+						"read_errors": float64(0), "tombstones": float64(0), "warning_count": float64(0),
+					} {
+						if value, exists := got.SourceAuthority[field]; !exists || value != want {
+							t.Fatalf("source accounting %s=%v (present=%v), want %v", field, value, exists, want)
+						}
+					}
+					// Graph export exposes these source fields, not description or
+					// timestamps. Check every row and edge against the fixture oracle.
+					for i, node := range got.Adjacency.Nodes {
+						want := wantNodes[i]
+						if node.ID != want.ID || node.Title != want.Title || node.Status != want.Status || node.Priority != want.Priority || len(node.Labels) != 2 || node.Labels[0] != want.Labels[0] || node.Labels[1] != want.Labels[1] {
+							t.Fatalf("node %d differs: got %+v, want %+v", i, node, want)
+						}
+					}
+					for i, edge := range got.Adjacency.Edges {
+						if edge != wantEdges[i] {
+							t.Fatalf("edge %d differs: got %+v, want %+v", i, edge, wantEdges[i])
+						}
+					}
+					after, err := os.ReadFile(path)
+					if err != nil || sha256.Sum256(after) != inputHash {
+						t.Fatalf("CLI changed the input fixture: %v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func writePerformanceFixture(t testing.TB, dir, kind string, size int) string {
+	t.Helper()
+	issues, err := testutil.PerformanceIssues(kind, size, 20260904)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var data bytes.Buffer
+	encoder := json.NewEncoder(&data)
+	for _, issue := range issues {
+		if err := encoder.Encode(issue); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "issues.jsonl"), data.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data.Bytes()))
+}
+
+func runPerformanceCLI(t testing.TB, binary, dir, cache, sample, epoch string) ([]byte, time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, "--robot-triage")
+	cmd.Dir = dir
+	// A pinned SOURCE_DATE_EPOCH runs metrics to completion. Removing it is
+	// essential here: production timeouts/degradation must remain observable.
+	for _, value := range os.Environ() {
+		key, _, _ := strings.Cut(value, "=")
+		if !strings.HasPrefix(key, "BV_") && !strings.HasPrefix(key, "BEADS_") && key != "SOURCE_DATE_EPOCH" && key != "GOMAXPROCS" {
+			cmd.Env = append(cmd.Env, value)
+		}
+	}
+	cmd.Env = append(cmd.Env, "BV_NO_BROWSER=1", "BV_TEST_MODE=1", "BV_NO_SAVED_CONFIG=1", "BEADS_DIR="+filepath.Join(dir, ".beads"), "BV_CACHE_DIR="+cache,
+		"GOMAXPROCS="+strconv.Itoa(runtime.GOMAXPROCS(0)))
+	if epoch != "" {
+		// Only the separate exact-result cohort supplies this. Its durations
+		// receive no latency credit because metrics run to completion.
+		cmd.Env = append(cmd.Env, "SOURCE_DATE_EPOCH="+epoch)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	started := time.Now()
+	output, err := cmd.Output()
+	elapsed := time.Since(started)
+	// Capture cancellation before artifact writes: slow filesystem operations
+	// must not make an earlier process failure look like a command timeout.
+	contextErr := ctx.Err()
+	// Retain actual stdout/stderr, including failures. Each sample has a unique
+	// name inside an isolated destination; the runner retains the directory.
+	for suffix, content := range map[string][]byte{"stdout.json": output, "stderr.log": stderr.Bytes()} {
+		path := filepath.Join(dir, sample+"."+suffix)
+		if filepath.IsAbs(sample) {
+			path = sample + "." + suffix
+		}
+		if writeErr := os.WriteFile(path, content, 0o600); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	}
+	if err != nil {
+		t.Fatalf("%s --robot-triage failed: %v (sample=%s, elapsed=%s, context_error=%v)\nstderr: %s\nstdout: %s",
+			binary, err, sample, elapsed, contextErr, stderr.String(), output)
+	}
+	return output, elapsed
+}
+
+// Compare the decision IDs in order, readiness/claim fields, source identity,
+// and every metric state/reason/sample. Raw outputs remain available for score
+// review; this projection does not claim bitwise floating-point score parity.
+func performanceCLIBehavior(output []byte) ([]byte, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(output, &envelope); err != nil {
+		return nil, fmt.Errorf("decode robot envelope: %w", err)
+	}
+	var triage map[string]json.RawMessage
+	if err := json.Unmarshal(envelope["triage"], &triage); err != nil {
+		return nil, fmt.Errorf("decode triage: %w", err)
+	}
+	states, err := testutil.PerformanceMetricStates(triage["status"])
+	if err != nil {
+		return nil, err
+	}
+	decision := map[string]any{"status": states, "data_hash": envelope["data_hash"], "authority_hash": envelope["authority_hash"], "source_authority": envelope["source_authority"], "commands": triage["commands"]}
+	for _, field := range []string{"recommendations", "quick_wins", "blockers_to_clear"} {
+		var rows []map[string]json.RawMessage
+		if err := json.Unmarshal(triage[field], &rows); err != nil {
+			return nil, fmt.Errorf("decode %s: %w", field, err)
+		}
+		projected := make([]map[string]json.RawMessage, 0, len(rows))
+		for _, row := range rows {
+			item := make(map[string]json.RawMessage)
+			for _, key := range []string{"id", "status", "claimable", "actionable", "claim_command", "unblocks_ids", "blocked_by"} {
+				if value, ok := row[key]; ok {
+					item[key] = value
+				}
+			}
+			if len(item["id"]) == 0 {
+				return nil, fmt.Errorf("%s entry has no ID", field)
+			}
+			projected = append(projected, item)
+		}
+		decision[field] = projected
+	}
+	var quick map[string]json.RawMessage
+	if err := json.Unmarshal(triage["quick_ref"], &quick); err != nil {
+		return nil, fmt.Errorf("decode quick_ref: %w", err)
+	}
+	var picks []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(quick["top_picks"], &picks); err != nil {
+		return nil, fmt.Errorf("decode top picks: %w", err)
+	}
+	decision["top_picks"] = picks
+	return json.Marshal(decision)
+}
+
+func TestPerformanceCLIParityControls(t *testing.T) {
+	dir := t.TempDir()
+	writePerformanceFixture(t, dir, "realistic", 20)
+	output, _ := runPerformanceCLI(t, buildBvBinary(t), dir, filepath.Join(dir, "cache"), "parity-control", "")
+	baseline, err := performanceCLIBehavior(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mutation := range []string{"reordered-ids", "skipped-metric", "missing-metric"} {
+		t.Run(mutation, func(t *testing.T) {
+			var envelope map[string]any
+			if err := json.Unmarshal(output, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			triage := envelope["triage"].(map[string]any)
+			status := triage["status"].(map[string]any)
+			switch mutation {
+			case "reordered-ids":
+				rows := triage["recommendations"].([]any)
+				if len(rows) < 2 {
+					t.Fatal("parity fixture must exercise at least two recommendations")
+				}
+				rows[0], rows[1] = rows[1], rows[0]
+			case "skipped-metric":
+				status["PageRank"] = map[string]any{"state": "skipped", "reason": "planted parity negative"}
+			case "missing-metric":
+				delete(status, "Cycles")
+			}
+			mutated, err := json.Marshal(envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			behavior, err := performanceCLIBehavior(mutated)
+			if mutation == "missing-metric" {
+				if err == nil {
+					t.Fatal("missing metric accepted as measured work")
+				}
+			} else if err != nil || bytes.Equal(behavior, baseline) {
+				t.Fatalf("%s did not change behavior parity: %v", mutation, err)
+			}
+		})
+	}
+}
+
+const performanceCLIReferenceEpoch = "1788220800" // 2026-09-01T00:00:00Z
+
+// Preserve the complete result, including exact JSON numbers and array order.
+// Only these named duration fields are excluded; new fields remain compared.
+func performanceCLIExactBehavior(output []byte) ([]byte, error) {
+	if _, err := performanceCLIBehavior(output); err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	decoder.UseNumber()
+	var envelope map[string]any
+	if err := decoder.Decode(&envelope); err != nil {
+		return nil, err
+	}
+	triage, ok := envelope["triage"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("missing full triage result")
+	}
+	meta, ok := triage["meta"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("missing full triage metadata")
+	}
+	const reference = "2026-09-01T00:00:00Z"
+	if envelope["generated_at"] != reference || meta["generated_at"] != reference {
+		return nil, fmt.Errorf("exact-result cohort did not preserve fixed clock: envelope=%v triage=%v", envelope["generated_at"], meta["generated_at"])
+	}
+	delete(meta, "compute_time_ms")
+	status := triage["status"].(map[string]any) // validated by performanceCLIBehavior
+	for _, name := range []string{"PageRank", "Betweenness", "Eigenvector", "HITS", "Critical", "Cycles", "KCore", "Articulation", "Slack"} {
+		delete(status[name].(map[string]any), "ms")
+	}
+	return json.Marshal(envelope)
+}
+
+func TestPerformanceCLIExactParityControls(t *testing.T) {
+	dir := t.TempDir()
+	writePerformanceFixture(t, dir, "realistic", 20)
+	binary := buildBvBinary(t)
+	output, _ := runPerformanceCLI(t, binary, dir, filepath.Join(dir, "cache"), "exact-cold", performanceCLIReferenceEpoch)
+	baseline, err := performanceCLIExactBehavior(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	warm, _ := runPerformanceCLI(t, binary, dir, filepath.Join(dir, "cache"), "exact-warm", performanceCLIReferenceEpoch)
+	behavior, err := performanceCLIExactBehavior(warm)
+	if err != nil || !bytes.Equal(behavior, baseline) {
+		t.Fatalf("actual fixed-clock cold/warm complete results differ: %v\ncold: %s\nwarm: %s", err, baseline, behavior)
+	}
+	for _, mutation := range []string{"elapsed-only", "score-ulp", "component-ulp", "reordered-ids", "skipped-metric", "missing-metric", "source-authority", "generated-at", "unknown-ms-field"} {
+		t.Run(mutation, func(t *testing.T) {
+			decoder := json.NewDecoder(bytes.NewReader(output))
+			decoder.UseNumber()
+			var envelope map[string]any
+			if err := decoder.Decode(&envelope); err != nil {
+				t.Fatal(err)
+			}
+			triage := envelope["triage"].(map[string]any)
+			status := triage["status"].(map[string]any)
+			rows := triage["recommendations"].([]any)
+			if len(rows) < 2 {
+				t.Fatal("exact parity fixture must include multiple scored recommendations")
+			}
+			switch mutation {
+			case "elapsed-only":
+				triage["meta"].(map[string]any)["compute_time_ms"] = json.Number("987654321")
+				status["PageRank"].(map[string]any)["ms"] = json.Number("123456789.5")
+			case "score-ulp", "component-ulp":
+				row, field := rows[0].(map[string]any), "score"
+				if mutation == "component-ulp" {
+					row, field = row["breakdown"].(map[string]any), "pagerank"
+				}
+				number, err := row[field].(json.Number).Float64()
+				if err != nil {
+					t.Fatal(err)
+				}
+				row[field] = json.Number(strconv.FormatFloat(math.Nextafter(number, math.Inf(1)), 'g', -1, 64))
+			case "reordered-ids":
+				rows[0], rows[1] = rows[1], rows[0]
+			case "skipped-metric":
+				status["PageRank"] = map[string]any{"state": "skipped", "reason": "planted exact parity negative"}
+			case "missing-metric":
+				delete(status, "Cycles")
+			case "source-authority":
+				envelope["source_authority"].(map[string]any)["claim_safe"] = false
+			case "generated-at":
+				envelope["generated_at"] = "2001-01-01T00:00:00Z"
+			case "unknown-ms-field":
+				triage["future_result_ms"] = json.Number("17")
+			}
+			changed, err := json.Marshal(envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			behavior, err := performanceCLIExactBehavior(changed)
+			if mutation == "elapsed-only" {
+				if err != nil || !bytes.Equal(behavior, baseline) {
+					t.Fatalf("declared duration-only change altered exact parity: %v", err)
+				}
+			} else if err == nil && bytes.Equal(behavior, baseline) {
+				t.Fatalf("%s escaped complete-result comparison", mutation)
+			}
+		})
+	}
+}
+
+type performanceBinaryIdentity struct {
+	SHA256    string `json:"binary_sha256"`
+	GoVersion string `json:"go_version"`
+	GOOS      string `json:"goos"`
+	GOARCH    string `json:"goarch"`
+}
+
+func readPerformanceBinary(t testing.TB, binary string) performanceBinaryIdentity {
+	t.Helper()
+	file, err := os.Open(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.New()
+	_, hashErr := io.Copy(hash, file)
+	closeErr := file.Close()
+	if hashErr != nil || closeErr != nil {
+		t.Fatalf("hash measurement executable: %v; close: %v", hashErr, closeErr)
+	}
+	info, err := buildinfo.ReadFile(binary)
+	if err != nil {
+		t.Fatalf("read measured CLI toolchain: %v", err)
+	}
+	identity := performanceBinaryIdentity{SHA256: fmt.Sprintf("%x", hash.Sum(nil)), GoVersion: info.GoVersion}
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "GOOS":
+			identity.GOOS = setting.Value
+		case "GOARCH":
+			identity.GOARCH = setting.Value
+		}
+	}
+	if identity.GOOS == "" || identity.GOARCH == "" {
+		t.Fatal("measured CLI build info lacks GOOS/GOARCH")
+	}
+	return identity
+}
+
+// Exact semantic proof is separate from timed production-timeout cohorts.
+// Two repeats per side give 72 paired comparisons across 18 workloads and two
+// cache modes. The 144 invocations and 36 warmups earn no latency/SLO credit.
+func TestPerformanceCLIExactCohorts(t *testing.T) {
+	outDir := os.Getenv("BV_PERF_DIR")
+	if outDir == "" {
+		t.Skip("opt-in exact-result measurement: scripts/benchmark.sh latency")
+	}
+	binaries := [2]string{os.Getenv("BV_PERF_BASELINE_BINARY"), os.Getenv("BV_PERF_CURRENT_BINARY")}
+	if binaries[0] == "" || binaries[1] == "" {
+		t.Fatal("both BV_PERF_BASELINE_BINARY and BV_PERF_CURRENT_BINARY are required")
+	}
+	identities := [2]performanceBinaryIdentity{readPerformanceBinary(t, binaries[0]), readPerformanceBinary(t, binaries[1])}
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range testutil.PerformanceWorkloadNames() {
+		for _, size := range []int{1000, 5000, 10000} {
+			t.Run(fmt.Sprintf("%s/%d", kind, size), func(t *testing.T) {
+				for _, warm := range []bool{false, true} {
+					mode := "cold-application-cache"
+					if warm {
+						mode = "warm-application-cache"
+					}
+					t.Run(mode, func(t *testing.T) {
+						dir := filepath.Join(outDir, fmt.Sprintf("exact-%s-%d-%s", kind, size, mode))
+						if err := os.Mkdir(dir, 0o700); err != nil {
+							t.Fatal(err)
+						}
+						fixtureHash := writePerformanceFixture(t, dir, kind, size)
+						var outputs [2][]json.RawMessage
+						var expected []byte
+						var loadedIssues int
+						var mismatches []string
+						for repeat := 0; repeat < 2; repeat++ {
+							for position := 0; position < 2; position++ {
+								side := (repeat + position) % 2
+								cache := filepath.Join(dir, fmt.Sprintf("cache-side-%d", side))
+								if !warm {
+									cache += fmt.Sprintf("-cold-%d", repeat)
+								}
+								if !warm || repeat == 0 {
+									if _, err := os.Stat(cache); !os.IsNotExist(err) {
+										t.Fatalf("fresh cache already exists or cannot be checked: %v", err)
+									}
+								}
+								if warm && repeat == 0 {
+									runPerformanceCLI(t, binaries[side], dir, cache, fmt.Sprintf("warmup-side-%d", side), performanceCLIReferenceEpoch)
+									entries, err := filepath.Glob(filepath.Join(cache, "*", "*.json"))
+									if err != nil || len(entries) == 0 {
+										t.Fatalf("exact warmup did not populate the analysis cache: %v", err)
+									}
+								}
+								name := fmt.Sprintf("repeat-%d-side-%d", repeat, side)
+								output, _ := runPerformanceCLI(t, binaries[side], dir, cache, name, performanceCLIReferenceEpoch)
+								behavior, err := performanceCLIExactBehavior(output)
+								if err != nil {
+									t.Fatalf("%s: %v", name, err)
+								}
+								var count struct {
+									Triage struct {
+										Meta struct {
+											IssueCount int `json:"issue_count"`
+										} `json:"meta"`
+									} `json:"triage"`
+								}
+								if err := json.Unmarshal(behavior, &count); err != nil || count.Triage.Meta.IssueCount != size {
+									t.Fatalf("%s: loaded_issues=%d want=%d: %v", name, count.Triage.Meta.IssueCount, size, err)
+								}
+								loadedIssues = count.Triage.Meta.IssueCount
+								outputs[side] = append(outputs[side], behavior)
+								if expected == nil {
+									expected = behavior
+								} else if !bytes.Equal(expected, behavior) {
+									mismatches = append(mismatches, name)
+								}
+							}
+						}
+						record := map[string]any{"workload": kind, "issues": size, "loaded_issues": loadedIssues,
+							"mode": mode, "seed": 20260904, "fixture_sha256": fixtureHash,
+							"host": host, "gomaxprocs": runtime.GOMAXPROCS(0), "binaries": identities,
+							"reference_epoch": performanceCLIReferenceEpoch, "outputs": outputs, "parity_mismatches": mismatches,
+							"interpretation": "complete fixed-clock JSON parity excluding named elapsed fields only; no latency credit"}
+						data, err := json.MarshalIndent(record, "", "  ")
+						if err != nil {
+							t.Fatal(err)
+						}
+						if err := os.WriteFile(filepath.Join(dir, "result.json"), data, 0o600); err != nil {
+							t.Fatal(err)
+						}
+						if len(mismatches) != 0 {
+							t.Errorf("complete result mismatch: %v; actual outputs retained in %s", mismatches, dir)
+						}
+						t.Logf("%s: 2 paired repeats, 4 actual full results retained", dir)
+					})
+				}
+			})
+		}
+	}
+}
+
+// TestPerformanceCLICohorts runs same-host alternating baseline/current pairs.
+// Both cohorts start a new OS process; only the application's disk-cache state
+// differs. No OS page-cache drop, CPU tuning, or best-of-N selection is involved.
+func TestPerformanceCLICohorts(t *testing.T) {
+	outDir := os.Getenv("BV_PERF_DIR")
+	if outDir == "" {
+		t.Skip("opt-in measurement: scripts/benchmark.sh latency")
+	}
+	baseline := os.Getenv("BV_PERF_BASELINE_BINARY")
+	current := os.Getenv("BV_PERF_CURRENT_BINARY")
+	if baseline == "" || current == "" {
+		t.Fatal("both BV_PERF_BASELINE_BINARY and BV_PERF_CURRENT_BINARY are required")
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	samples := 200
+	if value := os.Getenv("BV_PERF_CLI_SAMPLES"); value != "" {
+		var err error
+		samples, err = strconv.Atoi(value)
+		if err != nil || samples < 200 {
+			t.Fatal("BV_PERF_CLI_SAMPLES must be at least 200; p99 is descriptive")
+		}
+	}
+	for _, kind := range testutil.PerformanceWorkloadNames() {
+		for _, size := range []int{1000, 5000, 10000} {
+			t.Run(fmt.Sprintf("%s/%d", kind, size), func(t *testing.T) {
+				for _, warm := range []bool{false, true} {
+					mode := "cold-application-cache"
+					if warm {
+						mode = "warm-application-cache"
+					}
+					t.Run(mode, func(t *testing.T) {
+						var durations [2][]time.Duration
+						var dirs [2]string
+						var identities [2]performanceBinaryIdentity
+						var loadedIssues [2]int
+						// Both binaries must read the same physical source path:
+						// source-authority identity intentionally includes provenance.
+						fixtureDir := filepath.Join(outDir, fmt.Sprintf("cli-%s-%d-%s-source", kind, size, mode))
+						if err := os.Mkdir(fixtureDir, 0o700); err != nil {
+							t.Fatal(err)
+						}
+						fixtureHash := writePerformanceFixture(t, fixtureDir, kind, size)
+						binaries := [2]string{baseline, current}
+						for side, binary := range binaries {
+							dir := filepath.Join(outDir, fmt.Sprintf("cli-%s-%d-%s-%d", kind, size, mode, side))
+							if err := os.Mkdir(dir, 0o700); err != nil {
+								t.Fatal(err)
+							}
+							dirs[side] = dir
+							identities[side] = readPerformanceBinary(t, binary)
+							if warm {
+								runPerformanceCLI(t, binary, fixtureDir, filepath.Join(dir, "cache"), filepath.Join(dir, "warmup"), "")
+								entries, err := filepath.Glob(filepath.Join(dir, "cache", "*", "*.json"))
+								if err != nil || len(entries) == 0 {
+									t.Fatalf("warmup did not create an actual analysis cache entry: %v", err)
+								}
+							}
+						}
+						var expected []byte
+						var mismatches []string
+						for sample := 0; sample < samples; sample++ {
+							for position := 0; position < 2; position++ {
+								side := (sample + position) % 2
+								cache := filepath.Join(dirs[side], "cache")
+								if !warm {
+									cache = filepath.Join(dirs[side], fmt.Sprintf("cold-%04d", sample))
+									if _, err := os.Stat(cache); !os.IsNotExist(err) {
+										t.Fatalf("cold cache already exists or cannot be checked: %v", err)
+									}
+								}
+								output, elapsed := runPerformanceCLI(t, binaries[side], fixtureDir, cache, filepath.Join(dirs[side], fmt.Sprintf("sample-%04d", sample)), "")
+								durations[side] = append(durations[side], elapsed)
+								var measured struct {
+									Triage struct {
+										Meta struct {
+											IssueCount int `json:"issue_count"`
+										} `json:"meta"`
+									} `json:"triage"`
+								}
+								if err := json.Unmarshal(output, &measured); err != nil || measured.Triage.Meta.IssueCount != size {
+									t.Fatalf("side=%d sample=%d loaded_issues=%d want=%d: %v", side, sample, measured.Triage.Meta.IssueCount, size, err)
+								}
+								loadedIssues[side] = measured.Triage.Meta.IssueCount
+								behavior, err := performanceCLIBehavior(output)
+								if err != nil {
+									t.Fatal(err)
+								}
+								if expected == nil {
+									expected = behavior
+								} else if !bytes.Equal(expected, behavior) {
+									mismatches = append(mismatches, fmt.Sprintf("side=%d sample=%d", side, sample))
+								}
+							}
+						}
+						for side := range binaries {
+							summary, err := testutil.SummarizeLatency(durations[side])
+							if err != nil {
+								t.Fatal(err)
+							}
+							record := map[string]any{"workload": kind, "issues": size, "seed": 20260904, "fixture_sha256": fixtureHash,
+								"mode": mode, "side": side, "binary_sha256": identities[side].SHA256, "distribution": summary, "sample_ns": durations[side],
+								"loaded_issues": loadedIssues[side], "host": host, "gomaxprocs": runtime.GOMAXPROCS(0),
+								"decision_behavior": json.RawMessage(expected), "parity_mismatches": mismatches,
+								"go_version": identities[side].GoVersion, "goos": identities[side].GOOS, "goarch": identities[side].GOARCH,
+								"interpretation": "empirical new-process wall time; application cache isolated; OS page cache uncontrolled; ID/order/metric-state parity only"}
+							data, err := json.MarshalIndent(record, "", "  ")
+							if err != nil {
+								t.Fatal(err)
+							}
+							if err := os.WriteFile(filepath.Join(dirs[side], "result.json"), data, 0o600); err != nil {
+								t.Fatal(err)
+							}
+							t.Logf("%s side=%d p50=%.3fms p95=%.3fms p99=%.3fms", mode, side, summary.P50MS, summary.P95MS, summary.P99MS)
+						}
+						if len(mismatches) != 0 {
+							t.Errorf("%d samples changed ordered IDs/readiness/metric states; timing comparison is inconclusive; first: %s", len(mismatches), mismatches[0])
+						}
+					})
+				}
+			})
+		}
 	}
 }
 

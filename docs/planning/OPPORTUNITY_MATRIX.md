@@ -1,3 +1,6 @@
+> **Status (2026-09-02): historical roadmap, 2026-01**
+> Unchecked boxes are not a current plan. Items delivered later by the June and August performance campaigns include the parallel JSONL parse, goccy JSON, and the disk caches; the rest were not pursued.
+
 # Performance Opportunity Matrix
 
 **Task:** bd-29b3 - Profile + opportunity matrix (identify top hotspots)

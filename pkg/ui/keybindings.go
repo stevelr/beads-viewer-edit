@@ -4,54 +4,39 @@ import (
 	"sort"
 	"strings"
 	"sync"
-
-	tea "github.com/charmbracelet/bubbletea"
 )
 
-// KeyHandler processes a key event and returns the updated model and whether
-// the key was handled. If handled is false, the key may fall through to other
-// handlers (e.g., cross-view switches).
-type KeyHandler func(m Model, msg tea.KeyMsg) (Model, bool)
-
-// KeyBinding associates a key with a handler for a specific focus context.
+// KeyBinding documents one key for one focus context. Bindings feed the
+// shortcuts sidebar, the help overlay, and --robot-help; they do not dispatch.
+// Runtime dispatch is Model.Update and the per-view handlers (handleListKeys,
+// handleBoardKeys, handleTreeKeys, ...), and the tests in keybindings_test.go
+// drive those handlers directly for every documented key.
 type KeyBinding struct {
-	Focus    focus      // Which view/focus context this binding applies to
-	Key      string     // Key string (e.g., "j", "ctrl+d", "enter")
-	Desc     string     // Human-readable description for help display
-	Category string     // Grouping category (e.g., "Navigation", "Actions")
-	Handler  KeyHandler // The handler function to call
+	Focus    focus  // Which view/focus context this binding applies to
+	Key      string // Key string (e.g., "j", "ctrl+d", "enter")
+	Desc     string // Human-readable description for help display
+	Category string // Grouping category (e.g., "Navigation", "Actions")
 }
 
-// KeyRegistry manages key bindings organized by focus context. It provides
-// a centralized dispatch mechanism for key events.
+// KeyRegistry is the per-focus index of documented key bindings.
 type KeyRegistry struct {
 	mu       sync.RWMutex
-	handlers map[focus]map[string]KeyHandler // focus -> key -> handler
-	bindings map[focus][]KeyBinding          // focus -> ordered bindings (for help)
+	bindings map[focus][]KeyBinding // focus -> ordered bindings (for help)
 }
 
 // NewKeyRegistry creates an empty key registry ready to accept bindings.
 func NewKeyRegistry() *KeyRegistry {
 	return &KeyRegistry{
-		handlers: make(map[focus]map[string]KeyHandler),
 		bindings: make(map[focus][]KeyBinding),
 	}
 }
 
 // RegisterBinding adds a single key binding to the registry.
 // If the same key is registered twice for the same focus, the later
-// registration overwrites the earlier one.
+// registration replaces the earlier one.
 func (r *KeyRegistry) RegisterBinding(b KeyBinding) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	// Ensure the focus map exists
-	if r.handlers[b.Focus] == nil {
-		r.handlers[b.Focus] = make(map[string]KeyHandler)
-	}
-
-	// Register the handler
-	r.handlers[b.Focus][b.Key] = b.Handler
 
 	// Track binding for help generation (replace if exists)
 	existingBindings := r.bindings[b.Focus]
@@ -66,41 +51,6 @@ func (r *KeyRegistry) RegisterBinding(b KeyBinding) {
 	if !found {
 		r.bindings[b.Focus] = append(r.bindings[b.Focus], b)
 	}
-}
-
-// RegisterView adds multiple bindings for a specific focus context.
-// This is a convenience wrapper around RegisterBinding.
-func (r *KeyRegistry) RegisterView(f focus, bindings []KeyBinding) {
-	for _, b := range bindings {
-		// Ensure the binding's focus matches the specified focus
-		b.Focus = f
-		r.RegisterBinding(b)
-	}
-}
-
-// Dispatch looks up and executes the handler for the given focus and key.
-// Returns:
-//   - model: The potentially updated model
-//   - handled: True if a handler was found and executed
-//   - cmd: Any tea.Cmd returned by the handler (currently always nil; reserved for future use)
-//
-// If no handler is registered for the focus+key combination, handled is false
-// and the model is returned unchanged.
-func (r *KeyRegistry) Dispatch(f focus, key string, m Model, msg tea.KeyMsg) (Model, bool, tea.Cmd) {
-	r.mu.RLock()
-	focusHandlers := r.handlers[f]
-	var handler KeyHandler
-	if focusHandlers != nil {
-		handler = focusHandlers[key]
-	}
-	r.mu.RUnlock()
-
-	if handler == nil {
-		return m, false, nil
-	}
-
-	updatedModel, handled := handler(m, msg)
-	return updatedModel, handled, nil
 }
 
 // AllBindingsForFocus returns all registered bindings for a specific focus,
@@ -156,44 +106,22 @@ func (r *KeyRegistry) AllBindings() []KeyBinding {
 	return result
 }
 
-// HasBinding checks if a binding exists for the given focus and key.
+// HasBinding reports whether a binding is documented for the focus and key.
 func (r *KeyRegistry) HasBinding(f focus, key string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	focusHandlers := r.handlers[f]
-	if focusHandlers == nil {
-		return false
+	for _, b := range r.bindings[f] {
+		if b.Key == key {
+			return true
+		}
 	}
-	_, exists := focusHandlers[key]
-	return exists
+	return false
 }
 
-// BindingsCount returns the total number of registered bindings.
-func (r *KeyRegistry) BindingsCount() int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	count := 0
-	for _, bindings := range r.bindings {
-		count += len(bindings)
-	}
-	return count
-}
-
-// Clear removes all registered bindings. Primarily useful for testing.
-func (r *KeyRegistry) Clear() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.handlers = make(map[focus]map[string]KeyHandler)
-	r.bindings = make(map[focus][]KeyBinding)
-}
-
-// registerKeyBindings populates the KeyRegistry with all view handlers.
-// Called from NewModel to set up two-phase key dispatch (bv-3bsx).
-// For now this registers the authoritative documentation bindings so the
-// shortcuts/help surfaces stay in sync even before runtime dispatch migrates.
+// registerKeyBindings populates the KeyRegistry from GetKeyBindingDocs so the
+// shortcuts sidebar and help surfaces show exactly the documented keys for
+// the focused view. Called from NewModel.
 func (m *Model) registerKeyBindings() {
 	if m == nil || m.keyRegistry == nil {
 		return
@@ -251,6 +179,8 @@ func focusesForBindingDoc(doc KeyBindingDoc) []focus {
 			addFocus(focusFlowMatrix)
 		case "sprint":
 			addFocus(focusSprint)
+		case "attention":
+			addFocus(focusAttention)
 		}
 	}
 
@@ -270,6 +200,7 @@ func allDocumentedFocuses() []focus {
 		focusTree,
 		focusFlowMatrix,
 		focusSprint,
+		focusAttention,
 	}
 }
 
@@ -291,11 +222,14 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"j", "Move down", "Navigation", "all"},
 		{"k", "Move up", "Navigation", "all"},
 		{"G", "Go to end", "Navigation", "all"},
-		{"gg", "Go to start", "Navigation", "all"},
+		{"home", "Go to start", "Navigation", "list"},
+		// gg is a 200 ms combo; only the board and tree implement it. In the
+		// list a single g opens the graph view.
+		{"gg", "Go to start", "Navigation", "board,tree"},
 		{"ctrl+d", "Page down", "Navigation", "all"},
 		{"ctrl+u", "Page up", "Navigation", "all"},
 		{"enter", "Open details", "Navigation", "all"},
-		{"esc", "Back/close", "Navigation", "all"},
+		{"esc", "Back/close (list: clear filters)", "Navigation", "all"},
 		{"q", "Quit", "Navigation", "all"},
 
 		// View Switching
@@ -304,6 +238,13 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"g", "Graph view", "Views", "list,detail"},
 		{"h", "History view", "Views", "list,detail"},
 		{"i", "Insights panel", "Views", "list,detail"},
+		{"E", "Tree view (parent-child hierarchy)", "Views", "list,detail"},
+		{"f", "Flow matrix (cross-label dependencies)", "Views", "list,detail"},
+		{"P", "Sprint dashboard", "Views", "list,detail"},
+		{"[", "Label dashboard", "Views", "list,detail"},
+		{"]", "Attention view", "Views", "list,detail"},
+		{"!", "Alerts panel", "Views", "list"},
+		{"w", "Repo picker (workspace mode)", "Views", "list"},
 		{"?", "Help overlay", "Views", "all"},
 		{";", "Shortcuts sidebar", "Views", "all"},
 		{"p", "Priority hints", "Views", "list,detail"},
@@ -314,10 +255,14 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"r", "Ready (unblocked)", "Filters", "list"},
 		{"l", "Label picker", "Filters", "list"},
 		{"/", "Search/filter", "Filters", "list"},
+		{"s", "Cycle sort mode", "Filters", "list"},
+		{"S", "Sort by triage score (triage recipe)", "Filters", "list"},
 
 		// Actions
-		{"t", "Time travel (forward)", "Actions", "list,detail"},
-		{"T", "Time travel (back)", "Actions", "list,detail"},
+		{"t", "Time travel (custom revision)", "Actions", "list,detail"},
+		{"T", "Time travel (HEAD~5)", "Actions", "list,detail"},
+		{"n", "Next changed issue (time travel)", "Actions", "list"},
+		{"N", "Previous changed issue (time travel)", "Actions", "list"},
 		{"x", "Export to markdown", "Actions", "list,detail"},
 		{"y", "Copy issue ID", "Actions", "all"},
 		{"C", "Copy full issue", "Actions", "detail"},
@@ -332,19 +277,29 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"hjkl", "Navigate graph", "Graph", "graph"},
 		{"H", "Scroll left", "Graph", "graph"},
 		{"L", "Scroll right", "Graph", "graph"},
-		{"PgUp", "Scroll up", "Graph", "graph"},
-		{"PgDn", "Scroll down", "Graph", "graph"},
+		{"J/K", "Scroll graph vertically", "Graph", "graph"},
+		{"space", "Expand/collapse dependency paths", "Graph", "graph"},
+		{"PgUp", "Previous 10 nodes", "Graph", "graph"},
+		{"PgDn", "Next 10 nodes", "Graph", "graph"},
 
 		// Board View
 		{"h", "Previous column", "Board", "board"},
 		{"l", "Next column", "Board", "board"},
+		{"H", "First column", "Board", "board"},
+		{"L", "Last column", "Board", "board"},
+		{"s", "Cycle swimlane mode", "Board", "board"},
 		{"tab", "Toggle detail", "Board", "board"},
+
+		// Tree View
+		{"E", "Exit tree view", "Tree", "tree"},
 		{"ctrl+j", "Scroll detail down", "Board", "board"},
 		{"ctrl+k", "Scroll detail up", "Board", "board"},
 
 		// Insights View
 		{"h", "Previous panel", "Insights", "insights"},
 		{"l", "Next panel", "Insights", "insights"},
+		{"tab", "Next panel", "Insights", "insights"},
+		{"shift+tab", "Previous panel", "Insights", "insights"},
 		{"e", "Toggle explanations", "Insights", "insights"},
 		{"x", "Calculation proof", "Insights", "insights"},
 		{"m", "Heatmap toggle", "Insights", "insights"},
@@ -352,8 +307,21 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		// History View
 		{"v", "Toggle git/bead mode", "History", "history"},
 		{"tab", "Toggle focus", "History", "history"},
+		{"t", "Toggle timeline pane", "History", "history"},
+		{"f", "Toggle file tree", "History", "history"},
 		{"J", "Detail scroll down", "History", "history"},
 		{"K", "Detail scroll up", "History", "history"},
 		{"o", "Open in browser", "History", "history"},
+
+		// Attention View (])
+		{"g", "Go to top", "Attention", "attention"},
+		{"enter", "Label drilldown", "Attention", "attention"},
+		{"1-9", "Filter list by rank", "Attention", "attention"},
+		{"]", "Close attention view", "Attention", "attention"},
+
+		// Sprint Dashboard (P)
+		{"P", "Close sprint dashboard", "Sprint", "sprint"},
+		{"j", "Next sprint", "Sprint", "sprint"},
+		{"k", "Previous sprint", "Sprint", "sprint"},
 	}
 }

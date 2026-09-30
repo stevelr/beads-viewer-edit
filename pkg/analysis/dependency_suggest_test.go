@@ -3,6 +3,7 @@ package analysis
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -97,6 +98,25 @@ func TestDetectMissingDependencies_NoSharedKeywords(t *testing.T) {
 	}
 }
 
+func TestDetectMissingDependenciesRejectsLongerIDPrefixMention(t *testing.T) {
+	issues := []model.Issue{
+		{
+			ID:     "bv-42",
+			Title:  "Authentication service",
+			Status: model.StatusOpen,
+		},
+		{
+			ID:          "bv-420",
+			Title:       "Authentication service",
+			Description: "Follow-up work for bv-420",
+			Status:      model.StatusOpen,
+		},
+	}
+	if got := DetectMissingDependencies(issues, DefaultDependencySuggestionConfig()); len(got) != 0 {
+		t.Fatalf("longer ID prefix manufactured exact-mention dependency: %+v", got)
+	}
+}
+
 func TestDetectMissingDependencies_SharedKeywords(t *testing.T) {
 	config := DefaultDependencySuggestionConfig()
 	config.MinKeywordOverlap = 2
@@ -120,6 +140,9 @@ func TestDetectMissingDependencies_SharedKeywords(t *testing.T) {
 		},
 	}
 
+	for i := range issues {
+		issues[i].Origin = suggestionTestOrigin(issues[i].ID)
+	}
 	suggestions := DetectMissingDependencies(issues, config)
 	// Should find suggestion due to shared keywords: user, authentication, jwt
 	if len(suggestions) == 0 {
@@ -135,8 +158,8 @@ func TestDetectMissingDependencies_SharedKeywords(t *testing.T) {
 		if sug.ActionCommand == "" {
 			t.Error("expected action command to be set")
 		}
-		if !strings.Contains(sug.ActionCommand, "br dep add") {
-			t.Errorf("expected action to contain 'br dep add', got %s", sug.ActionCommand)
+		if !strings.Contains(sug.ActionCommand, "'dep' 'add'") {
+			t.Errorf("expected routed dependency add command, got %s", sug.ActionCommand)
 		}
 	}
 }
@@ -288,6 +311,22 @@ func TestDetectMissingDependencies_MaxSuggestions(t *testing.T) {
 	suggestions := DetectMissingDependencies(issues, config)
 	if len(suggestions) > config.MaxSuggestions {
 		t.Errorf("expected at most %d suggestions, got %d", config.MaxSuggestions, len(suggestions))
+	}
+}
+
+func TestDetectMissingDependencies_NonPositiveMaxIsSafe(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Title: "Authentication service", Status: model.StatusOpen},
+		{ID: "B", Title: "Authentication service", Status: model.StatusOpen},
+	}
+	for _, limit := range []int{0, -1} {
+		config := DefaultDependencySuggestionConfig()
+		config.MinKeywordOverlap = 1
+		config.MinConfidence = 0
+		config.MaxSuggestions = limit
+		if suggestions := DetectMissingDependencies(issues, config); len(suggestions) != 0 {
+			t.Fatalf("MaxSuggestions=%d returned %d suggestions", limit, len(suggestions))
+		}
 	}
 }
 
@@ -453,6 +492,20 @@ func TestDetectMissingDependencies_IDMentioned(t *testing.T) {
 	// The exact behavior depends on keyword extraction
 }
 
+func TestDetectMissingDependencies_EmptyIDIsNotAnExactMention(t *testing.T) {
+	config := DefaultDependencySuggestionConfig()
+	config.MinKeywordOverlap = 1
+	config.MinConfidence = 0.4
+
+	issues := []model.Issue{
+		{ID: "", Title: "Shared alpha work", Status: model.StatusOpen},
+		{ID: "valid", Title: "Shared beta work", Status: model.StatusOpen},
+	}
+	if got := DetectMissingDependencies(issues, config); len(got) != 0 {
+		t.Fatalf("empty ID manufactured exact-mention suggestions: %+v", got)
+	}
+}
+
 func TestDetectMissingDependencies_DeterminismWithTimestamps(t *testing.T) {
 	config := DefaultDependencySuggestionConfig()
 	config.MinKeywordOverlap = 2
@@ -491,6 +544,92 @@ func TestDetectMissingDependencies_DeterminismWithTimestamps(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestDetectMissingDependencies_IsInvariantToInputOrder(t *testing.T) {
+	config := DefaultDependencySuggestionConfig()
+	config.MinKeywordOverlap = 2
+	config.MinConfidence = 0.1
+
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID:          "older-low-priority",
+			Title:       "Build API",
+			Description: "authentication tokens",
+			Status:      model.StatusOpen,
+			CreatedAt:   now.Add(-time.Hour),
+			Priority:    3,
+		},
+		{
+			ID:        "newer-high-priority",
+			Title:     "Authentication tokens tests",
+			Status:    model.StatusOpen,
+			CreatedAt: now,
+			Priority:  1,
+		},
+	}
+
+	forward := DetectMissingDependencies(issues, config)
+	reversed := DetectMissingDependencies([]model.Issue{issues[1], issues[0]}, config)
+
+	if len(forward) != 1 {
+		t.Fatalf("forward suggestions = %d, want 1", len(forward))
+	}
+	for i := range forward {
+		forward[i].GeneratedAt = time.Time{}
+	}
+	for i := range reversed {
+		reversed[i].GeneratedAt = time.Time{}
+	}
+	if !reflect.DeepEqual(forward, reversed) {
+		t.Fatalf("input order changed suggestions:\nforward = %#v\nreversed = %#v", forward, reversed)
+	}
+}
+
+func TestDetectMissingDependencies_DirectionIndependentOfInputOrder(t *testing.T) {
+	config := DefaultDependencySuggestionConfig()
+	config.MinKeywordOverlap = 2
+	config.MinConfidence = 0.1
+
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	olderLowPriority := model.Issue{
+		ID:          "A",
+		Title:       "Foundation layer",
+		Description: "authentication service",
+		Status:      model.StatusOpen,
+		CreatedAt:   now.Add(-time.Hour),
+		Priority:    4,
+	}
+	newerHighPriority := model.Issue{
+		ID:        "B",
+		Title:     "Authentication service tests",
+		Status:    model.StatusOpen,
+		CreatedAt: now,
+		Priority:  0,
+	}
+
+	forward := DetectMissingDependencies([]model.Issue{olderLowPriority, newerHighPriority}, config)
+	reversed := DetectMissingDependencies([]model.Issue{newerHighPriority, olderLowPriority}, config)
+	if len(forward) != 1 || len(reversed) != 1 {
+		t.Fatalf("suggestion counts forward=%d reversed=%d, want one each", len(forward), len(reversed))
+	}
+	forward[0].GeneratedAt = time.Time{}
+	reversed[0].GeneratedAt = time.Time{}
+	forwardJSON, err := json.Marshal(forward)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reversedJSON, err := json.Marshal(reversed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(forwardJSON) != string(reversedJSON) {
+		t.Fatalf("input permutation changed suggestion\nforward: %s\nreversed: %s", forwardJSON, reversedJSON)
+	}
+	if forward[0].TargetBead != "B" || forward[0].RelatedBead != "A" {
+		t.Fatalf("direction = %s -> %s, want newer B -> older A", forward[0].TargetBead, forward[0].RelatedBead)
 	}
 }
 

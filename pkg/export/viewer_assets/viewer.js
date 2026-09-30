@@ -9,6 +9,68 @@
  */
 
 // ============================================================================
+// Mermaid initialisation (moved here from an inline <script> in index.html so
+// the CSP can forbid inline scripts). viewer.js loads after vendor/mermaid.min.js
+// and before Alpine boots, which is the same point the inline block ran.
+// ============================================================================
+
+// Theme-aware Mermaid config: Dracula-inspired colours in dark mode,
+// GitHub-inspired in light mode.
+function getMermaidConfig() {
+  const dark = document.documentElement.classList.contains('dark');
+  return {
+    startOnLoad: false,
+    theme: dark ? 'dark' : 'neutral',
+    flowchart: { curve: 'basis', padding: 10 },
+    securityLevel: 'strict',
+    themeVariables: dark ? {
+      primaryColor: '#bd93f9',      // Purple
+      primaryTextColor: '#f8f8f2',  // Foreground
+      primaryBorderColor: '#ff79c6', // Pink
+      lineColor: '#6272a4',         // Muted (comment)
+      secondaryColor: '#44475a',    // Background secondary
+      tertiaryColor: '#282a36',     // Background
+      background: '#282a36',
+      mainBkg: '#282a36',
+      nodeBorder: '#bd93f9',
+      clusterBkg: '#44475a',
+      clusterBorder: '#6272a4',
+      titleColor: '#f8f8f2',
+      edgeLabelBackground: '#44475a',
+      nodeTextColor: '#f8f8f2'
+    } : {
+      primaryColor: '#8250df',      // Purple
+      primaryTextColor: '#24292f',  // Foreground
+      primaryBorderColor: '#bf3989', // Pink
+      lineColor: '#57606a',         // Muted
+      secondaryColor: '#f6f8fa',    // Background secondary
+      tertiaryColor: '#ffffff',     // Background
+      background: '#ffffff',
+      mainBkg: '#ffffff',
+      nodeBorder: '#8250df',
+      clusterBkg: '#f6f8fa',
+      clusterBorder: '#d0d7de',
+      titleColor: '#24292f',
+      edgeLabelBackground: '#f6f8fa',
+      nodeTextColor: '#24292f'
+    }
+  };
+}
+
+if (typeof mermaid !== 'undefined') {
+  mermaid.initialize(getMermaidConfig());
+} else {
+  console.warn('[bv] mermaid is not loaded; diagram rendering is disabled');
+}
+
+// Exposed for the theme toggle, which re-initialises Mermaid after switching.
+window.reinitializeMermaid = function () {
+  if (typeof mermaid !== 'undefined') {
+    mermaid.initialize(getMermaidConfig());
+  }
+};
+
+// ============================================================================
 // Error Handling and Diagnostics
 // ============================================================================
 
@@ -128,6 +190,7 @@ const DB_STATE = {
   db: null,           // Database instance
   cacheKey: null,     // OPFS cache key (hash)
   source: 'unknown',  // 'network' | 'cache' | 'chunks'
+  fts5: null,         // Actual browser SQLite capability, not exported schema.
 };
 
 // Graph engine state (WASM)
@@ -668,6 +731,9 @@ function execScalar(sql, params = []) {
 // WASM Graph Engine - Live graph calculations
 // ============================================================================
 
+// Match model.DependencyType.IsBlocking, including legacy empty types.
+const BLOCKING_DEPENDENCY_TYPES_SQL = "('', 'blocks', 'conditional-blocks', 'waits-for')";
+
 /**
  * Initialize the WASM graph engine
  */
@@ -705,10 +771,16 @@ async function initGraphEngine() {
       return false;
     }
 
+    // Isolated issues participate in metrics too. Edges alone omit them.
+    for (const row of execQuery('SELECT id FROM issues ORDER BY id')) {
+      GRAPH_STATE.nodeMap.set(row.id, GRAPH_STATE.graph.addNode(row.id));
+    }
+
     const deps = execQuery(`
       SELECT issue_id, depends_on_id
       FROM dependencies
-      WHERE type = 'blocks'
+      WHERE type IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
+      ORDER BY issue_id, depends_on_id
     `);
 
     for (const row of deps) {
@@ -735,7 +807,7 @@ async function initGraphEngine() {
     const nodeCount = GRAPH_STATE.graph.nodeCount();
     const edgeCount = GRAPH_STATE.graph.edgeCount();
     if (nodeCount === 0) {
-      console.log('[Graph] WASM engine ready (no dependencies in project - metrics will use pre-computed data)');
+      console.log('[Graph] WASM engine ready (empty project)');
     } else {
       console.log(`[Graph] WASM engine loaded: ${nodeCount} nodes, ${edgeCount} edges`);
     }
@@ -748,27 +820,43 @@ async function initGraphEngine() {
 }
 
 /**
- * Build closed set array from database
- * Returns Uint8Array where 1 = closed, 0 = open
+ * Preserve resolved prerequisite identities even when their rows are omitted.
  */
+function getResolvedIssueIDs() {
+  const ids = new Set(execQuery("SELECT id FROM issues WHERE status IN ('closed', 'tombstone')").map(row => row.id));
+  const metadata = getMeta().resolved_issue_ids;
+  if (metadata) {
+    for (const id of JSON.parse(metadata)) ids.add(id);
+  }
+  return ids;
+}
+
+/** Return 1 for resolved nodes (closed or tombstone), 0 for unresolved nodes. */
 function buildClosedSet() {
   if (!GRAPH_STATE.ready) return null;
 
   const n = GRAPH_STATE.graph.nodeCount();
   const closed = new Uint8Array(n);
 
-  const closedIssues = execQuery(`
-    SELECT id FROM issues WHERE status = 'closed'
-  `);
-
-  for (const row of closedIssues) {
-    const idx = GRAPH_STATE.nodeMap.get(row.id);
+  for (const id of getResolvedIssueIDs()) {
+    const idx = GRAPH_STATE.nodeMap.get(id);
     if (idx !== undefined) {
       closed[idx] = 1;
     }
   }
 
   return closed;
+}
+
+/** Restrict selectable issues without marking excluded prerequisites closed. */
+function buildCandidateSet(actionableOnly = false) {
+  const candidates = new Uint8Array(GRAPH_STATE.graph.nodeCount());
+  const rows = execQuery(`SELECT id FROM issue_overview_mv${actionableOnly ? ' WHERE is_actionable = 1' : ''} ORDER BY id`);
+  for (const { id } of rows) {
+    const idx = GRAPH_STATE.nodeMap.get(id);
+    if (idx !== undefined) candidates[idx] = 1;
+  }
+  return candidates;
 }
 
 /**
@@ -826,10 +914,10 @@ function whatIfClose(issueId) {
  * Get top issues by cascade impact
  */
 function topWhatIf(limit = 10) {
-  if (!GRAPH_STATE.ready) return [];
+  if (!GRAPH_STATE.ready || limit <= 0) return [];
 
   const closedSet = buildClosedSet();
-  const results = GRAPH_STATE.graph.topWhatIf(closedSet, limit);
+  const results = GRAPH_STATE.graph.topWhatIf(closedSet, limit, buildCandidateSet(true));
 
   // Enrich with issue IDs
   return (results || []).map(item => ({
@@ -840,17 +928,13 @@ function topWhatIf(limit = 10) {
 }
 
 /**
- * Get actionable issues (all blockers closed)
+ * Get actual issues eligible under the exported full-source readiness policy.
  */
 function getActionableIssues() {
   if (!GRAPH_STATE.ready) return [];
 
-  const closedSet = buildClosedSet();
-  const indices = GRAPH_STATE.graph.actionableNodes(closedSet);
-
-  return (indices || [])
-    .map(idx => GRAPH_STATE.graph.nodeId(idx))
-    .filter(Boolean);
+  return execQuery('SELECT id FROM issue_overview_mv WHERE is_actionable = 1 ORDER BY id')
+    .map(row => row.id);
 }
 
 /**
@@ -870,7 +954,7 @@ function getTopKSet(k = 5) {
   if (!GRAPH_STATE.ready) return null;
 
   const closedSet = buildClosedSet();
-  const result = GRAPH_STATE.graph.topkSet(closedSet, k);
+  const result = GRAPH_STATE.graph.topkSet(closedSet, k, buildCandidateSet());
 
   // Enrich with issue IDs
   if (result && result.items) {
@@ -942,11 +1026,11 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
     params.push(filters.assignee);
   }
 
-	  // Blocked filter
-	  if (filters.hasBlockers === true || filters.hasBlockers === 'true') {
-    clauses.push(`(${col('blocked_by_ids')} IS NOT NULL AND ${col('blocked_by_ids')} <> '')`);
+  // Readiness comes from the full-source export snapshot, not visible edges.
+  if (filters.hasBlockers === true || filters.hasBlockers === 'true') {
+    clauses.push(`${col('dependency_state')} <> 'satisfied'`);
   } else if (filters.hasBlockers === false || filters.hasBlockers === 'false') {
-    clauses.push(`(${col('blocked_by_ids')} IS NULL OR ${col('blocked_by_ids')} = '')`);
+    clauses.push(`${col('is_actionable')} = 1`);
   }
 
   // Blocking filter (has items depending on it)
@@ -1115,7 +1199,7 @@ function getGraphViewData() {
   const dependencies = execQuery(`
     SELECT issue_id, depends_on_id, type
     FROM dependencies
-    WHERE type = 'blocks'
+    WHERE type IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
   `);
 
   return { issues, dependencies };
@@ -1192,6 +1276,13 @@ function adjustHybridWeightsForQuery(baseWeights, term) {
   };
 }
 
+function supportsFTS5() {
+  if (DB_STATE.fts5 === null) {
+    DB_STATE.fts5 = execQuery('PRAGMA module_list').some(row => row.name === 'fts5');
+  }
+  return DB_STATE.fts5;
+}
+
 function searchIssues(term, options = {}) {
   const {
     mode = 'text',
@@ -1230,10 +1321,16 @@ function searchIssues(term, options = {}) {
   queryParams.push(fetchLimit, fetchOffset);
 
   let rows = [];
-  try {
-    rows = execQuery(sql, queryParams);
-  } catch {
-    return queryIssues({ ...searchFilters, search: term }, 'score', limit, offset);
+  if (supportsFTS5()) {
+    try {
+      rows = execQuery(sql, queryParams);
+    } catch {
+      // Invalid FTS syntax can still use plain substring matching. Continue
+      // through the same hybrid scorer instead of silently losing ranking.
+      rows = queryIssues({ ...searchFilters, search: term }, 'score', fetchLimit, fetchOffset);
+    }
+  } else {
+    rows = queryIssues({ ...searchFilters, search: term }, 'score', fetchLimit, fetchOffset);
   }
   if (isLikelyIssueID(term)) {
     rows = promoteExactID(term, rows);
@@ -1279,6 +1376,7 @@ function searchIssues(term, options = {}) {
 function countSearchIssues(term, filters = {}) {
   const searchFilters = { ...filters };
   delete searchFilters.search;
+  if (!supportsFTS5()) return countIssues({ ...searchFilters, search: term });
   const { clauses, params } = buildFilterClauses(searchFilters, 'i');
 
   let sql = `
@@ -1304,7 +1402,7 @@ function countSearchIssues(term, filters = {}) {
  * Get project statistics
  */
 function getStats() {
-  const stats = {};
+  const stats = { open: 0, in_progress: 0, closed: 0, tombstone: 0 };
 
   try {
     // Count by status
@@ -1322,23 +1420,22 @@ function getStats() {
     console.error('[Stats] Error loading status counts:', err);
   }
 
-  // Count blocked (has blocked_by_ids and status is open/in_progress)
+  // Missing prerequisites and inherited parent gates also withhold readiness.
   stats.blocked = execScalar(`
     SELECT COUNT(*) FROM issue_overview_mv
-    WHERE blocked_by_ids IS NOT NULL
-    AND blocked_by_ids <> ''
+    WHERE dependency_state <> 'satisfied'
     AND status IN ('open', 'in_progress')
   `) || 0;
 
-  // Count actionable (open/in_progress with NO open blockers)
+  // Planning readiness includes deferral and lifecycle at the export clock.
   stats.actionable = execScalar(`
     SELECT COUNT(*) FROM issue_overview_mv
-    WHERE status IN ('open', 'in_progress')
-    AND (blocked_by_ids IS NULL OR blocked_by_ids = '')
+    WHERE is_actionable = 1
   `) || 0;
 
   // Total
   stats.total = execScalar(`SELECT COUNT(*) FROM issue_overview_mv`) || 0;
+  stats.active = stats.total - stats.closed - stats.tombstone;
 
   return stats;
 }
@@ -1349,8 +1446,7 @@ function getStats() {
 function getQuickWins(limit = 5) {
   return execQuery(`
     SELECT * FROM issue_overview_mv
-    WHERE status IN ('open', 'in_progress')
-    AND (blocked_by_ids IS NULL OR blocked_by_ids = '')
+    WHERE is_actionable = 1
     ORDER BY blocks_count DESC, triage_score DESC
     LIMIT ?
   `, [limit]);
@@ -1455,6 +1551,25 @@ function getTopBlockers(limit = 10) {
 }
 
 /**
+ * Rank exported issue rows by full-graph scores. Missing or filtered dependency
+ * endpoints remain in the graph, but do not consume the visible issue limit.
+ */
+function getRankedGraphIssues(values, field, limit, include = () => true) {
+  if (!GRAPH_STATE.ready || !values?.length || limit <= 0) return [];
+
+  const ranked = execQuery('SELECT id FROM issue_overview_mv ORDER BY id')
+    .map(({ id }) => ({ id, value: values[GRAPH_STATE.nodeMap.get(id)] }))
+    .filter(row => row.value !== undefined && include(row.value));
+  ranked.sort((a, b) => b.value - a.value);
+
+  return ranked.slice(0, limit).map(row => {
+    const issue = getIssue(row.id);
+    issue[field] = row.value;
+    return issue;
+  });
+}
+
+/**
  * Get top issues by betweenness centrality (bottlenecks)
  */
 function getTopByBetweenness(limit = 10) {
@@ -1475,19 +1590,7 @@ function getTopByBetweenness(limit = 10) {
   if (GRAPH_STATE.ready) {
     const betweenness = GRAPH_STATE.graph.betweenness();
     if (betweenness && betweenness.length > 0) {
-      // Get top N by betweenness value
-      const indexed = Array.from(betweenness).map((val, idx) => ({ idx, val }));
-      indexed.sort((a, b) => b.val - a.val);
-      const topNodes = indexed.slice(0, limit);
-
-      return topNodes.map(node => {
-        const id = GRAPH_STATE.graph.nodeId(node.idx);
-        const issue = getIssue(id);
-        if (issue) {
-          issue.betweenness = node.val;
-        }
-        return issue;
-      }).filter(Boolean);
+      return getRankedGraphIssues(betweenness, 'betweenness', limit);
     }
   }
 
@@ -1515,18 +1618,7 @@ function getTopByCriticalPath(limit = 10) {
   if (GRAPH_STATE.ready) {
     const heights = GRAPH_STATE.graph.criticalPathHeights();
     if (heights && heights.length > 0) {
-      const indexed = Array.from(heights).map((val, idx) => ({ idx, val }));
-      indexed.sort((a, b) => b.val - a.val);
-      const topNodes = indexed.slice(0, limit);
-
-      return topNodes.map(node => {
-        const id = GRAPH_STATE.graph.nodeId(node.idx);
-        const issue = getIssue(id);
-        if (issue) {
-          issue.critical_path_depth = node.val;
-        }
-        return issue;
-      }).filter(Boolean);
+      return getRankedGraphIssues(heights, 'critical_path_depth', limit);
     }
   }
 
@@ -1542,21 +1634,9 @@ function getTopByHITSHub(limit = 10) {
 
   try {
     const hitsResult = GRAPH_STATE.graph.hitsDefault();
-    if (!hitsResult || !hitsResult.hub) return [];
+    if (!hitsResult || !hitsResult.hubs) return [];
 
-    const hubScores = Array.from(hitsResult.hub);
-    const indexed = hubScores.map((val, idx) => ({ idx, val }));
-    indexed.sort((a, b) => b.val - a.val);
-    const topNodes = indexed.slice(0, limit);
-
-    return topNodes.map(node => {
-      const id = GRAPH_STATE.graph.nodeId(node.idx);
-      const issue = getIssue(id);
-      if (issue) {
-        issue.hits_hub = node.val;
-      }
-      return issue;
-    }).filter(Boolean);
+    return getRankedGraphIssues(hitsResult.hubs, 'hits_hub', limit);
   } catch (e) {
     console.warn('[viewer] getTopByHITSHub failed:', e);
     return [];
@@ -1572,21 +1652,9 @@ function getTopByHITSAuth(limit = 10) {
 
   try {
     const hitsResult = GRAPH_STATE.graph.hitsDefault();
-    if (!hitsResult || !hitsResult.authority) return [];
+    if (!hitsResult || !hitsResult.authorities) return [];
 
-    const authScores = Array.from(hitsResult.authority);
-    const indexed = authScores.map((val, idx) => ({ idx, val }));
-    indexed.sort((a, b) => b.val - a.val);
-    const topNodes = indexed.slice(0, limit);
-
-    return topNodes.map(node => {
-      const id = GRAPH_STATE.graph.nodeId(node.idx);
-      const issue = getIssue(id);
-      if (issue) {
-        issue.hits_auth = node.val;
-      }
-      return issue;
-    }).filter(Boolean);
+    return getRankedGraphIssues(hitsResult.authorities, 'hits_auth', limit);
   } catch (e) {
     console.warn('[viewer] getTopByHITSAuth failed:', e);
     return [];
@@ -1604,18 +1672,7 @@ function getTopByKCore(limit = 10) {
     const kcoreValues = GRAPH_STATE.graph.kcore();
     if (!kcoreValues || kcoreValues.length === 0) return [];
 
-    const indexed = Array.from(kcoreValues).map((val, idx) => ({ idx, val }));
-    indexed.sort((a, b) => b.val - a.val);
-    const topNodes = indexed.slice(0, limit);
-
-    return topNodes.map(node => {
-      const id = GRAPH_STATE.graph.nodeId(node.idx);
-      const issue = getIssue(id);
-      if (issue) {
-        issue.kcore = node.val;
-      }
-      return issue;
-    }).filter(Boolean);
+    return getRankedGraphIssues(kcoreValues, 'kcore', limit);
   } catch (e) {
     console.warn('[viewer] getTopByKCore failed:', e);
     return [];
@@ -1658,33 +1715,12 @@ function getIssuesBySlack(limit = 10, showZeroSlack = true) {
     const slackValues = GRAPH_STATE.graph.slack();
     if (!slackValues || slackValues.length === 0) return [];
 
-    const indexed = Array.from(slackValues).map((val, idx) => ({ idx, val }));
-
-    if (showZeroSlack) {
-      // Show critical path items (zero slack)
-      const criticalPath = indexed.filter(item => item.val === 0);
-      return criticalPath.slice(0, limit).map(node => {
-        const id = GRAPH_STATE.graph.nodeId(node.idx);
-        const issue = getIssue(id);
-        if (issue) {
-          issue.slack = 0;
-          issue.on_critical_path = true;
-        }
-        return issue;
-      }).filter(Boolean);
-    } else {
-      // Show items with most slack (most flexible scheduling)
-      indexed.sort((a, b) => b.val - a.val);
-      return indexed.slice(0, limit).map(node => {
-        const id = GRAPH_STATE.graph.nodeId(node.idx);
-        const issue = getIssue(id);
-        if (issue) {
-          issue.slack = node.val;
-          issue.on_critical_path = node.val === 0;
-        }
-        return issue;
-      }).filter(Boolean);
+    const issues = getRankedGraphIssues(slackValues, 'slack', limit,
+      value => !showZeroSlack || value === 0);
+    for (const issue of issues) {
+      issue.on_critical_path = issue.slack === 0;
     }
+    return issues;
   } catch (e) {
     console.warn('[viewer] getIssuesBySlack failed:', e);
     return [];
@@ -1781,16 +1817,18 @@ function getMeta() {
  * Get dependencies for an issue
  */
 function getIssueDependencies(id) {
-  const blocks = execQuery(`
-    SELECT i.* FROM issue_overview_mv i
-    JOIN dependencies d ON i.id = d.depends_on_id
-    WHERE d.issue_id = ? AND d.type = 'blocks'
-  `, [id]);
-
   const blockedBy = execQuery(`
     SELECT i.* FROM issue_overview_mv i
+    JOIN dependencies d ON i.id = d.depends_on_id
+    WHERE d.issue_id = ? AND d.type IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
+    ORDER BY i.id
+  `, [id]);
+
+  const blocks = execQuery(`
+    SELECT i.* FROM issue_overview_mv i
     JOIN dependencies d ON i.id = d.issue_id
-    WHERE d.depends_on_id = ? AND d.type = 'blocks'
+    WHERE d.depends_on_id = ? AND d.type IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
+    ORDER BY i.id
   `, [id]);
 
   return { blocks, blockedBy };
@@ -2290,6 +2328,7 @@ function beadsApp() {
     stats: {},
     meta: {},
     dbSource: 'loading',
+    searchBackend: '',
 
     // Issues list
     issues: [],
@@ -2334,6 +2373,7 @@ function beadsApp() {
 
     // Selected issue
     selectedIssue: null,
+    copyLinkMessage: '',
     showDepGraph: false,
     issueNavList: [], // List of issue IDs for j/k navigation
     showKeyboardHelp: false, // Keyboard shortcuts help modal
@@ -2563,6 +2603,7 @@ function beadsApp() {
         }
 
         this.dbSource = DB_STATE.source;
+        this.searchBackend = supportsFTS5() ? 'FTS5' : 'substring';
         this.loadingMessage = 'Loading data...';
 
         // Load initial data
@@ -2664,10 +2705,24 @@ function beadsApp() {
       }
     },
 
+    async copyIssueLink() {
+      this.copyLinkMessage = '';
+      if (!this.selectedIssue) return;
+      const url = new URL(window.location.href);
+      url.hash = '#/issue/' + encodeURIComponent(this.selectedIssue.id);
+      try {
+        await navigator.clipboard.writeText(url.href);
+        this.copyLinkMessage = 'Link copied';
+      } catch (err) {
+        this.copyLinkMessage = 'Could not copy. Select the issue link to copy it manually.';
+      }
+    },
+
     /**
      * Handle hash change (browser back/forward navigation)
      */
     handleHashChange() {
+      this.copyLinkMessage = '';
       const urlState = filtersFromURL();
       const hash = window.location.hash;
 
@@ -3544,6 +3599,7 @@ window.beadsViewer = {
   GRAPH_STATE,
   initGraphEngine,
   buildClosedSet,
+  getResolvedIssueIDs,
   recalculateMetrics,
   whatIfClose,
   topWhatIf,

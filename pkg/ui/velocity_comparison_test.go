@@ -75,6 +75,76 @@ func TestVelocityComparisonNavigation(t *testing.T) {
 	}
 }
 
+func TestVelocityComparisonSetDataClampsStaleScrollOffset(t *testing.T) {
+	theme := Theme{Renderer: lipgloss.DefaultRenderer()}
+	m := NewVelocityComparisonModel(theme)
+	m.SetSize(80, 5) // One visible data row.
+
+	now := time.Now().UTC()
+	var many []model.Issue
+	for i, label := range []string{"api", "backend", "cli", "docs", "frontend", "infra"} {
+		closedAt := now.Add(-time.Duration(i+1) * time.Hour)
+		many = append(many, model.Issue{
+			ID:       label,
+			Labels:   []string{label},
+			Status:   model.StatusClosed,
+			ClosedAt: &closedAt,
+		})
+	}
+	m.SetData(many)
+	for range many {
+		m.MoveDown()
+	}
+	if m.scrollOffset == 0 {
+		t.Fatal("test setup did not create a non-zero scroll offset")
+	}
+
+	closedAt := now.Add(-time.Hour)
+	m.SetData([]model.Issue{{
+		ID:       "api-only",
+		Labels:   []string{"api"},
+		Status:   model.StatusClosed,
+		ClosedAt: &closedAt,
+	}})
+
+	if m.cursor != 0 || m.scrollOffset != 0 {
+		t.Fatalf("refresh coordinates = cursor %d, offset %d; want 0, 0", m.cursor, m.scrollOffset)
+	}
+	if view := m.View(); !containsString(view, "api") {
+		t.Fatalf("refreshed non-empty dataset was not rendered:\n%s", view)
+	}
+}
+
+func TestVelocityComparisonResizeKeepsCursorVisible(t *testing.T) {
+	theme := Theme{Renderer: lipgloss.DefaultRenderer()}
+	m := NewVelocityComparisonModel(theme)
+	m.SetSize(80, 10) // Six visible data rows.
+
+	now := time.Now().UTC()
+	var issues []model.Issue
+	for i, label := range []string{"api", "backend", "cli", "docs", "frontend", "infra"} {
+		closedAt := now.Add(-time.Duration(i+1) * time.Hour)
+		issues = append(issues, model.Issue{
+			ID:       label,
+			Labels:   []string{label},
+			Status:   model.StatusClosed,
+			ClosedAt: &closedAt,
+		})
+	}
+	m.SetData(issues)
+	for range issues {
+		m.MoveDown()
+	}
+	if m.cursor != len(issues)-1 || m.scrollOffset != 0 {
+		t.Fatalf("test setup = cursor %d, offset %d", m.cursor, m.scrollOffset)
+	}
+
+	m.SetSize(80, 5) // One visible data row.
+	if got, want := m.scrollOffset, m.cursor; got != want {
+		t.Fatalf("resize offset = %d, want cursor %d to remain visible", got, want)
+	}
+}
+
 func TestVelocityComparisonSelectedLabel(t *testing.T) {
 	theme := Theme{Renderer: lipgloss.DefaultRenderer()}
 	m := NewVelocityComparisonModel(theme)

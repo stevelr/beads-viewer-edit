@@ -6,9 +6,89 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestRobotForecast_ScopeIntersections(t *testing.T) {
+	bv := buildBvBinary(t)
+	if control := os.Getenv("BV_FORECAST_TEST_BINARY"); control != "" {
+		bv = control
+	}
+	t.Setenv("SOURCE_DATE_EPOCH", "1788912000")
+	dir := t.TempDir()
+	writeIssuesJSONL(t, dir, strings.Join([]string{
+		`{"id":"outer","title":"Outside prerequisite","status":"open","priority":1,"issue_type":"task","labels":["other"],"estimated_minutes":120}`,
+		`{"id":"focus","title":"Selected work","status":"open","priority":1,"issue_type":"task","labels":["focus"],"estimated_minutes":60,"dependencies":[{"depends_on_id":"outer","type":"blocks"}]}`,
+		`{"id":"done","title":"Completed sample","status":"closed","priority":1,"issue_type":"task","labels":["focus"],"estimated_minutes":300,"closed_at":"2026-09-08T00:00:00Z"}`,
+	}, "\n")+"\n")
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "sprints.jsonl"), []byte(`{"id":"selected","name":"Selected sprint","bead_ids":["focus"]}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	type payload struct {
+		Count     int              `json:"forecast_count"`
+		Forecasts []map[string]any `json:"forecasts"`
+	}
+	baseline := runScoped(t, bv, dir, "--robot-forecast", "all")
+	var base payload
+	if baseline.exit != nil || json.Unmarshal([]byte(baseline.stdout), &base) != nil || base.Count != 2 {
+		t.Fatalf("baseline failed: %+v", baseline)
+	}
+	byID := make(map[string]map[string]any)
+	for _, forecast := range base.Forecasts {
+		byID[forecast["issue_id"].(string)] = forecast
+	}
+	for _, tc := range []struct {
+		name      string
+		target    string
+		flags     []string
+		want      []string
+		wantError bool
+	}{
+		{"global", "all", []string{"--label", "focus"}, []string{"focus"}, false},
+		{"forecast_label", "all", []string{"--forecast-label", "focus"}, []string{"focus"}, false},
+		{"sprint", "all", []string{"--forecast-sprint", "selected"}, []string{"focus"}, false},
+		{"all_intersect", "all", []string{"--label", "focus", "--forecast-label", "focus", "--forecast-sprint", "selected"}, []string{"focus"}, false},
+		{"disjoint", "all", []string{"--label", "focus", "--forecast-label", "other"}, nil, false},
+		{"empty", "all", []string{"--label", "absent"}, nil, false},
+		{"recipe", "all", []string{"--recipe", "actionable"}, []string{"outer"}, false},
+		{"single_selected", "focus", []string{"--label", "focus", "--forecast-label", "focus", "--forecast-sprint", "selected"}, []string{"focus"}, false},
+		{"single_global_excluded", "outer", []string{"--label", "focus"}, nil, true},
+		{"single_label_excluded", "outer", []string{"--forecast-label", "focus"}, nil, true},
+		{"single_sprint_excluded", "outer", []string{"--forecast-sprint", "selected"}, nil, true},
+		{"single_missing", "missing", nil, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append([]string{"--robot-forecast", tc.target}, tc.flags...)
+			r := runScoped(t, bv, dir, args...)
+			t.Logf("binary=%q argv=%q exit=%v stderr=%s stdout=%s", bv, args, r.exit, r.stderr, r.stdout)
+			if tc.wantError {
+				if r.exit == nil || r.stdout != "" || !strings.Contains(r.stderr, tc.target) {
+					t.Fatalf("excluded target should fail without forecast JSON: %+v", r)
+				}
+				return
+			}
+			var got payload
+			if r.exit != nil || json.Unmarshal([]byte(r.stdout), &got) != nil {
+				t.Fatalf("forecast failed: %+v", r)
+			}
+			var ids []string
+			for _, forecast := range got.Forecasts {
+				id := forecast["issue_id"].(string)
+				ids = append(ids, id)
+				if tc.name != "recipe" && !reflect.DeepEqual(forecast, byID[id]) {
+					t.Errorf("output selection changed estimate context for %s: got=%v baseline=%v", id, forecast, byID[id])
+				}
+			}
+			if !slices.Equal(ids, tc.want) || got.Count != len(tc.want) {
+				t.Errorf("IDs=%v count=%d, want %v", ids, got.Count, tc.want)
+			}
+		})
+	}
+}
 
 func createForecastRepo(t *testing.T) (string, time.Time) {
 	t.Helper()

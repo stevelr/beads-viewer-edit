@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -16,11 +17,11 @@ import (
 	osExec "os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/version"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -29,23 +30,194 @@ const (
 	baseURL          = "https://api.github.com/repos/" + repoOwner + "/" + repoName
 	latestReleaseURL = baseURL + "/releases/latest"
 
-	maxReleaseMetadataBytes = 1 << 20
-	maxDownloadBytes        = 512 << 20
+	maxReleaseMetadataBytes  = 1 << 20
+	maxChecksumManifestBytes = 1 << 20
+	maxDownloadBytes         = 512 << 20
+	githubAPIVersion         = "2022-11-28"
 )
 
 // maxExtractedBinaryBytes is a variable so tests can shrink the limit without
 // constructing large archives. Production keeps it aligned with maxDownloadBytes.
 var maxExtractedBinaryBytes int64 = maxDownloadBytes
 
-// githubToken returns a GitHub personal access token from the environment,
+// Environment variables that control the updater's network behaviour.
+const (
+	// EnvNoUpdateCheck disables the TUI's startup release check when set to a
+	// truthy value. Explicit --check-update / --update invocations ignore it.
+	EnvNoUpdateCheck = "BV_NO_UPDATE_CHECK"
+	// EnvUseToken opts in to sending the ambient GITHUB_TOKEN / GH_TOKEN with
+	// GitHub requests. Without it the updater talks to GitHub anonymously.
+	EnvUseToken = "BV_UPDATE_USE_TOKEN"
+	// envNoSavedConfig is the project-wide switch that makes bv ignore every
+	// file under the user config directory (read and write).
+	envNoSavedConfig = "BV_NO_SAVED_CONFIG"
+
+	userConfigFileName        = "config.yaml"
+	startupDisclosureFileName = "update-check-disclosed"
+)
+
+// StartupCheckDisclosure is the footer text shown the first time bv performs
+// its automatic release check, so the network access is never silent (#197).
+const StartupCheckDisclosure = "checked github.com for updates (BV_NO_UPDATE_CHECK=1 to disable)"
+
+// Preferences is the resolved update policy: defaults, then
+// ~/.config/bv/config.yaml `updates:` keys, then environment overrides.
+type Preferences struct {
+	// CheckOnStartup controls the TUI's background release check.
+	CheckOnStartup bool
+	// UseAmbientToken allows GITHUB_TOKEN / GH_TOKEN to be attached to
+	// requests that target GitHub hosts.
+	UseAmbientToken bool
+}
+
+// userUpdateConfig is the subset of config.yaml the updater understands:
+//
+//	updates:
+//	  check: false      # skip the startup release check
+//	  use_token: true   # send the ambient GITHUB_TOKEN / GH_TOKEN
+type userUpdateConfig struct {
+	Updates struct {
+		Check    *bool `yaml:"check"`
+		UseToken *bool `yaml:"use_token"`
+	} `yaml:"updates"`
+}
+
+// envTruthy treats any non-empty value other than an explicit "0"/"false"/
+// "no"/"off" as enabled, so BV_NO_UPDATE_CHECK=1 and BV_NO_UPDATE_CHECK=true
+// both work while BV_NO_UPDATE_CHECK=0 re-enables the default.
+func envTruthy(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "0", "false", "no", "off":
+		return false
+	}
+	return true
+}
+
+func savedConfigDisabled() bool {
+	return os.Getenv(envNoSavedConfig) != ""
+}
+
+// UserConfigDir returns bv's user configuration directory:
+// $XDG_CONFIG_HOME/bv when XDG_CONFIG_HOME is set, otherwise ~/.config/bv.
+func UserConfigDir() (string, error) {
+	if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
+		return filepath.Join(xdg, "bv"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolving user config dir: %w", err)
+	}
+	if home == "" {
+		return "", fmt.Errorf("resolving user config dir: empty home directory")
+	}
+	return filepath.Join(home, ".config", "bv"), nil
+}
+
+// loadUserUpdateConfig reads the `updates:` section of config.yaml. A missing
+// or unreadable file, or BV_NO_SAVED_CONFIG, yields the zero value so callers
+// fall back to defaults.
+func loadUserUpdateConfig() userUpdateConfig {
+	var cfg userUpdateConfig
+	if savedConfigDisabled() {
+		return cfg
+	}
+	dir, err := UserConfigDir()
+	if err != nil {
+		return cfg
+	}
+	data, err := os.ReadFile(filepath.Join(dir, userConfigFileName))
+	if err != nil {
+		return cfg
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return userUpdateConfig{}
+	}
+	return cfg
+}
+
+// LoadPreferences resolves the update policy. Defaults are "check on startup,
+// never send the ambient token"; config.yaml can flip either, and the
+// environment (BV_NO_UPDATE_CHECK, BV_UPDATE_USE_TOKEN) wins over both.
+func LoadPreferences() Preferences {
+	prefs := Preferences{CheckOnStartup: true, UseAmbientToken: false}
+	cfg := loadUserUpdateConfig()
+	if cfg.Updates.Check != nil {
+		prefs.CheckOnStartup = *cfg.Updates.Check
+	}
+	if cfg.Updates.UseToken != nil {
+		prefs.UseAmbientToken = *cfg.Updates.UseToken
+	}
+	if envTruthy(os.Getenv(EnvNoUpdateCheck)) {
+		prefs.CheckOnStartup = false
+	}
+	if envTruthy(os.Getenv(EnvUseToken)) {
+		prefs.UseAmbientToken = true
+	}
+	return prefs
+}
+
+// StartupCheckEnabled reports whether the TUI should run its automatic
+// release check at startup.
+func StartupCheckEnabled() bool {
+	return LoadPreferences().CheckOnStartup
+}
+
+// StartupDisclosurePending reports whether the one-time "checked github.com"
+// footer notice still has to be shown. The notice is recorded in the user
+// config directory, so it appears once per config-directory lifetime; with
+// BV_NO_SAVED_CONFIG nothing can be recorded and nothing is shown.
+func StartupDisclosurePending() bool {
+	if savedConfigDisabled() {
+		return false
+	}
+	dir, err := UserConfigDir()
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(filepath.Join(dir, startupDisclosureFileName))
+	return os.IsNotExist(err)
+}
+
+// RecordStartupDisclosure marks the startup-check disclosure as shown by
+// writing a marker file into the user config directory.
+func RecordStartupDisclosure() error {
+	if savedConfigDisabled() {
+		return nil
+	}
+	dir, err := UserConfigDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating config dir: %w", err)
+	}
+	body := "bv showed the startup update-check disclosure on " + time.Now().UTC().Format(time.RFC3339) + "\n"
+	if err := os.WriteFile(filepath.Join(dir, startupDisclosureFileName), []byte(body), 0o644); err != nil {
+		return fmt.Errorf("recording update-check disclosure: %w", err)
+	}
+	return nil
+}
+
+// ambientGitHubToken returns the GitHub token present in the environment,
 // checking GITHUB_TOKEN first, then GH_TOKEN. Returns empty string if
-// neither is set. Using a token raises the API rate limit from 60 to
-// 5,000 requests/hour and avoids 403 errors on shared IPs (#117).
-func githubToken() string {
+// neither is set.
+func ambientGitHubToken() string {
 	if tok := strings.TrimSpace(os.Getenv("GITHUB_TOKEN")); tok != "" {
 		return tok
 	}
 	return strings.TrimSpace(os.Getenv("GH_TOKEN"))
+}
+
+// githubToken returns the token to attach to GitHub requests, or "" when the
+// user has not opted in via BV_UPDATE_USE_TOKEN=1 or config.yaml
+// `updates: {use_token: true}`. Public release metadata needs no token; using
+// one only raises the rate limit from 60 to 5,000 requests/hour (#117), so a
+// credential that happens to be in the environment is never sent by default.
+func githubToken() string {
+	if !LoadPreferences().UseAmbientToken {
+		return ""
+	}
+	return ambientGitHubToken()
 }
 
 // isGitHubHost returns true if the given URL points to a github.com or
@@ -57,14 +229,21 @@ func isGitHubHost(u *url.URL) bool {
 		host == "githubusercontent.com" || strings.HasSuffix(host, ".githubusercontent.com")
 }
 
-// setGitHubAuth adds Authorization header to a request if a GitHub token
-// is available in the environment (GITHUB_TOKEN or GH_TOKEN) and the
-// request targets a GitHub domain. This prevents leaking tokens to
+// setGitHubAuth adds an Authorization header to a request when the user has
+// opted in to using the ambient GITHUB_TOKEN / GH_TOKEN (see githubToken)
+// and the request targets a GitHub domain. This prevents leaking tokens to
 // non-GitHub hosts (e.g. CDN redirects).
 func setGitHubAuth(req *http.Request) {
 	if tok := githubToken(); tok != "" && isGitHubHost(req.URL) {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
+}
+
+func setGitHubAPIHeaders(req *http.Request, userAgent string) {
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", githubAPIVersion)
+	req.Header.Set("User-Agent", userAgent)
+	setGitHubAuth(req)
 }
 
 func safeAssetName(name string) (string, error) {
@@ -100,9 +279,11 @@ func decodeReleaseMetadata(body io.Reader) (Release, error) {
 
 // Release represents a GitHub release
 type Release struct {
-	TagName string  `json:"tag_name"`
-	HTMLURL string  `json:"html_url"`
-	Assets  []Asset `json:"assets"`
+	TagName    string  `json:"tag_name"`
+	HTMLURL    string  `json:"html_url"`
+	Draft      bool    `json:"draft"`
+	Prerelease bool    `json:"prerelease"`
+	Assets     []Asset `json:"assets"`
 }
 
 // Asset represents a release asset (binary, checksum file, etc.)
@@ -110,6 +291,8 @@ type Asset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 	Size               int64  `json:"size"`
+	Digest             string `json:"digest"`
+	State              string `json:"state"`
 }
 
 // UpdateResult contains information about an update operation
@@ -125,21 +308,30 @@ type UpdateResult struct {
 // CheckForUpdates queries GitHub for the latest release.
 // Returns the new version tag if an update is available, empty string otherwise.
 func CheckForUpdates() (string, string, error) {
-	// Set a short timeout to avoid blocking startup for too long
+	// The TUI runs this command asynchronously, so allow enough time for slow
+	// networks without delaying startup or input handling.
 	client := &http.Client{
-		Timeout: 2 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 	return checkForUpdates(client, latestReleaseURL)
 }
 
 func checkForUpdates(client *http.Client, url string) (string, string, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if client == nil {
+		return "", "", fmt.Errorf("http client is nil")
+	}
+	timeout := client.Timeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", "", err
 	}
-	// GitHub recommends sending a UA; some endpoints 403 without it.
-	req.Header.Set("User-Agent", "beads-viewer-update-check")
-	setGitHubAuth(req)
+	setGitHubAPIHeaders(req, "beads-viewer-update-check")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -148,247 +340,277 @@ func checkForUpdates(client *http.Client, url string) (string, string, error) {
 		}
 		return "", "", err
 	}
-	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		// For rate/abuse limits, avoid treating as fatal; just skip update.
-		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
-			return "", "", nil
-		}
+		resp.Body.Close()
 		return "", "", fmt.Errorf("github api returned status: %s", resp.Status)
 	}
 
 	rel, err := decodeReleaseMetadata(resp.Body)
+	closeErr := resp.Body.Close()
 	if err != nil {
+		return "", "", fmt.Errorf("decode latest release metadata: %w", err)
+	}
+	if closeErr != nil {
+		return "", "", fmt.Errorf("close latest release response: %w", closeErr)
+	}
+	if err := validateReleaseIdentity(&rel); err != nil {
 		return "", "", err
 	}
 
-	// Compare versions
-	// Assumes SemVer with 'v' prefix
-	if compareVersions(rel.TagName, version.Version) > 0 {
-		return rel.TagName, rel.HTMLURL, nil
+	newer, err := isNewerVersion(rel.TagName, version.Version)
+	if err != nil {
+		return "", "", err
+	}
+	if !newer {
+		return "", "", nil
 	}
 
-	return "", "", nil
+	if err := ValidateReleaseForUpdate(&rel); err != nil {
+		return "", "", fmt.Errorf("latest release %s is not installable: %w", rel.TagName, err)
+	}
+	if err := validateRemoteChecksumManifest(ctx, client, &rel); err != nil {
+		return "", "", fmt.Errorf("latest release %s has an unusable checksum manifest: %w", rel.TagName, err)
+	}
+	return rel.TagName, rel.HTMLURL, nil
 }
 
 // IsNewerThanCurrent reports whether candidate is newer than this binary's version.
 func IsNewerThanCurrent(candidate string) bool {
-	return compareVersions(candidate, version.Version) > 0
+	newer, err := CheckNewerThanCurrent(candidate)
+	return err == nil && newer
 }
 
-// compareVersions compares semver-ish strings with optional leading 'v' and optional pre-release
-// suffix (e.g., v1.2.3-alpha). Pre-release versions are considered LOWER than their corresponding
-// release version per SemVer spec, EXCEPT for development builds.
-// Returns 1 if v1>v2, -1 if v1<v2, 0 if equal.
-//
-// Special handling for development builds:
-// Version strings containing dev-like suffixes (e.g. "dev", "dirty", "nightly", "local")
-// are considered NEWER than stable releases to prevent false "update available" prompts.
-// This applies both to unparseable versions like "dev" and parseable versions like "v0.11.2-dirty".
-func compareVersions(v1, v2 string) int {
-	type parsed struct {
-		parts      []int
-		prerelease bool
-		preLabel   string
+// CheckNewerThanCurrent reports whether candidate is newer. It returns an
+// error for a malformed candidate or non-development current version; known
+// local/development version markers fail closed without advertising an update.
+func CheckNewerThanCurrent(candidate string) (bool, error) {
+	return isNewerVersion(candidate, version.Version)
+}
+
+type parsedVersion struct {
+	core           [3]string
+	coreComponents int
+	prerelease     []string
+}
+
+func parseVersion(raw string) (parsedVersion, error) {
+	var parsed parsedVersion
+	raw = strings.TrimSpace(raw)
+	if len(raw) > 128 {
+		return parsed, fmt.Errorf("version is too long")
+	}
+	raw = strings.TrimPrefix(raw, "v")
+	if raw == "" {
+		return parsed, fmt.Errorf("version is empty")
 	}
 
-	// isDevLabel returns true if the prerelease label indicates a development build
-	isDevLabel := func(label string) bool {
-		label = strings.ToLower(strings.TrimSpace(label))
-		return strings.Contains(label, "dev") ||
-			strings.Contains(label, "dirty") ||
-			strings.Contains(label, "nightly") ||
-			strings.Contains(label, "local") ||
-			strings.Contains(label, "snapshot") ||
-			strings.Contains(label, "git")
+	versionAndBuild := strings.Split(raw, "+")
+	if len(versionAndBuild) > 2 {
+		return parsed, fmt.Errorf("version %q contains multiple build metadata separators", raw)
 	}
-
-	parse := func(v string) *parsed {
-		v = strings.TrimSpace(v)
-		v = strings.TrimPrefix(v, "v")
-		prerelease := false
-		preLabel := ""
-		if idx := strings.Index(v, "-"); idx != -1 {
-			prerelease = true
-			preLabel = strings.TrimSpace(v[idx+1:])
-			v = v[:idx] // compare only main version numbers
-		}
-		parts := strings.Split(v, ".")
-		res := make([]int, 3)
-
-		// Optimization: if no parts are numeric, fail early
-		allNonNumeric := true
-		for _, part := range parts {
-			if _, err := strconv.Atoi(part); err == nil {
-				allNonNumeric = false
-				break
-			}
-		}
-		if allNonNumeric {
-			return nil
-		}
-
-		for i := 0; i < len(res) && i < len(parts); i++ {
-			if n, err := strconv.Atoi(parts[i]); err == nil {
-				res[i] = n
-			} else {
-				// If a major/minor/patch component isn't a number,
-				// treat the whole version as non-semver (e.g. "dev")
-				return nil
-			}
-		}
-		return &parsed{parts: res, prerelease: prerelease, preLabel: preLabel}
-	}
-
-	p1 := parse(v1)
-	p2 := parse(v2)
-
-	// If local version (v2) is a development build (unparseable), consider it newer
-	// than any release to prevent downgrade prompts.
-	isDev := func(v string) bool {
-		v = strings.ToLower(strings.TrimSpace(v))
-		return strings.Contains(v, "dev") ||
-			strings.Contains(v, "dirty") ||
-			strings.Contains(v, "nightly") ||
-			strings.Contains(v, "local") ||
-			strings.Contains(v, "snapshot") ||
-			strings.Contains(v, "git")
-	}
-
-	if p2 == nil && isDev(v2) {
-		return -1 // v2 (dev) > v1 (any)
-	}
-
-	// Special case: if local version (v2) has a dev-like prerelease suffix,
-	// treat it as newer than a release with the same base version.
-	// e.g., v0.11.2-dirty should NOT prompt to update to v0.11.2
-	if p1 != nil && p2 != nil && p2.prerelease && isDevLabel(p2.preLabel) {
-		// Check if base versions are the same or local is newer
-		for i := 0; i < 3; i++ {
-			if p1.parts[i] > p2.parts[i] {
-				// Remote has higher version - this is a real update
-				break
-			}
-			if p1.parts[i] < p2.parts[i] {
-				// Local base version is higher - definitely no update needed
-				return -1
-			}
-		}
-		// Base versions are equal; local is a dev build of this version
-		// Consider local as newer to prevent false update prompts
-		partsEqual := true
-		for i := 0; i < 3; i++ {
-			if p1.parts[i] != p2.parts[i] {
-				partsEqual = false
-				break
-			}
-		}
-		if partsEqual {
-			return -1 // dev build is considered newer than same-version release
+	if len(versionAndBuild) == 2 {
+		if err := validateVersionIdentifiers(versionAndBuild[1], false); err != nil {
+			return parsed, fmt.Errorf("invalid build metadata in version %q: %w", raw, err)
 		}
 	}
+	raw = versionAndBuild[0]
 
-	// If one is parsed (valid semver) and the other is not (dev/custom),
-	// treat the parsed one as newer than empty/unknown, but dev/nightly newer than released?
-	// For our updater: unparsable (dev/dirty/empty) should NOT trigger downgrade prompts.
-	if p1 != nil && p2 == nil {
-		return 1 // v1 valid > v2 unknown
-	}
-	if p1 == nil && p2 != nil {
-		return -1 // v1 unknown < v2 valid
-	}
-	// If both are unparsable (e.g., empty strings), consider equal to avoid upgrade spam
-	if p1 == nil && p2 == nil {
-		return strings.Compare(v1, v2)
+	versionAndPre := strings.SplitN(raw, "-", 2)
+	if len(versionAndPre) == 2 {
+		if err := validateVersionIdentifiers(versionAndPre[1], true); err != nil {
+			return parsed, fmt.Errorf("invalid prerelease in version %q: %w", raw, err)
+		}
+		parsed.prerelease = strings.Split(versionAndPre[1], ".")
 	}
 
-	if p1 != nil && p2 != nil {
-		for i := 0; i < 3; i++ {
-			if p1.parts[i] > p2.parts[i] {
-				return 1
-			}
-			if p1.parts[i] < p2.parts[i] {
-				return -1
+	core := strings.Split(versionAndPre[0], ".")
+	if len(core) == 0 || len(core) > len(parsed.core) {
+		return parsed, fmt.Errorf("version %q must have one to three numeric components", raw)
+	}
+	for i := range parsed.core {
+		parsed.core[i] = "0"
+	}
+	for i, component := range core {
+		if !isNumericIdentifier(component) {
+			return parsed, fmt.Errorf("version %q has non-numeric core component %q", raw, component)
+		}
+		if len(component) > 1 && component[0] == '0' {
+			return parsed, fmt.Errorf("version %q has a leading zero in core component %q", raw, component)
+		}
+		parsed.core[i] = component
+	}
+	parsed.coreComponents = len(core)
+	return parsed, nil
+}
+
+func validateVersionIdentifiers(value string, rejectNumericLeadingZeros bool) error {
+	for _, identifier := range strings.Split(value, ".") {
+		if identifier == "" {
+			return fmt.Errorf("identifier is empty")
+		}
+		for _, char := range identifier {
+			if (char < '0' || char > '9') && (char < 'A' || char > 'Z') &&
+				(char < 'a' || char > 'z') && char != '-' {
+				return fmt.Errorf("identifier %q contains an invalid character", identifier)
 			}
 		}
-		// main versions equal: compare prerelease labels
-		if p1.prerelease || p2.prerelease {
-			if p1.prerelease && !p2.prerelease {
-				return -1 // prerelease is lower than release
-			}
-			if !p1.prerelease && p2.prerelease {
-				return 1
-			}
-			// both prerelease: compare dot-separated identifiers
-			parts1 := strings.Split(p1.preLabel, ".")
-			parts2 := strings.Split(p2.preLabel, ".")
-
-			len1 := len(parts1)
-			len2 := len(parts2)
-			limit := len1
-			if len2 < limit {
-				limit = len2
-			}
-
-			for i := 0; i < limit; i++ {
-				part1 := parts1[i]
-				part2 := parts2[i]
-
-				// Check if parts are numeric
-				num1, err1 := strconv.Atoi(part1)
-				num2, err2 := strconv.Atoi(part2)
-
-				isNum1 := err1 == nil
-				isNum2 := err2 == nil
-
-				if isNum1 && isNum2 {
-					// Both numeric: compare numerically
-					if num1 > num2 {
-						return 1
-					}
-					if num1 < num2 {
-						return -1
-					}
-				} else if !isNum1 && !isNum2 {
-					// Both non-numeric: compare lexically
-					if part1 > part2 {
-						return 1
-					}
-					if part1 < part2 {
-						return -1
-					}
-				} else {
-					// One numeric, one non-numeric.
-					// SemVer: numeric has lower precedence than non-numeric
-					if isNum1 {
-						return -1 // part1 is numeric (lower)
-					}
-					return 1 // part2 is numeric (lower) -> part1 is non-numeric (higher)
-				}
-			}
-
-			// If all compared parts are equal, larger set of fields has higher precedence
-			if len1 > len2 {
-				return 1
-			}
-			if len1 < len2 {
-				return -1
-			}
+		if rejectNumericLeadingZeros && len(identifier) > 1 && identifier[0] == '0' && isNumericIdentifier(identifier) {
+			return fmt.Errorf("numeric identifier %q has a leading zero", identifier)
 		}
+	}
+	return nil
+}
+
+func isNumericIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func compareNumericIdentifiers(v1, v2 string) int {
+	if len(v1) != len(v2) {
+		if len(v1) > len(v2) {
+			return 1
+		}
+		return -1
+	}
+	return strings.Compare(v1, v2)
+}
+
+func compareVersionCore(v1, v2 parsedVersion) int {
+	for i := range v1.core {
+		if result := compareNumericIdentifiers(v1.core[i], v2.core[i]); result != 0 {
+			return result
+		}
+	}
+	return 0
+}
+
+func compareParsedVersions(v1, v2 parsedVersion) int {
+	if result := compareVersionCore(v1, v2); result != 0 {
+		return result
+	}
+	if len(v1.prerelease) == 0 && len(v2.prerelease) == 0 {
 		return 0
 	}
-
-	// Fallback: both are non-semver (e.g. "dev" vs "dirty").
-	// Use lexicographic sort just to be deterministic.
-	v1 = strings.TrimPrefix(strings.TrimSpace(v1), "v")
-	v2 = strings.TrimPrefix(strings.TrimSpace(v2), "v")
-	if v1 > v2 {
+	if len(v1.prerelease) == 0 {
 		return 1
-	} else if v1 < v2 {
+	}
+	if len(v2.prerelease) == 0 {
+		return -1
+	}
+
+	limit := len(v1.prerelease)
+	if len(v2.prerelease) < limit {
+		limit = len(v2.prerelease)
+	}
+	for i := 0; i < limit; i++ {
+		part1 := v1.prerelease[i]
+		part2 := v2.prerelease[i]
+		numeric1 := isNumericIdentifier(part1)
+		numeric2 := isNumericIdentifier(part2)
+		switch {
+		case numeric1 && numeric2:
+			if result := compareNumericIdentifiers(part1, part2); result != 0 {
+				return result
+			}
+		case numeric1:
+			return -1
+		case numeric2:
+			return 1
+		default:
+			if result := strings.Compare(part1, part2); result != 0 {
+				return result
+			}
+		}
+	}
+	if len(v1.prerelease) > len(v2.prerelease) {
+		return 1
+	}
+	if len(v1.prerelease) < len(v2.prerelease) {
 		return -1
 	}
 	return 0
+}
+
+func isDevelopmentVersion(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if len(raw) > 0 && (raw[0] == 'v' || raw[0] == 'V') {
+		raw = raw[1:]
+	}
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	for _, marker := range []string{"dev", "dirty", "nightly", "local", "snapshot", "git"} {
+		if hasDevelopmentMarker(raw, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDevelopmentPrerelease(parsed parsedVersion) bool {
+	for _, identifier := range parsed.prerelease {
+		identifier = strings.ToLower(identifier)
+		for _, marker := range []string{"dev", "dirty", "nightly", "local", "snapshot", "git"} {
+			if hasDevelopmentMarker(identifier, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasDevelopmentMarker(value, marker string) bool {
+	if value == marker || strings.HasPrefix(value, marker+"-") {
+		return true
+	}
+	if len(value) <= len(marker) || !strings.HasPrefix(value, marker) {
+		return false
+	}
+	next := value[len(marker)]
+	return next >= '0' && next <= '9'
+}
+
+func isNewerVersion(candidate, current string) (bool, error) {
+	parsedCandidate, err := parseVersion(candidate)
+	if err != nil {
+		return false, fmt.Errorf("invalid candidate version %q: %w", candidate, err)
+	}
+	parsedCurrent, err := parseVersion(current)
+	if err != nil {
+		if isDevelopmentVersion(current) {
+			return false, nil
+		}
+		return false, fmt.Errorf("invalid current version %q: %w", current, err)
+	}
+	if isDevelopmentPrerelease(parsedCurrent) && compareVersionCore(parsedCandidate, parsedCurrent) <= 0 {
+		return false, nil
+	}
+	return compareParsedVersions(parsedCandidate, parsedCurrent) > 0, nil
+}
+
+// compareVersions compares semantic versions with an optional leading v. It
+// accepts one-to-three numeric core components for compatibility with older bv
+// tags and ignores build metadata as required by Semantic Versioning. Invalid
+// inputs compare equal so callers fail closed instead of announcing an update.
+func compareVersions(v1, v2 string) int {
+	p1, err1 := parseVersion(v1)
+	p2, err2 := parseVersion(v2)
+	if err2 != nil && isDevelopmentVersion(v2) {
+		return -1
+	}
+	if err1 != nil || err2 != nil {
+		return 0
+	}
+	if isDevelopmentPrerelease(p2) && compareVersionCore(p1, p2) <= 0 {
+		return -1
+	}
+	return compareParsedVersions(p1, p2)
 }
 
 // GetLatestRelease fetches full release info including assets
@@ -398,8 +620,7 @@ func GetLatestRelease() (*Release, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "beads-viewer-updater")
-	setGitHubAuth(req)
+	setGitHubAPIHeaders(req, "beads-viewer-updater")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -418,6 +639,9 @@ func GetLatestRelease() (*Release, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse release info: %w", err)
 	}
+	if err := validateReleaseIdentity(&rel); err != nil {
+		return nil, err
+	}
 
 	return &rel, nil
 }
@@ -429,33 +653,45 @@ func platformArchiveExtension(goos string) string {
 	return ".tar.gz"
 }
 
+// stableAssetName is the unversioned archive name (bv_<os>_<arch>.<ext>)
+// that releases up to v0.22.0 used; kept as a fallback so the updater can
+// still install those releases and any release published by an older
+// goreleaser configuration.
 func stableAssetName() string {
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
 	return fmt.Sprintf("bv_%s_%s%s", goos, goarch, platformArchiveExtension(goos))
 }
 
-// getAssetName returns the legacy versioned asset name for older releases.
+// getAssetName returns the versioned archive name (bv_<version>_<os>_<arch>.<ext>)
+// that .goreleaser.yaml produces (#195).
 func getAssetName(version string) string {
 	ver := strings.TrimPrefix(version, "v")
 	return fmt.Sprintf("bv_%s_%s_%s%s", ver, runtime.GOOS, runtime.GOARCH, platformArchiveExtension(runtime.GOOS))
 }
 
+// platformAssetNames lists the archive names to try for this OS/arch, most
+// specific first: the versioned name, then the unversioned legacy name, then
+// the old Windows tar.gz variant.
 func platformAssetNames(version string) []string {
 	ver := strings.TrimPrefix(version, "v")
 
-	names := []string{stableAssetName()}
+	var names []string
 	if ver != "" {
 		names = append(names, getAssetName(version))
-		if runtime.GOOS == "windows" {
-			names = append(names, fmt.Sprintf("bv_%s_%s_%s.tar.gz", ver, runtime.GOOS, runtime.GOARCH))
-		}
+	}
+	names = append(names, stableAssetName())
+	if ver != "" && runtime.GOOS == "windows" {
+		names = append(names, fmt.Sprintf("bv_%s_%s_%s.tar.gz", ver, runtime.GOOS, runtime.GOARCH))
 	}
 	return names
 }
 
 // FindPlatformAsset finds the appropriate asset for the current OS/arch
 func (r *Release) FindPlatformAsset() *Asset {
+	if r == nil {
+		return nil
+	}
 	for _, targetName := range platformAssetNames(r.TagName) {
 		for i := range r.Assets {
 			if r.Assets[i].Name == targetName {
@@ -467,6 +703,9 @@ func (r *Release) FindPlatformAsset() *Asset {
 }
 
 func (r *Release) findPlatformAssetWithChecksum(checksums map[string]string) *Asset {
+	if r == nil {
+		return nil
+	}
 	for _, targetName := range platformAssetNames(r.TagName) {
 		if _, ok := checksums[targetName]; !ok {
 			continue
@@ -482,12 +721,238 @@ func (r *Release) findPlatformAssetWithChecksum(checksums map[string]string) *As
 
 // FindChecksumAsset finds the checksums file
 func (r *Release) FindChecksumAsset() *Asset {
+	if r == nil {
+		return nil
+	}
 	for i := range r.Assets {
 		if r.Assets[i].Name == "checksums.txt" {
 			return &r.Assets[i]
 		}
 	}
 	return nil
+}
+
+func parseGitHubHTTPSURL(rawURL, field string) (*url.URL, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s URL: %w", field, err)
+	}
+	if parsed.Scheme != "https" || strings.ToLower(parsed.Hostname()) != "github.com" || parsed.Port() != "" {
+		return nil, fmt.Errorf("%s URL must use HTTPS on github.com", field)
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, fmt.Errorf("%s URL must not contain credentials, a query, or a fragment", field)
+	}
+	return parsed, nil
+}
+
+func validateReleaseIdentity(release *Release) error {
+	if release == nil {
+		return fmt.Errorf("release metadata is nil")
+	}
+	if release.TagName != strings.TrimSpace(release.TagName) {
+		return fmt.Errorf("release tag %q has surrounding whitespace", release.TagName)
+	}
+	if release.Draft {
+		return fmt.Errorf("release %q is still a draft", release.TagName)
+	}
+	if release.Prerelease {
+		return fmt.Errorf("release %q is marked as a prerelease", release.TagName)
+	}
+	parsed, err := parseVersion(release.TagName)
+	if err != nil {
+		return fmt.Errorf("invalid release tag %q: %w", release.TagName, err)
+	}
+	if len(parsed.prerelease) != 0 {
+		return fmt.Errorf("release tag %q is a semantic-version prerelease", release.TagName)
+	}
+	if parsed.coreComponents != 3 {
+		return fmt.Errorf("release tag %q must use major.minor.patch", release.TagName)
+	}
+	releaseURL, err := parseGitHubHTTPSURL(release.HTMLURL, "release page")
+	if err != nil {
+		return err
+	}
+	expectedPath := fmt.Sprintf("/%s/%s/releases/tag/%s", repoOwner, repoName, release.TagName)
+	if releaseURL.Path != expectedPath {
+		return fmt.Errorf("release page URL path %q does not match %q", releaseURL.Path, expectedPath)
+	}
+	return nil
+}
+
+func validateReleaseAsset(release *Release, asset *Asset, description string, maxSize int64) error {
+	if release == nil {
+		return fmt.Errorf("release metadata is nil")
+	}
+	if asset == nil {
+		return fmt.Errorf("%s is missing", description)
+	}
+	assetName, err := safeAssetName(asset.Name)
+	if err != nil {
+		return fmt.Errorf("invalid %s: %w", description, err)
+	}
+	if asset.State != "uploaded" {
+		return fmt.Errorf("%s %q is not uploaded (state %q)", description, asset.Name, asset.State)
+	}
+	if asset.Size <= 0 {
+		return fmt.Errorf("%s %q has invalid size %d", description, asset.Name, asset.Size)
+	}
+	if maxSize <= 0 {
+		return fmt.Errorf("%s has invalid maximum size %d", description, maxSize)
+	}
+	if asset.Size > maxSize {
+		return fmt.Errorf("%s %q exceeds maximum size %d", description, asset.Name, maxSize)
+	}
+	assetURL, err := parseGitHubHTTPSURL(asset.BrowserDownloadURL, description)
+	if err != nil {
+		return err
+	}
+	expectedPath := fmt.Sprintf("/%s/%s/releases/download/%s/%s", repoOwner, repoName, release.TagName, assetName)
+	if assetURL.Path != expectedPath {
+		return fmt.Errorf("%s URL path %q does not match %q", description, assetURL.Path, expectedPath)
+	}
+	if _, err := assetSHA256Digest(asset); err != nil {
+		return fmt.Errorf("invalid %s digest: %w", description, err)
+	}
+	return nil
+}
+
+func assetSHA256Digest(asset *Asset) (string, error) {
+	if asset == nil {
+		return "", fmt.Errorf("asset is nil")
+	}
+	const prefix = "sha256:"
+	if !strings.HasPrefix(asset.Digest, prefix) {
+		return "", fmt.Errorf("asset %q digest must start with %q", asset.Name, prefix)
+	}
+	digest := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(asset.Digest, prefix)))
+	if len(digest) != sha256.Size*2 {
+		return "", fmt.Errorf("asset %q has invalid sha256 digest length %d", asset.Name, len(digest))
+	}
+	if _, err := hex.DecodeString(digest); err != nil {
+		return "", fmt.Errorf("asset %q has invalid sha256 digest: %w", asset.Name, err)
+	}
+	return digest, nil
+}
+
+func releaseAssetsForUpdate(release *Release) (*Asset, *Asset, error) {
+	if err := validateReleaseIdentity(release); err != nil {
+		return nil, nil, err
+	}
+	asset := release.FindPlatformAsset()
+	if asset == nil {
+		return nil, nil, fmt.Errorf("no binary available for %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	if err := validateReleaseAsset(release, asset, "platform asset", maxDownloadBytes); err != nil {
+		return nil, nil, err
+	}
+	checksumAsset := release.FindChecksumAsset()
+	if checksumAsset == nil {
+		return nil, nil, fmt.Errorf("checksums.txt asset is missing")
+	}
+	if err := validateReleaseAsset(release, checksumAsset, "checksum asset", maxChecksumManifestBytes); err != nil {
+		return nil, nil, err
+	}
+	return asset, checksumAsset, nil
+}
+
+func checkedPlatformAsset(release *Release, checksums map[string]string) (*Asset, string, error) {
+	asset := release.findPlatformAssetWithChecksum(checksums)
+	if asset == nil {
+		return nil, "", fmt.Errorf("checksums.txt has no entry for a %s/%s release asset", runtime.GOOS, runtime.GOARCH)
+	}
+	if err := validateReleaseAsset(release, asset, "checksummed platform asset", maxDownloadBytes); err != nil {
+		return nil, "", err
+	}
+	expectedHash, ok := checksums[asset.Name]
+	if !ok {
+		return nil, "", fmt.Errorf("no checksum found for %s", asset.Name)
+	}
+	assetDigest, err := assetSHA256Digest(asset)
+	if err != nil {
+		return nil, "", err
+	}
+	if expectedHash != assetDigest {
+		return nil, "", fmt.Errorf("checksums.txt digest for %s disagrees with GitHub release metadata", asset.Name)
+	}
+	return asset, assetDigest, nil
+}
+
+// ValidateReleaseForUpdate verifies that a release is stable and has bounded
+// assets for this platform plus the checksum manifest required by the automatic
+// installer. URLs must match this repository and tag, and both assets must
+// expose valid GitHub SHA-256 digests.
+func ValidateReleaseForUpdate(release *Release) error {
+	_, _, err := releaseAssetsForUpdate(release)
+	return err
+}
+
+func downloadReleaseAssetBytes(ctx context.Context, client *http.Client, asset *Asset, maxSize int64) ([]byte, error) {
+	if client == nil {
+		return nil, fmt.Errorf("http client is nil")
+	}
+	if asset == nil {
+		return nil, fmt.Errorf("release asset is nil")
+	}
+	if asset.Size <= 0 || asset.Size > maxSize {
+		return nil, fmt.Errorf("release asset %q has invalid size %d", asset.Name, asset.Size)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, asset.BrowserDownloadURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "beads-viewer-update-check")
+	setGitHubAuth(req)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download returned status: %s", resp.Status)
+	}
+	if resp.ContentLength > 0 && resp.ContentLength != asset.Size {
+		return nil, fmt.Errorf("size mismatch: expected %d, got header %d", asset.Size, resp.ContentLength)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) != asset.Size {
+		return nil, fmt.Errorf("downloaded size mismatch: expected %d, got %d", asset.Size, len(data))
+	}
+	expectedDigest, err := assetSHA256Digest(asset)
+	if err != nil {
+		return nil, err
+	}
+	actualDigest := sha256.Sum256(data)
+	if hex.EncodeToString(actualDigest[:]) != expectedDigest {
+		return nil, fmt.Errorf("digest mismatch for %s", asset.Name)
+	}
+	return data, nil
+}
+
+func validateRemoteChecksumManifest(ctx context.Context, client *http.Client, release *Release) error {
+	_, checksumAsset, err := releaseAssetsForUpdate(release)
+	if err != nil {
+		return err
+	}
+	data, err := downloadReleaseAssetBytes(ctx, client, checksumAsset, maxChecksumManifestBytes)
+	if err != nil {
+		return err
+	}
+	checksums, err := parseChecksumData(data)
+	if err != nil {
+		return err
+	}
+	_, _, err = checkedPlatformAsset(release, checksums)
+	return err
 }
 
 // downloadFile downloads a file from URL to a local path.
@@ -573,11 +1038,26 @@ func downloadFile(url, destPath string, expectedSize int64) error {
 
 // parseChecksums parses the checksums.txt file and returns a map of filename -> sha256
 func parseChecksums(checksumPath string) (map[string]string, error) {
-	data, err := os.ReadFile(checksumPath)
+	file, err := os.Open(checksumPath)
 	if err != nil {
 		return nil, err
 	}
+	defer file.Close()
 
+	data, err := io.ReadAll(io.LimitReader(file, maxChecksumManifestBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxChecksumManifestBytes {
+		return nil, fmt.Errorf("checksum manifest exceeds %d bytes", maxChecksumManifestBytes)
+	}
+	return parseChecksumData(data)
+}
+
+func parseChecksumData(data []byte) (map[string]string, error) {
+	if int64(len(data)) > maxChecksumManifestBytes {
+		return nil, fmt.Errorf("checksum manifest exceeds %d bytes", maxChecksumManifestBytes)
+	}
 	checksums := make(map[string]string)
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
@@ -773,25 +1253,52 @@ func GetBackupPath(binaryPath string) string {
 	return binaryPath + ".backup"
 }
 
-// PerformUpdate downloads and installs a new version of bv
-// Returns an UpdateResult with details about the operation
-func PerformUpdate(release *Release, skipConfirm bool) (*UpdateResult, error) {
+func checkBinaryDirectoryWritable(binaryDir string) error {
+	probe, err := os.CreateTemp(binaryDir, ".bv-update-test-*")
+	if err != nil {
+		return err
+	}
+	probePath := probe.Name()
+	closeErr := probe.Close()
+	removeErr := os.Remove(probePath)
+	if closeErr != nil {
+		return fmt.Errorf("close update permission probe: %w", closeErr)
+	}
+	if removeErr != nil {
+		return fmt.Errorf("remove update permission probe: %w", removeErr)
+	}
+	return nil
+}
+
+// PerformUpdate downloads and installs a new version of bv. Human-readable
+// progress is written to progress; pass nil to suppress output (for example,
+// while Bubble Tea owns the terminal).
+func PerformUpdate(release *Release, progress io.Writer) (*UpdateResult, error) {
+	if release == nil {
+		return nil, fmt.Errorf("release metadata is nil")
+	}
+	if progress == nil {
+		progress = io.Discard
+	}
 	result := &UpdateResult{
 		OldVersion: version.Version,
 		NewVersion: release.TagName,
 	}
 
 	// Check if update is needed
-	if compareVersions(release.TagName, version.Version) <= 0 {
+	newer, err := isNewerVersion(release.TagName, version.Version)
+	if err != nil {
+		return nil, err
+	}
+	if !newer {
 		result.Success = true
 		result.Message = fmt.Sprintf("Already at version %s (latest: %s)", version.Version, release.TagName)
 		return result, nil
 	}
 
-	// Find platform-specific asset
-	asset := release.FindPlatformAsset()
-	if asset == nil {
-		return nil, fmt.Errorf("no binary available for %s/%s", runtime.GOOS, runtime.GOARCH)
+	_, checksumAsset, err := releaseAssetsForUpdate(release)
+	if err != nil {
+		return nil, fmt.Errorf("release %s is not installable: %w", release.TagName, err)
 	}
 
 	// Get current binary path
@@ -802,13 +1309,12 @@ func PerformUpdate(release *Release, skipConfirm bool) (*UpdateResult, error) {
 
 	// Check write permissions
 	binaryDir := filepath.Dir(binaryPath)
-	testFile := filepath.Join(binaryDir, ".bv-update-test")
-	if f, err := os.Create(testFile); err != nil {
-		result.RequireRoot = true
-		return nil, fmt.Errorf("no write permission to %s (try running with sudo)", binaryDir)
-	} else {
-		f.Close()
-		os.Remove(testFile)
+	if err := checkBinaryDirectoryWritable(binaryDir); err != nil {
+		result.RequireRoot = os.IsPermission(err)
+		if result.RequireRoot {
+			return result, fmt.Errorf("no write permission to %s (try running with sudo): %w", binaryDir, err)
+		}
+		return result, fmt.Errorf("cannot prepare update in %s: %w", binaryDir, err)
 	}
 
 	// Create temp directory for download
@@ -818,23 +1324,25 @@ func PerformUpdate(release *Release, skipConfirm bool) (*UpdateResult, error) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	var checksums map[string]string
-	checksumAsset := release.FindChecksumAsset()
-	if checksumAsset != nil {
-		checksumPath := filepath.Join(tmpDir, "checksums.txt")
-		if err := downloadFile(checksumAsset.BrowserDownloadURL, checksumPath, checksumAsset.Size); err != nil {
-			return nil, fmt.Errorf("checksum download failed: %w", err)
-		}
+	checksumPath := filepath.Join(tmpDir, "checksums.txt")
+	if err := downloadFile(checksumAsset.BrowserDownloadURL, checksumPath, checksumAsset.Size); err != nil {
+		return nil, fmt.Errorf("checksum download failed: %w", err)
+	}
+	checksumDigest, err := assetSHA256Digest(checksumAsset)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyChecksum(checksumPath, checksumDigest); err != nil {
+		return nil, fmt.Errorf("checksum manifest verification failed: %w", err)
+	}
 
-		var err error
-		checksums, err = parseChecksums(checksumPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse checksums: %w", err)
-		}
-
-		if checkedAsset := release.findPlatformAssetWithChecksum(checksums); checkedAsset != nil {
-			asset = checkedAsset
-		}
+	checksums, err := parseChecksums(checksumPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse checksums: %w", err)
+	}
+	asset, assetDigest, err := checkedPlatformAsset(release, checksums)
+	if err != nil {
+		return nil, err
 	}
 
 	// Download archive
@@ -843,21 +1351,14 @@ func PerformUpdate(release *Release, skipConfirm bool) (*UpdateResult, error) {
 		return nil, err
 	}
 	archivePath := filepath.Join(tmpDir, assetName)
-	fmt.Printf("Downloading %s...\n", release.TagName)
+	fmt.Fprintf(progress, "Downloading %s...\n", release.TagName)
 	if err := downloadFile(asset.BrowserDownloadURL, archivePath, asset.Size); err != nil {
 		return nil, fmt.Errorf("download failed: %w", err)
 	}
 
-	if checksumAsset != nil {
-		expectedHash, ok := checksums[asset.Name]
-		if !ok {
-			return nil, fmt.Errorf("no checksum found for %s", asset.Name)
-		}
-
-		fmt.Println("Verifying checksum...")
-		if err := verifyChecksum(archivePath, expectedHash); err != nil {
-			return nil, fmt.Errorf("checksum verification failed: %w", err)
-		}
+	fmt.Fprintln(progress, "Verifying checksum...")
+	if err := verifyChecksum(archivePath, assetDigest); err != nil {
+		return nil, fmt.Errorf("checksum verification failed: %w", err)
 	}
 
 	// Extract binary to temp location
@@ -865,20 +1366,20 @@ func PerformUpdate(release *Release, skipConfirm bool) (*UpdateResult, error) {
 	if runtime.GOOS == "windows" {
 		newBinaryPath += ".exe"
 	}
-	fmt.Println("Extracting...")
+	fmt.Fprintln(progress, "Extracting...")
 	if err := extractBinary(archivePath, newBinaryPath); err != nil {
 		return nil, fmt.Errorf("extraction failed: %w", err)
 	}
 
 	// Verify new binary works
-	fmt.Println("Verifying new binary...")
-	if err := runCommand(newBinaryPath, "--version"); err != nil {
+	fmt.Fprintln(progress, "Verifying new binary...")
+	if err := verifyBinaryVersion(newBinaryPath, release.TagName); err != nil {
 		return nil, fmt.Errorf("new binary verification failed: %w", err)
 	}
 
 	// Create backup of current binary
 	backupPath := GetBackupPath(binaryPath)
-	fmt.Printf("Backing up current binary to %s...\n", backupPath)
+	fmt.Fprintf(progress, "Backing up current binary to %s...\n", backupPath)
 
 	// Move the current binary out of the way. This avoids ETXTBSY on Linux
 	// and "file in use" errors on Windows when writing the new binary.
@@ -894,7 +1395,7 @@ func PerformUpdate(release *Release, skipConfirm bool) (*UpdateResult, error) {
 	result.BackupPath = backupPath
 
 	// Replace binary
-	fmt.Println("Installing new version...")
+	fmt.Fprintln(progress, "Installing new version...")
 	if err := os.Rename(newBinaryPath, binaryPath); err != nil {
 		// If binaryPath still exists (copy fallback above), try to remove it first
 		if !movedForBackup {
@@ -917,7 +1418,7 @@ func PerformUpdate(release *Release, skipConfirm bool) (*UpdateResult, error) {
 	// Ensure executable permissions
 	if err := os.Chmod(binaryPath, 0755); err != nil {
 		// Not fatal, but log it
-		fmt.Fprintf(os.Stderr, "Warning: could not set permissions: %v\n", err)
+		fmt.Fprintf(progress, "Warning: could not set permissions: %v\n", err)
 	}
 
 	result.Success = true
@@ -950,10 +1451,72 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-// runCommand executes a command and returns any error
-func runCommand(name string, args ...string) error {
-	cmd := osExec.Command(name, args...)
-	return cmd.Run()
+func parseBinaryVersionOutput(output []byte) (string, error) {
+	fields := strings.Fields(string(output))
+	if len(fields) != 2 || fields[0] != "bv" {
+		return "", fmt.Errorf("unexpected --version output %q", strings.TrimSpace(string(output)))
+	}
+	if _, err := parseVersion(fields[1]); err != nil {
+		return "", fmt.Errorf("invalid version in --version output: %w", err)
+	}
+	return fields[1], nil
+}
+
+const maxBinaryVersionOutputBytes = 4 << 10
+
+type limitedOutputBuffer struct {
+	bytes.Buffer
+	truncated bool
+}
+
+func (buffer *limitedOutputBuffer) Write(data []byte) (int, error) {
+	written := len(data)
+	remaining := maxBinaryVersionOutputBytes - buffer.Len()
+	if remaining <= 0 {
+		buffer.truncated = true
+		return written, nil
+	}
+	if len(data) > remaining {
+		data = data[:remaining]
+		buffer.truncated = true
+	}
+	_, err := buffer.Buffer.Write(data)
+	return written, err
+}
+
+func verifyBinaryVersion(binaryPath, expectedVersion string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var stdout limitedOutputBuffer
+	var stderr limitedOutputBuffer
+	cmd := osExec.CommandContext(ctx, binaryPath, "--version")
+	cmd.WaitDelay = time.Second
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("--version timed out: %w", ctx.Err())
+		}
+		return fmt.Errorf("run --version: %w (stderr: %q)", err, strings.TrimSpace(stderr.String()))
+	}
+	if stdout.truncated {
+		return fmt.Errorf("--version output exceeds %d bytes", maxBinaryVersionOutputBytes)
+	}
+	reportedVersion, err := parseBinaryVersionOutput(stdout.Bytes())
+	if err != nil {
+		return err
+	}
+	if _, err := parseVersion(expectedVersion); err != nil {
+		return err
+	}
+	normalize := func(value string) string {
+		return "v" + strings.TrimPrefix(strings.TrimSpace(value), "v")
+	}
+	if normalize(reportedVersion) != normalize(expectedVersion) {
+		return fmt.Errorf("downloaded binary reports %s, expected %s", reportedVersion, expectedVersion)
+	}
+	return nil
 }
 
 // Rollback restores the previous version from backup

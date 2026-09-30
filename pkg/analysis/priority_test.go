@@ -1,12 +1,134 @@
 package analysis_test
 
 import (
+	"reflect"
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/testutil"
 )
+
+func TestImpactScoresRetainContextRowsAndNilResults(t *testing.T) {
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	rows := []model.Issue{
+		{ID: "open", Status: model.StatusOpen},
+		{ID: "closed", Status: model.StatusClosed},
+		{ID: "owned", Status: model.StatusInProgress},
+		{ID: "parked", Status: model.StatusBlocked},
+		{ID: "later", Status: model.StatusOpen, DeferUntil: &future},
+		{ID: "deleted", Status: model.StatusTombstone},
+		{ID: "custom", Status: model.Status("custom")},
+	}
+	for i := range rows {
+		rows[i].Title = "日本語\x00🙂 " + rows[i].ID
+		rows[i].Priority = i % 5
+		rows[i].UpdatedAt = now
+	}
+	for _, tc := range []struct {
+		name    string
+		rows    []model.Issue
+		wantIDs []string
+	}{
+		{"nil", nil, nil},
+		{"empty", []model.Issue{}, nil},
+		{"closed-and-deleted", []model.Issue{rows[1], rows[5]}, nil},
+		{"context-includes-withheld", rows, []string{"custom", "later", "open", "owned", "parked"}},
+		{"duplicate-last-row-closed", []model.Issue{rows[0], {ID: "open", Status: model.StatusClosed}}, nil},
+		{"duplicate-last-row-open", []model.Issue{{ID: "open", Status: model.StatusClosed}, rows[0]}, []string{"open"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := analysis.NewAnalyzer(tc.rows)
+			a.SetNow(now)
+			// Output eligibility does not remove context from impact scoring.
+			a.SetReadinessScope(model.NewReadinessIndex(tc.rows), map[string]bool{})
+			weights := analysis.DefaultWeights()
+			weights.PageRank += .05
+			weights.PriorityBoost -= .05
+			a.SetWeights(weights)
+			stats := a.AnalyzeWithConfig(analysis.AnalysisConfig{})
+			got := a.ComputeImpactScoresFromStats(&stats, now)
+			if len(tc.wantIDs) == 0 && got != nil {
+				t.Fatalf("empty result changed from nil: %#v", got)
+			}
+			var ids []string
+			for _, score := range got {
+				ids = append(ids, score.IssueID)
+				row := a.GetIssue(score.IssueID)
+				if row == nil || score.Status != string(row.Status) || score.Title != row.Title || score.Priority != row.Priority {
+					t.Fatalf("impact row lost exact metadata: %+v", score)
+				}
+			}
+			sort.Strings(ids)
+			if !reflect.DeepEqual(ids, tc.wantIDs) {
+				t.Fatalf("impact IDs=%v want %v", ids, tc.wantIDs)
+			}
+			// Rebuild the unique source in the opposite order. Reuse the same
+			// completed stats and exact captured weights to isolate ordering.
+			var reversed []model.Issue
+			for i := len(ids) - 1; i >= 0; i-- {
+				reversed = append(reversed, *a.GetIssue(ids[i]))
+			}
+			// Closed context contributes to graph/risk normalization, so retain it.
+			for _, row := range tc.rows {
+				current := a.GetIssue(row.ID)
+				if current != nil && (current.Status == model.StatusClosed || current.Status == model.StatusTombstone) {
+					reversed = append(reversed, *current)
+				}
+			}
+			other := analysis.NewAnalyzer(reversed)
+			other.RestoreScoring(a.CaptureScoring())
+			if want := other.ComputeImpactScoresFromStats(&stats, now); !reflect.DeepEqual(got, want) {
+				t.Fatalf("same stats/scoring changed exact output after source permutation: got %#v want %#v", got, want)
+			}
+		})
+	}
+}
+
+func BenchmarkImpactScoreCapacity(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		kind string
+		size int
+	}{
+		{"realistic-1000", "realistic", 1000},
+		{"realistic-5000", "realistic", 5000},
+		{"realistic-10000", "realistic", 10000},
+		{"unicode-10000", "unicode", 10000},
+		{"mostly-closed-10000", "mostly-closed", 10000},
+		{"all-closed-10000", "realistic", 10000},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			rows, err := testutil.PerformanceIssues(tc.kind, tc.size, 20260904)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if tc.name == "all-closed-10000" {
+				for i := range rows {
+					rows[i].Status = model.StatusClosed
+				}
+			}
+			a := analysis.NewAnalyzer(rows)
+			now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+			a.SetNow(now)
+			stats := a.AnalyzeWithConfig(analysis.AnalysisConfig{})
+			want := a.ComputeImpactScoresFromStats(&stats, now)
+			b.ReportAllocs()
+			b.ResetTimer()
+			var got []analysis.ImpactScore
+			for i := 0; i < b.N; i++ {
+				got = a.ComputeImpactScoresFromStats(&stats, now)
+			}
+			b.StopTimer()
+			if !reflect.DeepEqual(got, want) {
+				b.Fatalf("exact impact output changed for %s", tc.name)
+			}
+		})
+	}
+}
 
 func TestComputeImpactScoresEmpty(t *testing.T) {
 	an := analysis.NewAnalyzer([]model.Issue{})
@@ -142,6 +264,33 @@ func TestComputeImpactScoresBlockerRatio(t *testing.T) {
 	}
 }
 
+func TestComputeImpactScoresBlockerRatioDeduplicatesDependents(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "duplicate-root", Status: model.StatusOpen},
+		{ID: "duplicate-dependent", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "duplicate-root", Type: model.DepBlocks},
+			{DependsOnID: "duplicate-root", Type: model.DepBlocks},
+			{DependsOnID: "duplicate-root", Type: model.DepBlocks},
+		}},
+		{ID: "two-root", Status: model.StatusOpen},
+		{ID: "two-dependent-a", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "two-root", Type: model.DepBlocks}}},
+		{ID: "two-dependent-b", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "two-root", Type: model.DepBlocks}}},
+	}
+
+	scores := analysis.NewAnalyzer(issues).ComputeImpactScores()
+	scoreByID := make(map[string]analysis.ImpactScore, len(scores))
+	for _, score := range scores {
+		scoreByID[score.IssueID] = score
+	}
+
+	if got := scoreByID["duplicate-root"].Breakdown.BlockerRatioNorm; got != 0.5 {
+		t.Fatalf("one unique dependent normalized ratio = %v, want 0.5", got)
+	}
+	if got := scoreByID["two-root"].Breakdown.BlockerRatioNorm; got != 1 {
+		t.Fatalf("two unique dependents normalized ratio = %v, want 1", got)
+	}
+}
+
 func TestComputeImpactScoresPageRank(t *testing.T) {
 	// Chain: A <- B <- C (C depends on B depends on A)
 	// A should have highest PageRank (fundamental dependency)
@@ -235,6 +384,10 @@ func TestTopImpactScores(t *testing.T) {
 	top10 := an.TopImpactScores(10)
 	if len(top10) != 5 {
 		t.Errorf("Expected 5 scores (all available), got %d", len(top10))
+	}
+
+	if got := an.TopImpactScores(-1); len(got) != 0 {
+		t.Errorf("Expected no scores for a negative limit, got %d", len(got))
 	}
 }
 
@@ -577,15 +730,16 @@ func TestMedianEstimatedMinutes(t *testing.T) {
 
 func TestWhatIfDeltaDirectUnblocks(t *testing.T) {
 	// Create a chain: A blocks B, B blocks C
-	// Completing A should unblock B directly
+	// B and C are open work gated by dependencies, not parked by status.
+	// Completing A should unblock B directly.
 	issues := []model.Issue{
 		{ID: "A", Title: "Root Blocker", Status: model.StatusOpen, Priority: 0},
 		{
-			ID: "B", Title: "Middle", Status: model.StatusBlocked, Priority: 1,
+			ID: "B", Title: "Middle", Status: model.StatusOpen, Priority: 1,
 			Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}},
 		},
 		{
-			ID: "C", Title: "Leaf", Status: model.StatusBlocked, Priority: 2,
+			ID: "C", Title: "Leaf", Status: model.StatusOpen, Priority: 2,
 			Dependencies: []*model.Dependency{{IssueID: "C", DependsOnID: "B", Type: model.DepBlocks}},
 		},
 	}
@@ -619,6 +773,7 @@ func TestWhatIfDeltaDirectUnblocks(t *testing.T) {
 	if recA.WhatIf.BlockedReduction < 1 {
 		t.Errorf("Completing A should reduce blocked count, got %d", recA.WhatIf.BlockedReduction)
 	}
+	assertParkedDependentsStayWithheld(t, issues, "A")
 }
 
 func TestWhatIfDeltaNoDownstream(t *testing.T) {
@@ -648,7 +803,7 @@ func TestWhatIfDeltaEstimatedDays(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "A", Title: "Blocker", Status: model.StatusOpen, Priority: 0},
 		{
-			ID: "B", Title: "Blocked", Status: model.StatusBlocked, Priority: 1,
+			ID: "B", Title: "Dependency gated", Status: model.StatusOpen, Priority: 1,
 			EstimatedMinutes: &est,
 			Dependencies:     []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}},
 		},
@@ -673,6 +828,7 @@ func TestWhatIfDeltaEstimatedDays(t *testing.T) {
 	if recA.WhatIf.EstimatedDaysSaved < 0.9 || recA.WhatIf.EstimatedDaysSaved > 1.1 {
 		t.Errorf("Expected ~1 day saved, got %.2f", recA.WhatIf.EstimatedDaysSaved)
 	}
+	assertParkedDependentsStayWithheld(t, issues, "A")
 }
 
 func TestReasoningCapAtThree(t *testing.T) {
@@ -769,15 +925,15 @@ func TestParallelizationGain(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "A", Title: "Root Blocker", Status: model.StatusOpen, Priority: 0},
 		{
-			ID: "B", Title: "Blocked 1", Status: model.StatusBlocked, Priority: 1,
+			ID: "B", Title: "Dependency gated 1", Status: model.StatusOpen, Priority: 1,
 			Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}},
 		},
 		{
-			ID: "C", Title: "Blocked 2", Status: model.StatusBlocked, Priority: 1,
+			ID: "C", Title: "Dependency gated 2", Status: model.StatusOpen, Priority: 1,
 			Dependencies: []*model.Dependency{{IssueID: "C", DependsOnID: "A", Type: model.DepBlocks}},
 		},
 		{
-			ID: "D", Title: "Blocked 3", Status: model.StatusBlocked, Priority: 1,
+			ID: "D", Title: "Dependency gated 3", Status: model.StatusOpen, Priority: 1,
 			Dependencies: []*model.Dependency{{IssueID: "D", DependsOnID: "A", Type: model.DepBlocks}},
 		},
 	}
@@ -806,6 +962,7 @@ func TestParallelizationGain(t *testing.T) {
 	if *recA.WhatIf.ParallelizationGain != expectedGain {
 		t.Errorf("Expected ParallelizationGain=%d, got %d", expectedGain, *recA.WhatIf.ParallelizationGain)
 	}
+	assertParkedDependentsStayWithheld(t, issues, "A")
 }
 
 // TestParallelizationGainNegative verifies negative parallelization gain (bv-129)
@@ -848,7 +1005,7 @@ func TestParallelizationGainZero(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "A", Title: "Single Blocker", Status: model.StatusOpen, Priority: 0},
 		{
-			ID: "B", Title: "Blocked", Status: model.StatusBlocked, Priority: 1,
+			ID: "B", Title: "Dependency gated", Status: model.StatusOpen, Priority: 1,
 			Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}},
 		},
 	}
@@ -876,4 +1033,35 @@ func TestParallelizationGainZero(t *testing.T) {
 	if *recA.WhatIf.ParallelizationGain != expectedGain {
 		t.Errorf("Expected ParallelizationGain=%d, got %d", expectedGain, *recA.WhatIf.ParallelizationGain)
 	}
+	assertParkedDependentsStayWithheld(t, issues, "A")
+}
+
+// Every dependency-only fixture above has a parked-status counterexample:
+// completing the root may satisfy edges but cannot resume explicitly blocked work.
+func assertParkedDependentsStayWithheld(t *testing.T, issues []model.Issue, rootID string) {
+	t.Helper()
+	parked := make([]model.Issue, len(issues))
+	for i, issue := range issues {
+		parked[i] = issue.Clone()
+		if issue.ID != rootID {
+			parked[i].Status = model.StatusBlocked
+		}
+	}
+	an := analysis.NewAnalyzer(parked)
+	if got := an.ComputeUnblocks(rootID); len(got) != 0 {
+		t.Errorf("Completing %s must not resume parked dependents: %v", rootID, got)
+	}
+	for _, rec := range an.GenerateRecommendations() {
+		if rec.IssueID != rootID {
+			continue
+		}
+		if rec.WhatIf == nil {
+			t.Fatal("Expected what-if result for root of parked fixture")
+		}
+		if rec.WhatIf.DirectUnblocks != 0 || rec.WhatIf.TransitiveUnblocks != 0 || rec.WhatIf.BlockedReduction != 0 || rec.WhatIf.EstimatedDaysSaved != 0 {
+			t.Errorf("Completing %s must not credit parked work: %+v", rootID, rec.WhatIf)
+		}
+		return
+	}
+	t.Fatalf("Missing recommendation for root %s in parked fixture", rootID)
 }

@@ -3,10 +3,13 @@ package correlation
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -133,10 +136,23 @@ func (fs *FeedbackStore) GetAll() []CorrelationFeedback {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
 
+	return fs.sortedFeedbackLocked()
+}
+
+// sortedFeedbackLocked returns cache values in their semantic key order. The
+// caller must hold at least fs.mu.RLock. Stable ordering also makes floating-
+// point aggregation reproducible instead of depending on Go map iteration.
+func (fs *FeedbackStore) sortedFeedbackLocked() []CorrelationFeedback {
 	result := make([]CorrelationFeedback, 0, len(fs.cache))
 	for _, fb := range fs.cache {
 		result = append(result, fb)
 	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].CommitSHA != result[j].CommitSHA {
+			return result[i].CommitSHA < result[j].CommitSHA
+		}
+		return result[i].BeadID < result[j].BeadID
+	})
 	return result
 }
 
@@ -148,7 +164,7 @@ func (fs *FeedbackStore) GetStats() FeedbackStats {
 	stats := FeedbackStats{}
 	var confirmSum, rejectSum float64
 
-	for _, fb := range fs.cache {
+	for _, fb := range fs.sortedFeedbackLocked() {
 		stats.TotalFeedback++
 		switch fb.Type {
 		case FeedbackConfirm:
@@ -177,6 +193,29 @@ func (fs *FeedbackStore) GetStats() FeedbackStats {
 	}
 
 	return stats
+}
+
+// Fingerprint returns a stable digest of every (commit, bead, type) decision
+// in the store. The Correlator folds it into the persistent REPORT cache key:
+// feedback is applied during report assembly (not extraction), so the
+// HEAD-keyed artifact cache stays untouched while a new confirm/reject still
+// invalidates the assembled report that a warm second run would otherwise
+// serve unchanged. An attached-but-empty store has a non-empty fingerprint,
+// distinct from "no store attached" (which reports no feedback_applied at all).
+func (fs *FeedbackStore) Fingerprint() string {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+
+	h := sha256.New()
+	for _, fb := range fs.sortedFeedbackLocked() {
+		h.Write([]byte(fb.CommitSHA))
+		h.Write([]byte{0})
+		h.Write([]byte(fb.BeadID))
+		h.Write([]byte{0})
+		h.Write([]byte(fb.Type))
+		h.Write([]byte{'\n'})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 // Confirm records a confirmation that the correlation is correct

@@ -1,10 +1,24 @@
 package ui
 
 import (
+	"strings"
+	"unicode"
+	"unicode/utf8"
+
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/glamour/ansi"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/extension"
+	extast "github.com/yuin/goldmark/extension/ast"
+	"github.com/yuin/goldmark/parser"
+	"github.com/yuin/goldmark/text"
 )
+
+// ANSI styles can expand a few KiB of Markdown into hundreds of KiB. Keep
+// one output within a fixed half-MiB budget, independent of issue count.
+const maxRememberedMarkdownBytes = 512 * 1024
 
 // MarkdownRenderer provides theme-aware markdown rendering using glamour.
 // It detects the terminal's color scheme and uses appropriate styles.
@@ -14,6 +28,17 @@ type MarkdownRenderer struct {
 	isDark   bool
 	theme    *Theme // nil if using built-in styles, non-nil if using custom theme
 	useTheme bool   // true if created with NewMarkdownRendererWithTheme
+
+	// Remember only the last exact render. Snapshot delivery often refreshes
+	// unchanged selected details; a following key still renders its new issue.
+	// Renderer identity includes width and theme, so their replacement cannot
+	// reuse stale styling. Both strings together are bounded by the limit above.
+	lastRenderer *glamour.TermRenderer
+	lastMarkdown string
+	lastRendered string
+
+	paddingRenderer     *glamour.TermRenderer
+	paddingRendererBase *glamour.TermRenderer
 }
 
 // NewMarkdownRenderer creates a new markdown renderer using built-in styles.
@@ -81,7 +106,76 @@ func (mr *MarkdownRenderer) Render(markdown string) (string, error) {
 	if mr.renderer == nil {
 		return markdown, nil
 	}
-	return mr.renderer.Render(markdown)
+	if mr.lastRenderer == mr.renderer && mr.lastMarkdown == markdown {
+		return mr.lastRendered, nil
+	}
+	renderer := mr.renderer
+	if mr.useTheme && mr.theme != nil && permitsUnstyledDocumentPadding(markdown) {
+		if mr.paddingRendererBase != mr.renderer {
+			style := buildStyleFromTheme(*mr.theme, mr.isDark)
+			style.Document.Color = nil
+			if fast, err := glamour.NewTermRenderer(glamour.WithStyles(style), glamour.WithWordWrap(mr.width)); err == nil {
+				mr.paddingRenderer, mr.paddingRendererBase = fast, mr.renderer
+			}
+		}
+		if mr.paddingRendererBase == mr.renderer {
+			renderer = mr.paddingRenderer
+		}
+	}
+	rendered, err := renderer.Render(markdown)
+	mr.lastRenderer = nil
+	mr.lastMarkdown = ""
+	mr.lastRendered = ""
+	if err == nil && len(markdown)+len(rendered) <= maxRememberedMarkdownBytes {
+		mr.lastRenderer = mr.renderer
+		mr.lastMarkdown = markdown
+		mr.lastRendered = rendered
+	}
+	return rendered, err
+}
+
+// HTML and definition lists inherit Document.Color; wrapped links can carry
+// underline into its padding. Use Glamour's Markdown grammar to preserve their
+// original rendering, without mistaking fenced dependency labels for links.
+// Entities and terminal controls retain the original path as well.
+func permitsUnstyledDocumentPadding(markdown string) bool {
+	// Likely inline links keep the original renderer without parsing their
+	// entire bodies twice. False positives inside code simply keep that path;
+	// the parser below still identifies other link forms and autolinks.
+	if strings.Contains(markdown, "](") {
+		return false
+	}
+	if !utf8.ValidString(markdown) {
+		return false
+	}
+	for _, r := range markdown {
+		switch r {
+		case '&':
+			return false
+		case '\n', '\t':
+		default:
+			if unicode.IsControl(r) {
+				return false
+			}
+		}
+	}
+	md := goldmark.New(
+		goldmark.WithExtensions(extension.GFM, extension.DefinitionList),
+		goldmark.WithParserOptions(parser.WithAutoHeadingID()),
+	)
+	doc := md.Parser().Parse(text.NewReader([]byte(markdown)))
+	allowed := true
+	err := ast.Walk(doc, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		if entering {
+			switch node.Kind() {
+			case ast.KindHTMLBlock, ast.KindRawHTML, ast.KindLink, ast.KindAutoLink, ast.KindImage, extast.KindDefinitionList:
+				allowed = false
+				return ast.WalkStop, nil
+			}
+		}
+		return ast.WalkContinue, nil
+	})
+	return allowed && err == nil
 }
 
 // SetWidth updates the word wrap width and recreates the renderer.
@@ -100,6 +194,7 @@ func (mr *MarkdownRenderer) SetWidth(width int) {
 			glamour.WithWordWrap(width),
 		); err == nil {
 			mr.renderer = r
+			mr.paddingRenderer, mr.paddingRendererBase = nil, nil
 			mr.width = width
 		}
 		return
@@ -118,6 +213,7 @@ func (mr *MarkdownRenderer) SetWidth(width int) {
 		glamour.WithWordWrap(width),
 	); err == nil {
 		mr.renderer = r
+		mr.paddingRenderer, mr.paddingRendererBase = nil, nil
 		mr.width = width
 	}
 }
@@ -153,6 +249,7 @@ func (mr *MarkdownRenderer) SetWidthWithTheme(width int, theme Theme) {
 	}
 	if r != nil {
 		mr.renderer = r
+		mr.paddingRenderer, mr.paddingRendererBase = nil, nil
 		mr.width = width
 		mr.theme = &theme
 		mr.useTheme = true

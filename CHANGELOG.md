@@ -1,14 +1,25 @@
 # Changelog
 
-All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first. Each entry links to the tagged commit on GitHub. Where a version was published as a GitHub Release (with binaries), it is marked accordingly; tag-only versions are noted as such.
+All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first, with GitHub Releases distinguished from tag-only versions.
 
-Scope window: this update reconstructs `v0.21.0` through `v0.21.2`; the earlier version history is
-retained below.
+Scope window: this update verifies `v0.24.0..v0.24.1` and the post-release
+commits through [`b0ce5669`](https://github.com/Dicklesworthstone/beads_viewer/commit/b0ce5669), including the September 10 canonical-source and Cass
+repairs, September 11 performance work, and September 12 dependency campaign.
+The v0.25.0 candidate remains unpublished until its complete release gate passes.
+Earlier entries are retained without a fresh historical audit. The recent entries
+are checked against Git diffs, tags, live GitHub Release metadata, Beads records,
+and release receipts; [research notes](CHANGELOG_RESEARCH.md) record coverage.
+Release dates use UTC publication dates. `Unreleased` describes changes after
+the latest tag, including installer changes usable with already released binaries.
 
 ## Release Timeline
 
 | Version | Date | Publication | Orientation |
 |---|---|---|---|
+| v0.25.0 (candidate) | — | Not yet published | Workflow readiness, source integrity and live dashboards, responsive Cass search, priority performance, and Go 1.26 dependency refresh. |
+| [`v0.24.1`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.24.1) | 2026-09-08 | GitHub Release | Reuse loaded source hashes and avoid waiting for a busy analysis-cache writer. |
+| [`v0.24.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.24.0) | 2026-09-07 | GitHub Release | Latency campaign across analysis, loader and TUI, graph-navigation and causality repairs, release-gate isolation, and the x/text GO-2026-5970 dependency fix. |
+| [`v0.23.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.23.0) | 2026-09-04 | GitHub Release | Reality Check hardening sweep, 10-stage release gate, proactive drift alerts, typed env registry, docgen, and full tracker completion. |
 | [`v0.22.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.22.0) | 2026-08-25 | GitHub Release | Makes snapshot delivery pointer-based and incrementally rebuilds safe list changes, with measured UI latency and allocation reductions. |
 | [`v0.21.2`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.21.2) | 2026-08-24 | GitHub Release | Publishes the 50-pass performance campaign, verified binaries, checksums, SBOM, and corrected Nix guidance. |
 | [`v0.21.1`](https://github.com/Dicklesworthstone/beads_viewer/tree/v0.21.1) | 2026-08-24 | Tag only | Staged the performance and license work; superseded before binary publication. |
@@ -16,7 +27,393 @@ retained below.
 
 ---
 
-## [Unreleased]
+## v0.25.0 — release candidate
+
+### Priority recommendation performance
+
+- Cascade simulations now reuse sorted dependency and hierarchy adjacency
+  instead of rebuilding it at every step. Completion state and readiness checks
+  remain specific to each query ([frontier reuse](https://github.com/Dicklesworthstone/beads_viewer/commit/01383eb6a3ab2f5bac5a95f7596aa3f89ecb510f)).
+- Enhanced priority recommendations, used by `--robot-priority`, now reuse one
+  completed analysis snapshot across the batch instead of rereading the analysis
+  cache for every issue. Scoring, explanation fields, ordering, and output caps
+  are preserved ([snapshot reuse](https://github.com/Dicklesworthstone/beads_viewer/commit/c3091424a5895e62e1aa8c59ca8ca41fa7f24ee0);
+  [full-output regression](https://github.com/Dicklesworthstone/beads_viewer/commit/10666a6a74980ba4c39fa0f67081cab510b0e0cf)).
+
+### Performance verification and documentation
+
+- Failed CLI measurements now report sample identity, elapsed command time,
+  and cancellation state captured before diagnostic files are written. Slow
+  artifact writes cannot retroactively make a command failure look like a
+  timeout ([diagnostics](https://github.com/Dicklesworthstone/beads_viewer/commit/3bc5c15c481b299a4fbec20ca9f1ab513dd1f096)).
+  The original incomplete P1 matrix remains open.
+- The September 11 source measurement passed all 144 current UI cohorts at
+  the original 50 ms p99 and delivered-handler limits; the worst cohort p99
+  was 46.472 ms. The overall matrix failed when a baseline process was killed
+  in the last timed CLI cohort, leaving 70 of 72 records complete. The README
+  and [performance guide](docs/performance.md#september-11-2026-measurement-attempt)
+  distinguish those outcomes and keep the P1 work open. This adds measurement
+  evidence, not a runtime optimization or release qualification.
+- Documentation now distinguishes settled navigation from startup and
+  background preparation, and makes dependent readiness conditional on
+  remaining prerequisites and eligibility. The v0.22.0 entry names the
+  50 ms interaction target while preserving its original measurements.
+
+### Workflow data and static dashboards
+
+- SQLite dashboard rebuilds construct a private database before publishing it.
+  A failed construction preserves the last good database, and readers no
+  longer lock a partially populated export. On Windows, an open reader may
+  still prevent replacement; that failure preserves the prior database.
+- FTS indexing, materialized-view creation and export metadata now each use
+  one transaction. This reduces repeated disk syncs and rolls back the related
+  writes if a later statement fails, without disabling SQLite durability.
+- Source discovery now honors `issues.jsonl`, then `beads.jsonl`, then
+  `beads.base.jsonl` before comparing the selected export with SQLite and
+  worktree sources. A newer sync snapshot cannot replace current issue state,
+  and an empty export stays empty. Sidecar-only directories no longer bypass
+  the filename allowlist through the fallback loader; explicit file overrides
+  remain available. Human commands now report ignored left/right merge
+  artifacts while robot stderr stays clean (`bv-mvvu`, `bv-uoyj.1`).
+- SQLite live refresh now detects committed WAL updates in event and polling
+  modes. TUI and watched Pages exports update while the writer remains open;
+  checkpoint removal of the WAL is handled without reporting the database
+  itself as removed (`bv-oonu.21`;
+  [WAL refresh](https://github.com/Dicklesworthstone/beads_viewer/commit/cd100c661a5bb7ce751b6e10a45c5af16af34ce5)).
+- Live TUI refreshes and single-repository watched exports now use the source
+  that successfully loaded at startup. A corrupt newer file can no longer
+  redirect the watcher away from its valid fallback. Explicit JSONL and SQLite
+  selection remains supported. Historical `--as-of` exports reject
+  `--watch-export` before writing files (`bv-oonu.20`;
+  [source repair](https://github.com/Dicklesworthstone/beads_viewer/commit/ccc166e9c43f200e3c8d5b26136a4c25a2c0ebe8)).
+- SQLite and JSONL loading now retain nonblank custom workflow statuses and
+  relationship types. `conditional-blocks` and `waits-for` affect blocking
+  analysis; custom statuses do not automatically become claimable
+  ([loader change](https://github.com/Dicklesworthstone/beads_viewer/commit/55ec82b8ceb099222de99e2fdbe23329c91e9bd1)).
+- Recipe validation now rejects a blank `filters.status` entry with a message
+  that says so, instead of calling it an unknown status. Since the loader change
+  above the check has accepted custom workflow states such as `done`; only the
+  error text and the `Validate` documentation still described a closed
+  vocabulary.
+- Static dashboards now include both blocking variants and legacy untyped
+  dependencies in their relationship lists and browser graphs. Active ID lists
+  agree with blocker counts, including after either endpoint closes, so blocked
+  work no longer appears ready because its relationship type was omitted.
+- In issue details, `h` now navigates to a prerequisite and `l` to a dependent,
+  with stable ordering. The export and real Chromium regressions are tracked by
+  `bv-oonu.12`
+  ([dashboard repair](https://github.com/Dicklesworthstone/beads_viewer/commit/1c768eacdfcec4937c018b3c1e5febb7091cfc7c)).
+- “Simulate Close” now follows dependencies in the correct direction and shows
+  the engine's actual direct and downstream counts. Priority picks and cascade
+  cards show their calculated gains. Deleted prerequisites and closed rows
+  excluded from the dashboard remain resolved in both browser graph engines.
+- Graph simulation and reset use the bundled renderer's redraw API; cancelling,
+  reloading or cleaning up a simulation cancels its pending animation callbacks.
+  The rebuilt graph WASM preserves unrelated graph metrics. Real Chromium
+  regressions and source-rebuild evidence are tracked in `bv-oonu.13`
+  ([simulation repair](https://github.com/Dicklesworthstone/beads_viewer/commit/40a7cd07d0dab2d8a2a7a8c0ee1874b120fe3d9a)).
+- HITS hub and authority panels now display the bundled engine's scores and
+  open their ranked issues. Their JavaScript consumer previously read field
+  names that the engine does not return (`bv-oonu.14`).
+- Dashboard ready counts, quick wins and Ready/Blocked filters now use the
+  full-source readiness snapshot. Missing or filtered prerequisites, inherited
+  parent gates and deferral no longer disappear from eligibility checks;
+  resolved prerequisites still satisfy them when omitted from the display.
+  Ready cards include eligible in-progress work. Active-node counts include
+  each unresolved issue once and remain numeric when a status group is absent
+  (`bv-oonu.15`;
+  [rankings and readiness repair](https://github.com/Dicklesworthstone/beads_viewer/commit/51d25a80991e2488f85eb030ceb7d8d126d8f9ba)).
+- Direct dashboard exports now apply recipes, including sorted `max_items`
+  selection. Watched exports reapply repository, label and recipe filters to
+  each reload instead of expanding to the full dataset. Hidden prerequisites
+  still govern readiness, newly matching issues enter the selection, and an
+  empty selection clears old rows (`bv-oonu.16`;
+  [export scope repair](https://github.com/Dicklesworthstone/beads_viewer/commit/d10d341dfb46412cffdcee7641b3f67a3b53b015)).
+- Missing or filtered dependency endpoints no longer crowd real issues out of
+  WASM-backed ranking panels. HITS, k-core, slack and metric fallback lists
+  apply their limits to exported issue rows while preserving full-graph scores
+  (`bv-oonu.17`;
+  [ranking limit repair](https://github.com/Dicklesworthstone/beads_viewer/commit/3a56b9224ab621f2b178caf2453c4c1685efa62c)).
+- Interactive HTML and static SVG/PNG graph exports now honor recipes,
+  including custom files, sorted limits and label/repository intersections.
+  Actionable selection retains full-source prerequisite checks; an empty
+  recipe selection reports an error without creating a graph (`bv-oonu.18`;
+  [graph recipe repair](https://github.com/Dicklesworthstone/beads_viewer/commit/75be8362f67709e74266f709644b7b4465b706c7)).
+- Dashboard Priority Picks now restrict candidates before optimizing gains.
+  Missing issue IDs cannot be selected or implicitly completed to inflate
+  another issue's gain. Cascade suggestions and actionable lookup use the
+  exported full-source readiness snapshot. The rebuilt WASM preserves results
+  for callers without candidate restrictions (`bv-oonu.19`;
+  [candidate selection repair](https://github.com/Dicklesworthstone/beads_viewer/commit/5efb1daf3f3f61fe2122ba4c5033deb438b4db2f)).
+- Label-scoped insights rank hypothetical completions only for selected issues;
+  neighboring context can no longer take a result slot. Top-k candidate counts
+  use the same selection, while graph metrics and unresolved prerequisites
+  retain their context (`bv-xbvo.11`;
+  [scoped ranking repair](https://github.com/Dicklesworthstone/beads_viewer/commit/f24e2df76c0af757f0a0322bccd78f1d62ed63c5)).
+- Capacity reports now use full-source readiness and intersect global selection
+  with `--capacity-label`. Missing prerequisites, inherited parent gates and
+  parked/deferred work no longer produce false actionable counts. Direct
+  bottlenecks exclude non-blocking relationships, resolved endpoints and
+  duplicate pairs; result ordering is stable. The duration calculation remains
+  a heuristic (`bv-xbvo.12`;
+  [capacity repair](https://github.com/Dicklesworthstone/beads_viewer/commit/ab144521b77114c45341733d5179009962cfb193)).
+- Capacity path calculation now shares suffix results on acyclic graphs,
+  avoiding exponential enumeration of overlapping paths. It preserves the
+  chosen path, ties and estimates; reachable cycles retain the original
+  exhaustive search. A dense 26-issue fixture fell from a 3.55-second median
+  to 64 ms across ten measured runs per binary (`bv-xbvo.14`;
+  [capacity performance repair](https://github.com/Dicklesworthstone/beads_viewer/commit/06cc108f3dbb6df725e1616bfba1c079ad7b84b2)).
+- Forecasts now honor global selection intersected with the forecast label
+  and sprint. A single requested issue must also pass these filters; an
+  excluded ID returns an error. Selected estimates retain their loaded
+  dependency and closure context (`bv-xbvo.13`;
+  [forecast scope repair](https://github.com/Dicklesworthstone/beads_viewer/commit/9de473f47d66ec36c2103af928915f9fef5204b2)).
+
+### Build requirements
+
+- Source builds now require Go 1.26 or newer, with Go 1.26.8 selected by
+  `go.mod`. Both source installers enforce the same minimum. The Nix flake
+  moves to the 26.05 package set, which supplies Go 1.26.7.
+- Terminal rendering, Unicode normalization, HTML parsing and graph-image
+  dependencies are updated. The four local dependency patches remain in place;
+  [upgrade notes](UPGRADE_LOG.md) record the individual transitions and tests.
+- The SQLite module moves from 1.52.0 to 1.58.0, updating the embedded engine
+  from SQLite 3.53.2 to 3.53.4 with the module's required libc version.
+- The bundled graph WASM and JavaScript glue are rebuilt with wasm-bindgen
+  0.2.128 and refreshed Rust dependencies. Independent builds from two compiler
+  locations produce identical assets; the graph fixtures, viewer HITS adapter
+  and corruption controls pass in Node WebAssembly execution.
+
+### Vendored dependency patches
+
+- The four locally patched dependencies (`chroma`, `glamour`, `reflow`,
+  `go-json`; see `docs/PROVENANCE.md`) now live under `third_party/` as
+  complete Go modules reached through `replace` directives in `go.mod`, so
+  `go mod vendor` copies the patched sources instead of silently reverting
+  them. Previously the patches existed only as hand edits inside `vendor/`,
+  and a routine `go mod vendor` reverted all four, including the go-json
+  decoder-cache race repair that no `-race` test exercises. A new e2e
+  check fails when `vendor/` and `third_party/` disagree, and
+  `docs/RELEASING.md` documents editing, upgrading and retiring a patch.
+  The vendored package sources remain byte-identical to the previously
+  committed patched files.
+
+### Dependency inspection and documentation
+
+- Cass session lookups now run in the background, keeping navigation and
+  resizing available while Cass responds. `V` or Esc cancels a pending lookup;
+  results from an older selection or dataset cannot open a stale modal.
+  Refreshed data receives a fresh correlation cache. `V` also works from the
+  detail pane, and closing the modal restores its originating view (`bv-xiyd`;
+  [responsiveness repair](https://github.com/Dicklesworthstone/beads_viewer/commit/4ffc37c6f162d3e5b9de6f35511744ca12a0a2eb)).
+- Cass session lookup now reads the actual `hits` response and requests the
+  title, preview, workspace and millisecond timestamp fields used by the UI.
+  Pressing `V` can show sessions from a searchable stale or rebuilding index
+  while retaining its health warning. Cached sessions keep their computed
+  scores and match reasons; failed or partial lookups remain retryable instead
+  of becoming cached empty results (`bv-8phk`;
+  [search adapter](https://github.com/Dicklesworthstone/beads_viewer/commit/fe88cfb7),
+  [cache repair and live verification](https://github.com/Dicklesworthstone/beads_viewer/commit/c008a9b7f955680e17baebcc0e35de83efe3804d)).
+- README examples now place impact-network fields under `network`, show
+  priority reasoning as an array and use the actual alert fields. Flow Matrix
+  rows are documented as blockers and columns as dependents; saved-baseline
+  drift checks are distinguished from Git-revision comparisons. Cass scoring
+  and modal controls now describe the implemented behavior
+  ([documentation corrections](https://github.com/Dicklesworthstone/beads_viewer/commit/b543d376)).
+- Generated agent instructions now use `br update <id> --claim --json`,
+  matching the README and assigning the current actor as work starts.
+  Instruction version 6 makes existing version 5 blocks eligible for refresh
+  through `--agents-add`; surrounding user instructions remain intact.
+- Flow Matrix drilldowns now show the actual blocker and dependent for each
+  relationship, exclude unrelated issues sharing a label, and deduplicate pairs
+  spanning multiple labels. Enter inspects either endpoint without changing the
+  active recipe or selected work; Escape returns to the relationship.
+- Open relationships and endpoint details update after snapshots and file
+  reloads, retain surviving selection by ID, and remove obsolete relationships.
+  Unicode and long IDs fit narrow drilldown rows. The implementation and Linux
+  terminal journey are tracked by `bv-apal.12`/`bv-apal.13`
+  ([implementation and regression tests](https://github.com/Dicklesworthstone/beads_viewer/commit/b6e21d22f6098a78553aed2a365526bf98730fd6)).
+- README now matches the recipe-picker key, cass health/count indicators and
+  separate history modal, plan/history JSON fields and duration units, dependency
+  direction, and binary versus source requirements. `BV_INSIGHTS_MAP_LIMIT`
+  documentation now gives its existing default of 200; zero and invalid values
+  use that default. A real CLI regression checks all five documented limit cases.
+  These corrections are part of the still-open `bv-apal.3`/`bv-apal.4` workstream;
+  they do not establish the remaining performance or native-platform claims.
+
+### Windows installation
+
+- Version-check failures now retain stdout and stderr, capped at 4,096
+  characters per stream. The original ten-second execution deadline remains;
+  pipe draining is bounded to one additional second, including when a child
+  inherits the pipes. Truncated version output is rejected before installation
+  (`bv-oonu.9`;
+  [diagnostic repair](https://github.com/Dicklesworthstone/beads_viewer/commit/80450e345e6b2061fd1e17c6eee007bcb49d56c6)).
+  Both README install commands now pin this reviewed script. Portable process
+  regressions and native PowerShell 5.1 version/mismatch checks pass; the original
+  native source first-start failure remains open.
+- Suppress download progress locally inside `Install-FromRelease`, avoiding
+  the redirected-download stalls observed with Windows PowerShell 5.1 without
+  changing the caller's preference. The native harness now checks the existing
+  `diagnostic_top_pick` and metadata-free claim refusal instead of an obsolete
+  top-level ID ([`3ca2176f`](https://github.com/Dicklesworthstone/beads_viewer/commit/3ca2176f11cc6106be452815e03fc4164b581761)).
+  This fixes installer behavior and its test; it does not change robot output.
+- README's Windows commands initially pinned that installer revision
+  ([`87756815`](https://github.com/Dicklesworthstone/beads_viewer/commit/87756815cb55e8450cc559a74b29677327f830b6)).
+  The pinned source option uses a verified tagged checkout and vendored
+  dependencies; the stale reference to its older `go install` path is corrected.
+  The installer fix follows v0.24.1's immutable tag and is already usable with
+  its published binaries.
+
+### Verification and remaining limits
+
+- With installer `3ca2176f`, the complete default native Windows suite
+  passed against the public v0.24.0 and v0.24.1 archives: installation, readiness,
+  update/no-update, and preservation of the installed executable and user PATH
+  on failure. Readback covers 28 command logs, eight capability results, and
+  five specific rejection cases; it does not count a transport timeout as a
+  successful rejection.
+- An initial native Windows source installation passed, but a later optional
+  source run exceeded the unchanged 10-second first-start guard. Its retained
+  executable succeeded on a second diagnostic invocation; the original failure
+  remains unresolved. Native macOS amd64/arm64 and Linux arm64 execution,
+  native Homebrew installation, and a supported Nix build remain unverified.
+  The broader installation workstream
+  [bv-oonu.10](https://github.com/Dicklesworthstone/beads_viewer/blob/7983ee3f9a4d5d2cf615dbb9a919256a3e74c2fc/.beads/issues.jsonl#L454)
+  stays open. See the
+  [retained release findings](https://github.com/Dicklesworthstone/beads_viewer/commit/7983ee3f9a4d5d2cf615dbb9a919256a3e74c2fc).
+
+---
+
+## [v0.24.1] -- 2026-09-08 (Release)
+
+This patch removes avoidable hashing and cache-lock waiting from robot commands
+while preserving their data-hash scope and computed analysis results.
+
+### Fixed
+
+- Optional analysis-cache publication no longer waits for another process's
+  writer lock. A contended writer leaves the existing cache entry intact and
+  returns the computed result; a later request can publish successfully
+  ([`f719c41a`](https://github.com/Dicklesworthstone/beads_viewer/commit/f719c41a95d3565c736e4c20267d7568990b09ba)).
+  Linux and native Windows regression tests exercise the real lock, preservation
+  of the existing entry, and a successful later publication.
+
+### Performance
+
+- Robot commands reuse the hash computed while loading an unchanged single
+  source, including historical snapshots, avoiding a second fingerprint pass.
+  Workspace aggregates, tombstone-bearing sources, and `--repo` filtering still
+  trigger recomputation. The envelope hash remains scoped after `--repo` and
+  before `--label` or `--recipe`; 15 scenarios exercise both robot plan and
+  triage ([`6c8a4474`](https://github.com/Dicklesworthstone/beads_viewer/commit/6c8a4474)).
+
+### Distribution
+
+- Published through DSR using locally packaged GoReleaser artifacts, without
+  GitHub Actions or repository dispatch. Linux amd64/arm64, macOS amd64/arm64,
+  and Windows amd64 archives identify the clean tagged revision
+  [`3e4e61c9`](https://github.com/Dicklesworthstone/beads_viewer/commit/3e4e61c91a74dafe211d3f6a62f3c2919969657c),
+  Go 1.25.5, and disabled CGO. The 14 assets include checksums, a
+  [sealed gate receipt](https://github.com/Dicklesworthstone/beads_viewer/releases/download/v0.24.1/release-gate-receipt.json),
+  and an SPDX SBOM for the Linux amd64 binary. No minisign signature was produced.
+- [Homebrew](https://github.com/Dicklesworthstone/homebrew-tap/commit/cae0685b4c703d5e4ba22e7c093511ffdf72d9d6)
+  and [Scoop](https://github.com/Dicklesworthstone/scoop-bucket/commit/4fddb86e07486cd1bf1d2ad9e76c7a120ac14779)
+  were advanced from v0.22.0 to v0.24.1 using the verified archive hashes.
+  Go module publication and the tagged Nix flake were checked against the same
+  source revision. These publication checks do not establish native Homebrew
+  installation or a supported Nix build.
+
+### Verification
+
+- All ten release-gate stages passed on the clean tagged commit; no gate stage
+  was skipped. All 14 uploaded assets were downloaded and matched by size and
+  SHA-256 before publication. Native Linux installation, readiness,
+  update/no-update, and failed-install preservation checks passed. Windows
+  installer results and remaining native-platform limits are recorded under
+  Unreleased because the installer repair followed the tag.
+- The separate pre-release performance campaign retained 288 UI records, 72 timed CLI
+  records and 36 fixed-clock comparisons. Its original exact-output check
+  failed because the baseline reports v0.23.0 and the candidate v0.24.0;
+  readback of all 144 outputs found only those 72 version-field differences.
+  This accounts for the failure without changing the original result or
+  claiming the broader performance campaign complete. The latency workstream
+  [bv-apal.1](https://github.com/Dicklesworthstone/beads_viewer/blob/7983ee3f9a4d5d2cf615dbb9a919256a3e74c2fc/.beads/issues.jsonl#L283)
+  remains in progress; the distribution workstream
+  [bv-l76l](https://github.com/Dicklesworthstone/beads_viewer/blob/7983ee3f9a4d5d2cf615dbb9a919256a3e74c2fc/.beads/issues.jsonl#L422)
+  is complete. [Release verification details](docs/RELEASING.md#native-installation-and-package-stores)
+  preserve the original failures and execution limits.
+
+---
+
+## [v0.24.0] -- 2026-09-07 (Release)
+
+### Performance (latency campaign `bv-apal.1`)
+
+- **Analysis:** canonical graph hashing streams through successors instead of boxing and sorting every edge, so allocations scale with nodes (`fbc41526`); `ComputeDataHash` / `ComputeIssueDiff` reuse one fingerprint writer per call, 1,289 -> 777 allocations per 256-issue aggregate (`c48bd53c`); the ready set is reused across parallel-gain candidates and marginal unlock IDs are selected without copying issues (`9a72543d`, `187f7525`); blocker IDs sort without reflection (`347134f1`); the regenerable analysis cache no longer forces durable flushes (`4b018e1b`); the drift `Calculator` gains `ReuseAnalyzer` to share precomputed readiness and topology across runs (`1713989c`); Phase 2 analysis is size-tiered with a deterministic betweenness approximation that reduces in sample order (`341a0005`).
+- **TUI:** the visible critical chain is computed once, at snapshot construction, instead of on the event loop (`735f246a`, `30417526`); full list rows are initialised in place and incremental row copies are avoided (`934da756`, `e3dcc7ce`); owned readiness data is compacted (`84cf799b`); background Phase 2 preparation no longer mutates the active model (`1c5d55f9`); snapshot diffing and markdown element layout allocate less (`f2bad78d`).
+- **Loader / search:** one default 10 MiB JSONL reader is retained between parses while caller-owned buffers keep their semantics (`7f708334`); streaming readers and concurrency pooling in `internal/datasource` and `pkg/loader` (`3b4df94d`); metrics vector-search caching layers (`19323918`).
+- **Vendored renderers:** `strings.Builder` replaces quadratic concatenation in chroma `coalesce.go` and glamour `ansi/elements.go`, and reflow `padding.go` uses `runewidth.RuneWidth` (`5e16bff3`). These are hand patches under `vendor/`; a bare `go mod vendor` reverts them.
+
+### Fixed
+
+- Graph navigation and historical causality restored: pan, scroll and expansion follow bounded visible dependency paths with a deterministic highlighted chain; historical transition and dependency authority survive extraction and caching, observed waits carry explicit uncertainty, and causal history is bound to the selected revision and source path (`93b90959`).
+- Decoder cache synchronised and pseudo-versions filtered (`40644bd9`); XFetch cache refresh keyed on the actual expiry (`8285b6f6`).
+- SQLite export creates its schema atomically (`a4f8245b`).
+- Robot parallel-gain output omits elapsed timing when the clock is pinned, keeping envelopes reproducible (`5814bed8`).
+- Graph WASM build remaps compiler source paths (`8cd63299`); the frozen 1,000-issue benchmark input is tracked so a clean checkout can run the release gate (`09fed4e9`).
+
+### Changed
+
+- Robot registry outputs, `defer_until` flags and CLI fixtures harmonised (`54db481b`); the interactive HTML graph export embeds the robot envelope (`19323918`); readiness scopes modelled with projection and authority boundaries, richer triage recommendations, cycle detection and ETA prediction (`341a0005`); graph-analysis invariants, vector indexing and SQLite export schema validation hardened (`3db9dd04`); ingestion pipelines, `defer_until` parsing and workspace path resolution hardened (`3b4df94d`).
+- Release engineering: goreleaser dist output isolated to `/tmp/bv-dist` with `CGO_ENABLED=0` and `GOWORK=off` (`a90029b8`, `0aca294f`); `install.sh` / `install.ps1` handle native packaging with checksum verification and isolated release verification; `scripts/release_gate.sh` writes logs and receipts outside the checkout; the `bv-graph-wasm` Rust toolchain is pinned; installer, gate, WASM and dashboard smoke tests live under `tests/scripts` (`0aca294f`); smoke and installer artifacts are retained as evidence (`8a6386e9`).
+- Tests: end-to-end coverage for robot scoping, search relevance, recipe execution, export flows and board/swimlane interaction, plus benchmark workloads isolated from tree state and a frozen real correlation history (`087a847f`, `1a400830`, `257427df`, `f9d950a0`).
+
+### Dependencies
+
+- `golang.org/x/text` v0.38.0 -> v0.41.0 (fixes GO-2026-5970, reachable through `norm.Form.Properties`), `golang.org/x/image` v0.42.0 -> v0.45.0, `golang.org/x/net` -> v0.58.0; `vendor/` regenerated with the three hand-patched files above preserved (`1e8acace`, #200).
+
+### Housekeeping
+
+- Version metadata bumped to v0.24.0 (`flake.nix`, `pkg/version` fallback, README install examples, installer test defaults).
+
+---
+
+## [v0.23.0] -- 2026-09-04 (Release)
+
+### Reality check 2026-09 (bridge plan `docs/planning/REALITY_CHECK_BRIDGE_PLAN_2026-09-01.md`)
+
+- **Data sources:** discovery only reads issue-file names from the loader allowlist (no more `sync_base.jsonl` shadowing), probe warnings are buffered and only surface for the source actually used, and every robot payload names its `source_path` / `source_kind` plus `as_of` / `scope` in one shared envelope.
+- **Robot registry:** five handlers that ignored `--label` / `--recipe` / `--repo` / `--as-of` now honour them; `--robot-file-hotspots` moved into the registry and roughly 1,400 lines of unreachable inline handler copies were deleted from `cmd/bv/main.go`, along with the never-imported `pkg/beadscli` package; `--robot-help` is generated from the registries.
+- **Feedback loops:** `--feedback-*` weights change `--robot-triage` scoring (after three samples), and correlation confirm/reject changes `--robot-history`, the commit index, `--robot-explain-correlation`, and the History view.
+- **Correlation:** explicit-ID and temporal strategies run alongside co-commit; the artifact cache is format-versioned; `--robot-orphans` reports the scanned window and beads-only commit count.
+- **Sprints and alerts:** four-signal at-risk detection shared by the dashboard and `--robot-burndown` (`at_risk`), a scope-aware ideal line, `P` opens the dashboard; every declared alert type has an emitter (`velocity_drop`, `high_impact_unblock`, `abandoned_claim`, `potential_duplicate`) plus new `priority_mismatch` and `scope_creep`, each with a `suggested_action`, labels for `--alert-label`, a `proactive_max_issues` cap with `skipped_checks`, and every threshold documented from `.bv/drift.yaml`.
+- **TUI:** attention view with cursor and drilldown, tutorial progress persisted, `Shift+Tab` / `n` `N` / `t` bindings, startup update check opt-out (`BV_NO_UPDATE_CHECK`).
+- **Workspaces and recipes:** `.bv/workspace.yaml` is auto-discovered when no `.beads` is reachable; recipes load from `.beads/recipes/*.yaml` and `--recipe` accepts a file path.
+- **Release gate:** `scripts/release_gate.sh` (gofmt, build+vet, `-race` unit and e2e, docs parity, action pins, vendor hashes, benchmark compare, robot smoke, and the gate's own script self-tests) with `scripts/check_action_pins.sh`, `scripts/robot_smoke.sh`, `scripts/verify_vendor.sh`, a vendored-asset `MANIFEST.json` and `docs/PROVENANCE.md`; `ci.yml` runs the gate; `scripts/verify_isomorphic.sh` builds the baseline in a detached worktree instead of stashing the caller's tree.
+- **Release archives (#195):** `.goreleaser.yaml` now names archives `bv_<version>_<os>_<arch>.<ext>`; `bv --update` prefers the versioned name and still accepts the unversioned form older releases used; `install.sh` selects by platform so it handles both; README's direct-download section points at the release page and `checksums.txt` instead of moving `latest` links.
+- **Dashboard CSP (#197 residue):** the exported dashboard's `script-src` no longer allows `'unsafe-inline'`: the four inline bootstrap scripts moved into `head_init.js` and the top of `viewer.js`, `'wasm-unsafe-eval'` is declared for sql.js and the graph WASM, and `bv --preview-pages` serves its live-reload script as `/__preview__/livereload.js` instead of injecting an inline block. `'unsafe-eval'` remains because the vendored Alpine build evaluates `x-*` expressions with `Function()`; switching to Alpine's CSP build is the remaining step. Guards: `TestEmbeddedIndex_CSPHasNoInlineScripts` (also checks every referenced asset is embedded) and the e2e export check. Verified in a headless Chromium with `scripts/dashboard_browser_smoke.sh`: no refusals, database, WASM graph engine, charts, and triage all boot, and a planted inline script is blocked while the app still runs.
+- **Hardening sweep, `pkg/analysis` (from `wip/fresh-eyes-20260826`):** 37 files landed after a per-file rebase behind the gate: exact issue-ID matching in dependency suggestions (`bv-42` no longer matches inside `bv-420`), shell-quoted bead IDs in suggested `br` commands, cycle detection that reports truncation instead of silently capping, readiness-after-completions helpers shared by plan and priority, config caps normalised to defaults, and the cache refusing to serve incomplete Phase 2 results. Two tests on that branch were broken on the branch itself (a `DeferUntil` pointer aliased into the expected value; a cache-version literal not bumped) and are fixed here; the branch's asynchronous cache publish raced a synchronous second `Analyze`, which now stores before returning. The remaining packages of the branch are triaged in tracker item H4.
+- **Benchmark gate (stage 8):** `scripts/benchmark.sh` now runs ten tracked benchmarks against the frozen `tests/testdata/benchmark/medium.jsonl` (never the live tracker), writes `benchmarks/baseline.txt` with a provenance header (date, Go, CPU, OS, commit, dataset hash), and compares the best observed `ns/op` per benchmark with a built-in comparator (benchstat optional); `tests/scripts/benchmark_compare_test.sh` proves it turns red on a doubled median and a missing benchmark. `compare` judges HEAD against a fresh run of the baseline commit built in a detached worktree minutes earlier on the same machine, so host drift on a shared VM no longer reads as a regression; the stored baseline is the fallback.
+- **Key registry decision (tracker item B9):** the TUI `KeyRegistry` is the help index only; its never-called dispatch surface (`Dispatch`, `RegisterView`, `Handler`, `BindingsCount`, `Clear`) is gone. Keys that worked but were undocumented (`E`, `f`, `!`, `w`, `s`, `S` in the list; `H`, `L`, `s` on the board; `E` in the tree) are now in `GetKeyBindingDocs`, the sidebar, and the README, with tests driving each through `Update`.
+- **Windows installer (#197 finding 3):** `install.ps1` now downloads the release zip and `checksums.txt`, verifies SHA-256 with `Get-FileHash`, and refuses a missing or mismatching checksum before anything reaches the install directory; Go is no longer required (`-FromSource` keeps a build pinned to the resolved tag). `tests/scripts/install_ps1_test.sh` runs it under pwsh against a local fake release: verified install, tampered checksum refused, missing checksums refused, `-Version` pin. README pins the piped form to the reviewed commit.
+- **Hardening sweep, `pkg/loader` and `pkg/workspace` (from `wip/fresh-eyes-20260826`, pass 3):** `.beads/redirect` following exposed as `ResolveBeadsDir`/`ResolveBeadsDirWithTrace`, the issues file opened only after a same-file check, `bd export` refreshes run with an absolute `BEADS_DIR` and without an ambient `BEADS_DB`, and the workspace aggregate loader reports dropped records per repository, routes parse warnings safely in robot mode, and rejects cross-repository ID collisions; over-limit lines are counted before their warning fires so handlers see consistent stats.
+- **Hardening sweep, `pkg/search` (from `wip/fresh-eyes-20260826`, pass 4):** a stored vector index whose dimension does not match the embedder is backed up and rebuilt instead of being served as a hit; `NewHybridScorerAt` pins the recency clock; normalizer and query-adjustment fixes land with their tests. Main's stricter vector-index validation is kept. The branch's `internal/datasource` slice is retired: the allowlist and silent-probing design already on main replaced it.
+- **Graph WASM rebuild (#197 finding 8):** `scripts/build_graph_wasm.sh` pins the rebuild without `wasm-pack` (cargo for `wasm32-unknown-unknown`, a `wasm-bindgen` CLI that must match the crate version in `Cargo.lock`, `wasm-opt -Os`) and prints built and vendored hashes with tool versions; `docs/PROVENANCE.md` records that the comparison is still owed and why.
+- **Agent blurb v5:** the ready-made AGENTS.md block now says that `--graph-format=dot|mermaid` returns the diagram text in the `graph` field of the JSON envelope. The version marker moved from v4 to v5 so `bv --agents-update` refreshes installed blocks (`--agents-add` compares versions, not content); this repository's AGENTS.md and the README copy were regenerated with the tool.
+- **Decisions recorded:** no path-matching correlation strategy (README diagram and prose agree); downgrade priority recommendations are not alerts; `cycle_introduced` is documented as `new_cycle`.
+- **Environment registry (`internal/env`):** Centralizes all 41 `BV_*` and `BEADS_*` environment variables in a single package with typed accessors (`BV_NO_COLOR`, `BV_TEST_MODE`, `BV_LOG_FORMAT`, `BV_SEARCH_MODE`, etc.) and an AST-walking vet test guaranteeing zero raw `os.Getenv` / `os.LookupEnv` calls in production code.
+- **Documentation generator (`internal/docgen`):** Emits living reference documentation (`docs/generated/{flags,env,alerts,recipes,presets,keys,sort_modes}.md` and `constants.json`) and synchronizes tables into `README.md` via `go generate` / `bv --generate-docs`.
+- **Milestone completion:** All 615 tracking beads and epics closed (100% completion across graph analysis, drift detection, TUI, search, correlation, and the 10-stage release gate).
+- **Tracker recovery (2026-09-02):** `.beads/beads.db` was at schema 0 and rejected by br 0.5.7 (`SCHEMA_MISMATCH expected 17, found 0`); the JSONL was harmonized (empty-string fields dropped, dependency `metadata` / `thread_id` added), a fresh DB was rebuilt from it and promoted, and the old DB was renamed aside (`beads.db.bad_20260902T030027Z`) rather than deleted. With the maintainer's written approval later that day the renamed DB/WAL/SHM and the two rebuild `*.fsqlite-migration-state` markers were removed; the `recovery_20260902T023914Z/` snapshot (git-ignored) is the one leftover, kept for a recursive removal from the maintainer's own shell.
+
+### Fixed
+
+- SQLite-backed reloads (Ctrl-R / F5 and file-watch refreshes) failed on Windows with
+  `cannot connect to database: SQL logic error: invalid uri authority: E:%5C...`. The read-only
+  DSN was built with `net/url`, which turns a drive-letter path (or any relative path) into
+  `file://E:%5C...`, putting the first path segment in the URI authority slot. The DSN path is
+  now absolute and slash-normalized (`file:///E:/...`) on every platform (#198).
 
 ---
 
@@ -37,7 +434,7 @@ falls back to a full rebuild whenever graph topology, recipe membership, sort or
   bytes per operation fell by about **99.8%**. See
   [`96029793`](https://github.com/Dicklesworthstone/beads_viewer/commit/96029793) and
   [`1a90b016`](https://github.com/Dicklesworthstone/beads_viewer/commit/1a90b016).
-- **Keep interactive latency inside the frame budget.** Five update-only keypress runs measured
+- **Measure interactive latency against the 50 ms target.** Five update-only keypress runs measured
   p99 at **148-160 us**. Three isolated update-plus-render runs measured p99 at
   **33.05-35.54 ms**, below the 50 ms interaction target. Isolated GC validation measured maximum
   pauses of **0.879-1.374 ms**. The benchmarks live with the code in
@@ -1091,7 +1488,10 @@ Initial release of Beads Viewer -- a keyboard-driven terminal interface for the 
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.24.1...HEAD
+[v0.24.1]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.24.0...v0.24.1
+[v0.24.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.23.0...v0.24.0
+[v0.23.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.22.0...v0.23.0
 [v0.22.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.21.2...v0.22.0
 [v0.21.2]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.21.1...v0.21.2
 [v0.21.1]: https://github.com/Dicklesworthstone/beads_viewer/tree/v0.21.1

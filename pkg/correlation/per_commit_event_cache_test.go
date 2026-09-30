@@ -199,12 +199,13 @@ func TestPruneAndBoundPerCommitEntries(t *testing.T) {
 	}
 	// Insert more than the cap; older CreatedAt should be evicted first.
 	total := perCommitEventCacheMaxCommits + 50
+	base := now.Add(-time.Duration(total) * time.Second)
 	for i := 0; i < total; i++ {
 		entries["ns"].Commits[fmt.Sprintf("sha-%05d", i)] = perCommitEventEntry{
-			CreatedAt: now.Add(time.Duration(i) * time.Second),
+			CreatedAt: base.Add(time.Duration(i) * time.Second),
 		}
 	}
-	pruneAndBoundPerCommitEntries(now.Add(time.Hour), entries)
+	pruneAndBoundPerCommitEntries(now, entries)
 	got := len(entries["ns"].Commits)
 	if got != perCommitEventCacheMaxCommits {
 		t.Fatalf("after bound: %d commits, want %d", got, perCommitEventCacheMaxCommits)
@@ -219,6 +220,69 @@ func TestPruneAndBoundPerCommitEntries(t *testing.T) {
 	// the oldest surviving key is at least index 50.
 	if keys[0] < fmt.Sprintf("sha-%05d", 50) {
 		t.Fatalf("oldest surviving key %q suggests wrong entries evicted", keys[0])
+	}
+}
+
+func TestPruneAndBoundPerCommitEntriesRejectsInvalidFreshness(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	entries := map[string]perCommitNamespaceBucket{
+		"ns": {Commits: map[string]perCommitEventEntry{
+			"fresh":  {CreatedAt: now.Add(-time.Hour)},
+			"future": {CreatedAt: now.Add(time.Nanosecond)},
+			"stale":  {CreatedAt: now.Add(-perCommitEventCacheMaxAge - time.Nanosecond)},
+			"zero":   {},
+		}},
+	}
+
+	pruneAndBoundPerCommitEntries(now, entries)
+
+	bucket, ok := entries["ns"]
+	if !ok || len(bucket.Commits) != 1 {
+		t.Fatalf("prune retained %+v, want only fresh entry", entries)
+	}
+	if _, ok := bucket.Commits["fresh"]; !ok {
+		t.Fatal("prune removed fresh entry")
+	}
+}
+
+func TestLoadPerCommitEventsRejectsInvalidFreshness(t *testing.T) {
+	t.Setenv("BV_NO_CACHE", "")
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+	now := time.Now().UTC()
+	namespace := "freshness"
+	path, err := perCommitEventCachePath(true)
+	if err != nil {
+		t.Fatalf("cache path: %v", err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open cache: %v", err)
+	}
+	cacheFile := perCommitEventCacheFile{
+		Version: perCommitEventCacheVersion,
+		Entries: map[string]perCommitNamespaceBucket{
+			namespace: {Commits: map[string]perCommitEventEntry{
+				"fresh":  {CreatedAt: now.Add(-time.Hour)},
+				"future": {CreatedAt: now.Add(time.Hour)},
+				"stale":  {CreatedAt: now.Add(-perCommitEventCacheMaxAge - time.Hour)},
+			}},
+		},
+	}
+	if err := writePerCommitEventCacheLocked(f, cacheFile); err != nil {
+		_ = f.Close()
+		t.Fatalf("write cache: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close cache: %v", err)
+	}
+
+	loaded := loadPerCommitEvents(namespace)
+	if len(loaded) != 1 {
+		t.Fatalf("load returned %+v, want only fresh entry", loaded)
+	}
+	if _, ok := loaded["fresh"]; !ok {
+		t.Fatal("load removed fresh entry")
 	}
 }
 

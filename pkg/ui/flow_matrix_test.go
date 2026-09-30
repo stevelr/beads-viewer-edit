@@ -5,7 +5,10 @@ import (
 	"testing"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/ui"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // =============================================================================
@@ -263,6 +266,153 @@ func BenchmarkFlowMatrixViewLarge(b *testing.B) {
 
 func testFlowTheme() ui.Theme {
 	return ui.DefaultTheme(nil)
+}
+
+func flowDrilldownFixture() []model.Issue {
+	return []model.Issue{
+		{ID: "blocker", Title: "Database migration", Status: model.StatusOpen, Labels: []string{"database", "storage"}},
+		{ID: "unrelated", Title: "Unrelated database task", Status: model.StatusOpen, Labels: []string{"database"}},
+		{ID: "dependent", Title: "API rollout", Status: model.StatusOpen, Labels: []string{"api", "service"}, Dependencies: []*model.Dependency{{DependsOnID: "blocker", Type: model.DepBlocks}}},
+	}
+}
+
+func TestFlowMatrixDrilldownRelationships(t *testing.T) {
+	issues := flowDrilldownFixture()
+	flow := analysis.ComputeCrossLabelFlow(issues, analysis.DefaultLabelHealthConfig())
+	m := ui.NewFlowMatrixModel(testFlowTheme())
+	m.SetData(&flow, issues)
+	m.SetSize(100, 24)
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	view := m.View()
+	t.Logf("real flow=%+v; rendered drilldown:\n%s", flow.Dependencies, view)
+	for _, want := range []string{"blocker", "dependent", "Database migration", "API rollout", "blocks"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("missing relationship content %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "unrelated") || strings.Count(view, "API rollout") != 1 {
+		t.Errorf("unrelated or duplicate pair in drilldown:\n%s", view)
+	}
+	for _, id := range []string{"blocker", "dependent", "dependent"} {
+		if got := m.SelectedDrilldownIssue(); got == nil || got.ID != id {
+			t.Fatalf("selected=%+v, want %s", got, id)
+		}
+		m.MoveDown()
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m.GoToEnd() // Incoming-only label must show the same direction.
+	m.OpenDrilldown()
+	if got := m.SelectedDrilldownIssue(); got == nil || got.ID != "blocker" {
+		t.Fatalf("incoming label inverted or lost blocker: %+v", got)
+	}
+}
+
+func TestFlowMatrixDrilldownRefresh(t *testing.T) {
+	issues := flowDrilldownFixture()
+	flow := analysis.ComputeCrossLabelFlow(issues, analysis.DefaultLabelHealthConfig())
+	m := ui.NewFlowMatrixModel(testFlowTheme())
+	m.SetData(&flow, issues)
+	m.SetSize(100, 24)
+	m.OpenDrilldown()
+	m.MoveDown()
+	issues[2].Title = "REFRESHED API rollout"
+	flow = analysis.ComputeCrossLabelFlow(issues, analysis.DefaultLabelHealthConfig())
+	m.SetData(&flow, issues)
+	if got := m.SelectedDrilldownIssue(); got == nil || got.ID != "dependent" || got.Title != issues[2].Title {
+		t.Fatalf("refresh did not preserve selected endpoint/current title: %+v\n%s", got, m.View())
+	}
+	issues[0].Status = model.StatusClosed
+	flow = analysis.ComputeCrossLabelFlow(issues, analysis.DefaultLabelHealthConfig())
+	m.SetData(&flow, issues)
+	if m.SelectedDrilldownIssue() != nil || strings.Contains(m.View(), "API rollout") {
+		t.Fatalf("closed relationship retained after refresh:\n%s", m.View())
+	}
+	m.SetData(nil, nil)
+	if m.SelectedLabel() != "" || m.SelectedDrilldownIssue() != nil {
+		t.Fatal("empty source retained label or endpoint selection")
+	}
+}
+
+func TestFlowMatrixDrilldownNarrowUnicode(t *testing.T) {
+	issues := flowDrilldownFixture()
+	issues[0].ID = strings.Repeat("界", 40)
+	issues[2].Dependencies[0].DependsOnID = issues[0].ID
+	issues[2].Title = strings.Repeat("🧪 rollout ", 20)
+	flow := analysis.ComputeCrossLabelFlow(issues, analysis.DefaultLabelHealthConfig())
+	m := ui.NewFlowMatrixModel(testFlowTheme())
+	m.SetData(&flow, issues)
+	m.SetSize(24, 12)
+	m.OpenDrilldown()
+	for _, line := range strings.Split(m.View(), "\n") {
+		if width := lipgloss.Width(line); width > 24 {
+			t.Errorf("line exceeds terminal width (%d): %q", width, line)
+		}
+	}
+	m.MoveDown()
+	if got := m.SelectedDrilldownIssue(); got == nil || got.ID != "dependent" {
+		t.Fatalf("clipping lost endpoint identity: %+v", got)
+	}
+}
+
+func TestFlowMatrixDrilldownExcludesNonRelationships(t *testing.T) {
+	for _, kind := range []string{"closed-blocker", "tombstone-dependent", "nonblocking", "missing-blocker", "missing-detail"} {
+		t.Run(kind, func(t *testing.T) {
+			issues := flowDrilldownFixture()
+			switch kind {
+			case "closed-blocker":
+				issues[0].Status = model.StatusClosed
+			case "tombstone-dependent":
+				issues[2].Status = model.StatusTombstone
+			case "nonblocking":
+				issues[2].Dependencies[0].Type = model.DepRelated
+			case "missing-blocker":
+				issues[2].Dependencies[0].DependsOnID = "not-loaded"
+			}
+			flow := analysis.ComputeCrossLabelFlow(issues, analysis.DefaultLabelHealthConfig())
+			if kind == "missing-detail" {
+				issues = issues[1:] // Omit one endpoint at the consumer boundary.
+			}
+			m := ui.NewFlowMatrixModel(testFlowTheme())
+			m.SetData(&flow, issues)
+			m.SetSize(100, 24)
+			m.OpenDrilldown()
+			if m.SelectedDrilldownIssue() != nil || strings.Contains(m.View(), "API rollout") {
+				t.Fatalf("%s fabricated a blocking relationship:\n%s", kind, m.View())
+			}
+		})
+	}
+}
+
+func TestFlowMatrixDrilldownSelectionSurvivesReordering(t *testing.T) {
+	issues := flowDrilldownFixture()
+	m := ui.NewFlowMatrixModel(testFlowTheme())
+	flow := analysis.ComputeCrossLabelFlow(issues, analysis.DefaultLabelHealthConfig())
+	m.SetData(&flow, issues)
+	m.SetSize(100, 12)
+	m.OpenDrilldown()
+	m.MoveDown()
+	issues = append(issues,
+		model.Issue{ID: "aaa", Status: model.StatusOpen, Labels: []string{"database", "a-new-label"}},
+		model.Issue{ID: "bbb", Status: model.StatusOpen, Labels: []string{"api"}, Dependencies: []*model.Dependency{{DependsOnID: "aaa", Type: model.DepBlocks}}},
+	)
+	flow = analysis.ComputeCrossLabelFlow(issues, analysis.DefaultLabelHealthConfig())
+	m.SetData(&flow, issues)
+	if got := m.SelectedDrilldownIssue(); m.SelectedLabel() != "database" || got == nil || got.ID != "dependent" {
+		t.Fatalf("reordering lost selected label/pair/endpoint: label=%s endpoint=%+v", m.SelectedLabel(), got)
+	}
+	m.GoToEnd()
+	m.SetSize(100, 30)
+	if !strings.Contains(m.View(), "aaa") {
+		t.Fatalf("resize retained an obsolete scroll offset:\n%s", m.View())
+	}
+	issues[0].Labels = []string{"storage"}
+	issues[1].Labels = nil
+	issues[3].Labels = []string{"a-new-label"}
+	flow = analysis.ComputeCrossLabelFlow(issues, analysis.DefaultLabelHealthConfig())
+	m.SetData(&flow, issues)
+	if m.SelectedDrilldownIssue() != nil || m.SelectedLabel() == "database" {
+		t.Fatal("removed label retained its drilldown")
+	}
 }
 
 func TestNewFlowMatrixModel(t *testing.T) {

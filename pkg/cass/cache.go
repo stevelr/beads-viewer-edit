@@ -2,6 +2,7 @@ package cass
 
 import (
 	"container/list"
+	"slices"
 	"sync"
 	"time"
 )
@@ -13,11 +14,11 @@ const DefaultResultCacheSize = 100
 const DefaultResultCacheTTL = 10 * time.Minute
 
 // CorrelationHint represents cached correlation data for a bead.
-// This will be extended when the correlation engine is implemented.
 type CorrelationHint struct {
 	BeadID      string         // The bead this hint is for
-	Results     []SearchResult // Correlated search results
-	QueryUsed   string         // The query that produced these results
+	Results     []ScoredResult // Correlated results with their computed scores
+	QueryUsed   string         // The correlation strategy that produced these results
+	Keywords    []string       // Keywords used by the correlation search
 	ResultCount int            // Total results (may be > len(Results) if truncated)
 }
 
@@ -123,7 +124,7 @@ func (c *Cache) Get(beadID string) *CorrelationHint {
 	c.order.MoveToBack(elem)
 	c.hits++
 
-	return entry.Hint
+	return cloneCorrelationHint(entry.Hint)
 }
 
 // Set stores a correlation hint in the cache.
@@ -138,7 +139,7 @@ func (c *Cache) Set(beadID string, hint *CorrelationHint) {
 	// If already exists, update it
 	if elem, ok := c.entries[beadID]; ok {
 		entry := elem.Value.(*CacheEntry)
-		entry.Hint = hint
+		entry.Hint = cloneCorrelationHint(hint)
 		entry.CachedAt = now
 		entry.ExpiresAt = now.Add(c.ttl)
 		c.order.MoveToBack(elem)
@@ -151,13 +152,27 @@ func (c *Cache) Set(beadID string, hint *CorrelationHint) {
 	// Create new entry
 	entry := &CacheEntry{
 		Key:       beadID,
-		Hint:      hint,
+		Hint:      cloneCorrelationHint(hint),
 		CachedAt:  now,
 		ExpiresAt: now.Add(c.ttl),
 	}
 
 	elem := c.order.PushBack(entry)
 	c.entries[beadID] = elem
+}
+
+// cloneCorrelationHint keeps cached slices independent of callers' results.
+func cloneCorrelationHint(hint *CorrelationHint) *CorrelationHint {
+	if hint == nil {
+		return nil
+	}
+	cloned := *hint
+	cloned.Keywords = slices.Clone(hint.Keywords)
+	cloned.Results = slices.Clone(hint.Results)
+	for i := range cloned.Results {
+		cloned.Results[i].Keywords = slices.Clone(hint.Results[i].Keywords)
+	}
+	return &cloned
 }
 
 // Invalidate removes a specific entry from the cache.

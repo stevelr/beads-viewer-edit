@@ -215,7 +215,8 @@ func TestLoadIssues_RespectsBeadsDBSpecificJSONL(t *testing.T) {
 	createTestSQLiteDB(t, filepath.Join(beadsDir, "beads.db"))
 	t.Setenv(loader.BeadsDBEnvVar, jsonlPath)
 
-	issues, err := LoadIssues(tmpDir)
+	loaded, err := LoadIssues(tmpDir)
+	issues := loaded.Issues
 	if err != nil {
 		t.Fatalf("LoadIssues: %v", err)
 	}
@@ -239,7 +240,8 @@ func TestLoadIssues_RespectsBeadsDBSpecificSQLite(t *testing.T) {
 	createSingleIssueSQLiteDB(t, dbPath, "SQLITE-1")
 	t.Setenv(loader.BeadsDBEnvVar, dbPath)
 
-	issues, err := LoadIssues(tmpDir)
+	loaded, err := LoadIssues(tmpDir)
+	issues := loaded.Issues
 	if err != nil {
 		t.Fatalf("LoadIssues: %v", err)
 	}
@@ -809,6 +811,103 @@ func TestAutoRefreshManager_HandleChangeCallbackCanReadCurrentSource(t *testing.
 	}
 }
 
+func TestAutoRefreshManager_HandleChangeLoggerCanReadCurrentSource(t *testing.T) {
+	source := createValidJSONLSource(t)
+	manager := &AutoRefreshManager{
+		currentSource: &DataSource{
+			Type:    source.Type,
+			Path:    source.Path,
+			ModTime: source.ModTime.Add(-time.Minute),
+			Valid:   true,
+		},
+		sources: []DataSource{source},
+	}
+	manager.opts = DefaultSelectionOptions()
+	manager.opts.Verbose = true
+	logged := make(chan struct{}, 1)
+	manager.opts.Logger = func(string) {
+		_ = manager.CurrentSource()
+		select {
+		case logged <- struct{}{}:
+		default:
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		manager.handleChange(source)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("handleChange deadlocked while its selection logger read CurrentSource")
+	}
+
+	select {
+	case <-logged:
+	default:
+		t.Fatal("handleChange returned without invoking its selection logger")
+	}
+}
+
+func TestSourceWatcher_AddSourceLoggerCanReadSources(t *testing.T) {
+	source := createValidJSONLSource(t)
+	sw, err := NewSourceWatcher(nil, nil, DefaultWatcherOptions())
+	if err != nil {
+		t.Fatalf("NewSourceWatcher: %v", err)
+	}
+	defer sw.Stop()
+
+	sw.verbose = true
+	sw.logger = func(string) {
+		_ = sw.Sources()
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- sw.AddSource(source)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("AddSource: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("AddSource deadlocked while its logger read Sources")
+	}
+}
+
+func TestSourceWatcher_RemoveSourceLoggerCanReadSources(t *testing.T) {
+	source := createValidJSONLSource(t)
+	sw, err := NewSourceWatcher([]DataSource{source}, nil, DefaultWatcherOptions())
+	if err != nil {
+		t.Fatalf("NewSourceWatcher: %v", err)
+	}
+	defer sw.Stop()
+
+	sw.verbose = true
+	sw.logger = func(string) {
+		_ = sw.Sources()
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- sw.RemoveSource(source.Path)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RemoveSource: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("RemoveSource deadlocked while its logger read Sources")
+	}
+}
+
 func TestAutoRefreshManager_ForceRefreshCallbackCanReadCurrentSource(t *testing.T) {
 	source := createValidJSONLSource(t)
 	manager := &AutoRefreshManager{
@@ -840,6 +939,85 @@ func TestAutoRefreshManager_ForceRefreshCallbackCanReadCurrentSource(t *testing.
 	case <-done:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("ForceRefresh returned without invoking source change callback")
+	}
+}
+
+func TestAutoRefreshManager_ForceRefreshLoggerCanReadCurrentSource(t *testing.T) {
+	source := createValidJSONLSource(t)
+	manager := &AutoRefreshManager{
+		sources: []DataSource{source},
+	}
+	manager.opts = DefaultSelectionOptions()
+	manager.opts.Verbose = true
+	logged := make(chan struct{}, 1)
+	manager.opts.Logger = func(string) {
+		_ = manager.CurrentSource()
+		select {
+		case logged <- struct{}{}:
+		default:
+		}
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- manager.ForceRefresh()
+	}()
+
+	select {
+	case err := <-errChan:
+		if err != nil {
+			t.Fatalf("ForceRefresh failed: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("ForceRefresh deadlocked while its selection logger read CurrentSource")
+	}
+
+	select {
+	case <-logged:
+	default:
+		t.Fatal("ForceRefresh returned without invoking its selection logger")
+	}
+}
+
+func TestAutoRefreshManager_ForceRefreshPublishesUnchangedSelection(t *testing.T) {
+	source := createValidJSONLSource(t)
+	manager := &AutoRefreshManager{
+		currentSource: &DataSource{
+			Type:       source.Type,
+			Path:       source.Path,
+			Priority:   source.Priority,
+			ModTime:    source.ModTime.Add(-time.Hour),
+			Valid:      true,
+			IssueCount: source.IssueCount,
+			Size:       0,
+		},
+		sources: []DataSource{source},
+		opts:    DefaultSelectionOptions(),
+	}
+
+	callbackCount := 0
+	manager.onSourceChange = func(newSource DataSource, reason string) {
+		callbackCount++
+		if newSource.Path != source.Path {
+			t.Errorf("callback path = %q, want %q", newSource.Path, source.Path)
+		}
+		if reason != "force refresh" {
+			t.Errorf("callback reason = %q, want %q", reason, "force refresh")
+		}
+	}
+
+	if err := manager.ForceRefresh(); err != nil {
+		t.Fatalf("ForceRefresh failed: %v", err)
+	}
+	if callbackCount != 1 {
+		t.Fatalf("callback count = %d, want 1 for an unchanged selected path", callbackCount)
+	}
+	got := manager.CurrentSource()
+	if got.Path != source.Path {
+		t.Fatalf("current source path = %q, want %q", got.Path, source.Path)
+	}
+	if got.Size != source.Size || !got.ModTime.Equal(source.ModTime) {
+		t.Fatalf("current source metadata = size %d, modtime %v; want size %d, modtime %v", got.Size, got.ModTime, source.Size, source.ModTime)
 	}
 }
 

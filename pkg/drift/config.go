@@ -45,6 +45,37 @@ type Config struct {
 	BlockingCascadeInfo    int `yaml:"blocking_cascade_info_threshold" json:"blocking_cascade_info_threshold"`
 	BlockingCascadeWarning int `yaml:"blocking_cascade_warning_threshold" json:"blocking_cascade_warning_threshold"`
 
+	// Scope creep: open-issue growth (percent) over the baseline that triggers info
+	ScopeCreepPct float64 `yaml:"scope_creep_pct" json:"scope_creep_pct"`
+
+	// Velocity drop: closes in the last VelocityWindowDays fell by VelocityDropPct or
+	// more versus the previous window, which must hold at least VelocityMinBaseline closes
+	VelocityDropPct     float64 `yaml:"velocity_drop_pct" json:"velocity_drop_pct"`
+	VelocityWindowDays  int     `yaml:"velocity_window_days" json:"velocity_window_days"`
+	VelocityMinBaseline int     `yaml:"velocity_min_baseline" json:"velocity_min_baseline"`
+
+	// High-impact unblock: actionable issue unblocking HighImpactUnblockMin+ items of which
+	// at least one has priority <= HighImpactPriorityMax (P0=0 ... P4=4)
+	HighImpactUnblockMin  int `yaml:"high_impact_unblock_min" json:"high_impact_unblock_min"`
+	HighImpactPriorityMax int `yaml:"high_impact_priority_max" json:"high_impact_priority_max"`
+
+	// Abandoned claim: in_progress issues with an assignee idle longer than
+	// stale_warning_days x in_progress_stale_multiplier x this multiplier
+	AbandonedClaimMultiplier float64 `yaml:"abandoned_claim_multiplier" json:"abandoned_claim_multiplier"`
+
+	// Potential duplicate: keyword Jaccard similarity threshold and alert cap per run
+	DuplicateJaccardThreshold float64 `yaml:"duplicate_jaccard_threshold" json:"duplicate_jaccard_threshold"`
+	DuplicateMaxAlerts        int     `yaml:"duplicate_max_alerts" json:"duplicate_max_alerts"`
+
+	// Priority mismatch: minimum recommendation confidence (0-1) that becomes a warning
+	PriorityMismatchMinConfidence float64 `yaml:"priority_mismatch_min_confidence" json:"priority_mismatch_min_confidence"`
+
+	// ProactiveMaxIssues caps the graph size for the expensive proactive checks
+	// (priority_mismatch re-runs the full metric suite, potential_duplicate compares
+	// titles pairwise). Above it those checks are skipped and reported in
+	// skipped_checks; 0 means no cap.
+	ProactiveMaxIssues int `yaml:"proactive_max_issues" json:"proactive_max_issues"`
+
 	// Alert type enable/disable flags (bv-167)
 	// Disabled alert types will not generate alerts
 	DisabledAlerts []string `yaml:"disabled_alerts,omitempty" json:"disabled_alerts,omitempty"`
@@ -80,6 +111,18 @@ func DefaultConfig() *Config {
 		InProgressStaleMultiplier:    0.5, // In-progress thresholds are half as long
 		BlockingCascadeInfo:          3,   // Info alert when unblocks >=3
 		BlockingCascadeWarning:       5,   // Warning when unblocks >=5
+
+		ScopeCreepPct:                 20,   // Info when open issues grew 20%+ over the baseline
+		VelocityDropPct:               50,   // Warning when closes fell 50%+ window over window
+		VelocityWindowDays:            7,    // Compare the last 7 days with the 7 before
+		VelocityMinBaseline:           5,    // ...but only when the prior window closed 5+
+		HighImpactUnblockMin:          3,    // Unblocks 3+ items...
+		HighImpactPriorityMax:         1,    // ...including at least one P0/P1
+		AbandonedClaimMultiplier:      2,    // 2x the in-progress stale threshold (14d by default)
+		DuplicateJaccardThreshold:     0.7,  // Keyword Jaccard similarity for potential_duplicate
+		DuplicateMaxAlerts:            10,   // At most 10 duplicate alerts per run
+		PriorityMismatchMinConfidence: 0.6,  // Recommendation confidence that becomes a warning
+		ProactiveMaxIssues:            2000, // Skip the expensive checks above this many issues
 	}
 }
 
@@ -160,6 +203,71 @@ func (c *Config) Validate() error {
 	}
 	if c.InProgressStaleMultiplier == 0 {
 		c.InProgressStaleMultiplier = DefaultConfig().InProgressStaleMultiplier
+	}
+	// Proactive-check thresholds added later than the file format: an omitted
+	// key means "default", a negative value is an error (checked below), and a
+	// zero for the alert-cap style knobs means "unlimited" where noted.
+	defaults := DefaultConfig()
+	if c.ScopeCreepPct == 0 {
+		c.ScopeCreepPct = defaults.ScopeCreepPct
+	}
+	if c.VelocityDropPct == 0 {
+		c.VelocityDropPct = defaults.VelocityDropPct
+	}
+	if c.VelocityWindowDays == 0 {
+		c.VelocityWindowDays = defaults.VelocityWindowDays
+	}
+	if c.VelocityMinBaseline == 0 {
+		c.VelocityMinBaseline = defaults.VelocityMinBaseline
+	}
+	if c.HighImpactUnblockMin == 0 {
+		c.HighImpactUnblockMin = defaults.HighImpactUnblockMin
+	}
+	if c.HighImpactPriorityMax == 0 && c.HighImpactUnblockMin == defaults.HighImpactUnblockMin {
+		// P0-only is a legitimate setting; only backfill when the whole block was omitted.
+		c.HighImpactPriorityMax = defaults.HighImpactPriorityMax
+	}
+	if c.AbandonedClaimMultiplier == 0 {
+		c.AbandonedClaimMultiplier = defaults.AbandonedClaimMultiplier
+	}
+	if c.DuplicateJaccardThreshold == 0 {
+		c.DuplicateJaccardThreshold = defaults.DuplicateJaccardThreshold
+	}
+	if c.DuplicateMaxAlerts == 0 {
+		c.DuplicateMaxAlerts = defaults.DuplicateMaxAlerts
+	}
+	if c.PriorityMismatchMinConfidence == 0 {
+		c.PriorityMismatchMinConfidence = defaults.PriorityMismatchMinConfidence
+	}
+	if c.ProactiveMaxIssues < 0 {
+		return fmt.Errorf("proactive_max_issues must be non-negative (0 = no cap)")
+	}
+	if c.ScopeCreepPct < 0 || c.ScopeCreepPct > 1000 {
+		return fmt.Errorf("scope_creep_pct must be between 0 and 1000")
+	}
+	if c.VelocityDropPct < 0 || c.VelocityDropPct > 100 {
+		return fmt.Errorf("velocity_drop_pct must be between 0 and 100")
+	}
+	if c.VelocityWindowDays < 0 || c.VelocityMinBaseline < 0 {
+		return fmt.Errorf("velocity_window_days and velocity_min_baseline must be non-negative")
+	}
+	if c.HighImpactUnblockMin < 0 {
+		return fmt.Errorf("high_impact_unblock_min must be non-negative")
+	}
+	if c.HighImpactPriorityMax < 0 || c.HighImpactPriorityMax > 4 {
+		return fmt.Errorf("high_impact_priority_max must be a priority between 0 and 4")
+	}
+	if c.AbandonedClaimMultiplier < 0 || c.AbandonedClaimMultiplier > 10 {
+		return fmt.Errorf("abandoned_claim_multiplier must be between 0 and 10")
+	}
+	if c.DuplicateJaccardThreshold < 0 || c.DuplicateJaccardThreshold > 1 {
+		return fmt.Errorf("duplicate_jaccard_threshold must be between 0 and 1")
+	}
+	if c.DuplicateMaxAlerts < 0 {
+		return fmt.Errorf("duplicate_max_alerts must be non-negative")
+	}
+	if c.PriorityMismatchMinConfidence < 0 || c.PriorityMismatchMinConfidence > 1 {
+		return fmt.Errorf("priority_mismatch_min_confidence must be between 0 and 1")
 	}
 
 	if c.DensityWarningPct < 0 || c.DensityWarningPct > 1000 {
@@ -314,6 +422,32 @@ in_progress_stale_multiplier: 0.5  # In-progress items age twice as fast
 # Blocking cascade thresholds (downstream items)
 blocking_cascade_info_threshold: 3   # Info alert if completing an issue unblocks 3+ items
 blocking_cascade_warning_threshold: 5 # Warning if unblocks 5+ items
+
+# Scope creep (needs a saved baseline)
+scope_creep_pct: 20              # Info if open issues grew 20%+ since the baseline
+
+# Velocity drop (closes in the last window vs the window before)
+velocity_drop_pct: 50            # Warning if closes fell 50%+
+velocity_window_days: 7          # Window length in days
+velocity_min_baseline: 5         # Only alert when the prior window closed 5+ issues
+
+# High-impact unblock (blocking cascade with a priority signal)
+high_impact_unblock_min: 3       # Actionable issue unblocks 3+ items...
+high_impact_priority_max: 1      # ...including at least one P0/P1 (two or more => warning)
+
+# Abandoned claim (in_progress with an assignee, idle)
+abandoned_claim_multiplier: 2    # Idle longer than stale_warning_days x in_progress_stale_multiplier x 2
+
+# Potential duplicates (keyword similarity)
+duplicate_jaccard_threshold: 0.7 # Pairs at or above this Jaccard score
+duplicate_max_alerts: 10         # Cap per run
+
+# Priority mismatch (from --robot-priority recommendations)
+priority_mismatch_min_confidence: 0.6  # Warning at this confidence or above
+
+# Graph-size cap for the expensive proactive checks (priority_mismatch, potential_duplicate);
+# larger graphs skip them and report skipped_checks. 0 disables the cap.
+proactive_max_issues: 2000
 
 # Disable specific alert types (bv-167)
 # Uncomment to disable:

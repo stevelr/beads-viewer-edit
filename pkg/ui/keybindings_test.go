@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -8,121 +9,48 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
-// TestKeyRegistryDispatch_EmptyRegistry verifies that dispatching to an empty
-// registry returns handled=false and leaves the model unchanged.
-func TestKeyRegistryDispatch_EmptyRegistry(t *testing.T) {
+// The KeyRegistry is the help index behind the shortcuts sidebar: it holds
+// documented bindings per focus and never dispatches. Runtime dispatch is
+// Model.Update, exercised by the TestKeyDispatch_* tests below.
+
+// TestKeyRegistry_RegisterBindingReplacesSameKey: registering the same key
+// twice for one focus keeps a single entry carrying the latest description.
+func TestKeyRegistry_RegisterBindingReplacesSameKey(t *testing.T) {
 	r := NewKeyRegistry()
+	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "j", Desc: "old", Category: "Navigation"})
+	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "j", Desc: "new", Category: "Navigation"})
+	r.RegisterBinding(KeyBinding{Focus: focusBoard, Key: "j", Desc: "board", Category: "Navigation"})
 
-	// Create a minimal model for testing
-	m := Model{focused: focusList}
-
-	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")}
-	updatedModel, handled, cmd := r.Dispatch(focusList, "j", m, msg)
-
-	if handled {
-		t.Errorf("Dispatch on empty registry: expected handled=false, got true")
+	list := r.AllBindingsForFocus(focusList)
+	if len(list) != 1 || list[0].Desc != "new" {
+		t.Fatalf("expected one list binding with the replaced description, got %+v", list)
 	}
-	if cmd != nil {
-		t.Errorf("Dispatch on empty registry: expected cmd=nil, got %v", cmd)
+	if got := len(r.AllBindings()); got != 2 {
+		t.Fatalf("expected 2 bindings across focuses, got %d", got)
 	}
-	if updatedModel.focused != m.focused {
-		t.Errorf("Dispatch on empty registry: model should be unchanged")
-	}
-	t.Logf("focus=%v key=%s expected=handled:false actual=handled:%v", focusList, "j", handled)
 }
 
-// TestKeyRegistryRegisterAndLookup verifies that registering a binding
-// makes it discoverable via Dispatch.
-func TestKeyRegistryRegisterAndLookup(t *testing.T) {
-	r := NewKeyRegistry()
-
-	handlerCalled := false
-	testHandler := func(m Model, msg tea.KeyMsg) (Model, bool) {
-		handlerCalled = true
-		m.focused = focusDetail // Modify to prove handler ran
-		return m, true
-	}
-
-	r.RegisterBinding(KeyBinding{
-		Focus:    focusList,
-		Key:      "enter",
-		Desc:     "Select item",
-		Category: "Navigation",
-		Handler:  testHandler,
-	})
-
-	m := Model{focused: focusList}
-	msg := tea.KeyMsg{Type: tea.KeyEnter}
-
-	updatedModel, handled, _ := r.Dispatch(focusList, "enter", m, msg)
-
-	if !handled {
-		t.Errorf("Dispatch after register: expected handled=true, got false")
-	}
-	if !handlerCalled {
-		t.Errorf("Dispatch after register: handler was not called")
-	}
-	if updatedModel.focused != focusDetail {
-		t.Errorf("Dispatch after register: expected focus=focusDetail, got %v", updatedModel.focused)
-	}
-	t.Logf("focus=%v key=%s expected=handled:true actual=handled:%v", int(focusList), "enter", handled)
-}
-
-// TestKeyRegistryRegisterAndLookup_WrongFocus verifies that dispatch returns
-// handled=false when the focus doesn't match the registered binding.
-func TestKeyRegistryRegisterAndLookup_WrongFocus(t *testing.T) {
-	r := NewKeyRegistry()
-
-	testHandler := func(m Model, msg tea.KeyMsg) (Model, bool) {
-		return m, true
-	}
-
-	r.RegisterBinding(KeyBinding{
-		Focus:    focusList,
-		Key:      "j",
-		Desc:     "Move down",
-		Category: "Navigation",
-		Handler:  testHandler,
-	})
-
-	m := Model{focused: focusBoard}
-	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")}
-
-	_, handled, _ := r.Dispatch(focusBoard, "j", m, msg)
-
-	if handled {
-		t.Errorf("Dispatch with wrong focus: expected handled=false, got true")
-	}
-	t.Logf("focus=%v key=%s expected=handled:false actual=handled:%v", int(focusBoard), "j", handled)
-}
-
-// TestKeyRegistryAllBindings verifies that AllBindings returns all registered
-// bindings sorted by focus, category, then key.
+// TestKeyRegistryAllBindings verifies that AllBindings returns every binding
+// sorted by focus, then category, then key.
 func TestKeyRegistryAllBindings(t *testing.T) {
 	r := NewKeyRegistry()
-
-	noopHandler := func(m Model, msg tea.KeyMsg) (Model, bool) { return m, true }
-
-	// Register bindings in various orders
-	r.RegisterBinding(KeyBinding{Focus: focusBoard, Key: "j", Desc: "Down", Category: "Navigation", Handler: noopHandler})
-	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "k", Desc: "Up", Category: "Navigation", Handler: noopHandler})
-	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "enter", Desc: "Select", Category: "Actions", Handler: noopHandler})
-	r.RegisterBinding(KeyBinding{Focus: focusBoard, Key: "h", Desc: "Left", Category: "Navigation", Handler: noopHandler})
+	r.RegisterBinding(KeyBinding{Focus: focusBoard, Key: "j", Desc: "Down", Category: "Navigation"})
+	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "k", Desc: "Up", Category: "Navigation"})
+	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "enter", Desc: "Select", Category: "Actions"})
+	r.RegisterBinding(KeyBinding{Focus: focusBoard, Key: "h", Desc: "Left", Category: "Navigation"})
 
 	bindings := r.AllBindings()
-
 	if len(bindings) != 4 {
-		t.Errorf("AllBindings: expected 4 bindings, got %d", len(bindings))
+		t.Fatalf("AllBindings: expected 4 bindings, got %d", len(bindings))
 	}
-
-	// Verify sorting: by focus, then category, then key
-	// focusBoard < focusList (alphabetically by focus enum order)
-	// Within each focus: Actions < Navigation (alphabetically)
-	// Within each category: sorted by key
-
-	// Log all bindings for debugging
-	for i, b := range bindings {
-		t.Logf("binding[%d]: focus=%v category=%s key=%s desc=%s", i, b.Focus, b.Category, b.Key, b.Desc)
+	for i := 1; i < len(bindings); i++ {
+		a, b := bindings[i-1], bindings[i]
+		ordered := a.Focus < b.Focus ||
+			(a.Focus == b.Focus && a.Category < b.Category) ||
+			(a.Focus == b.Focus && a.Category == b.Category && a.Key < b.Key)
+		if !ordered {
+			t.Errorf("AllBindings not sorted at %d: %+v before %+v", i, a, b)
+		}
 	}
 }
 
@@ -130,37 +58,25 @@ func TestKeyRegistryAllBindings(t *testing.T) {
 // only bindings for the specified focus context.
 func TestKeyRegistryAllBindingsForFocus(t *testing.T) {
 	r := NewKeyRegistry()
+	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "j", Desc: "Down", Category: "Nav"})
+	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "k", Desc: "Up", Category: "Nav"})
+	r.RegisterBinding(KeyBinding{Focus: focusBoard, Key: "l", Desc: "Right", Category: "Nav"})
 
-	noopHandler := func(m Model, msg tea.KeyMsg) (Model, bool) { return m, true }
-
-	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "j", Desc: "Down", Category: "Nav", Handler: noopHandler})
-	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "k", Desc: "Up", Category: "Nav", Handler: noopHandler})
-	r.RegisterBinding(KeyBinding{Focus: focusBoard, Key: "l", Desc: "Right", Category: "Nav", Handler: noopHandler})
-
-	listBindings := r.AllBindingsForFocus(focusList)
-	boardBindings := r.AllBindingsForFocus(focusBoard)
-
-	if len(listBindings) != 2 {
-		t.Errorf("AllBindingsForFocus(focusList): expected 2, got %d", len(listBindings))
+	if got := len(r.AllBindingsForFocus(focusList)); got != 2 {
+		t.Errorf("AllBindingsForFocus(focusList): expected 2, got %d", got)
 	}
-	if len(boardBindings) != 1 {
-		t.Errorf("AllBindingsForFocus(focusBoard): expected 1, got %d", len(boardBindings))
+	if got := len(r.AllBindingsForFocus(focusBoard)); got != 1 {
+		t.Errorf("AllBindingsForFocus(focusBoard): expected 1, got %d", got)
 	}
-
-	// Verify empty focus returns empty slice
-	graphBindings := r.AllBindingsForFocus(focusGraph)
-	if len(graphBindings) != 0 {
-		t.Errorf("AllBindingsForFocus(focusGraph): expected 0, got %d", len(graphBindings))
+	if got := len(r.AllBindingsForFocus(focusGraph)); got != 0 {
+		t.Errorf("AllBindingsForFocus(focusGraph): expected 0, got %d", got)
 	}
 }
 
-// TestKeyRegistryHasBinding verifies the HasBinding lookup method.
+// TestKeyRegistryHasBinding verifies the HasBinding lookup.
 func TestKeyRegistryHasBinding(t *testing.T) {
 	r := NewKeyRegistry()
-
-	noopHandler := func(m Model, msg tea.KeyMsg) (Model, bool) { return m, true }
-
-	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "j", Handler: noopHandler})
+	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "j"})
 
 	if !r.HasBinding(focusList, "j") {
 		t.Error("HasBinding: expected true for registered binding")
@@ -173,100 +89,13 @@ func TestKeyRegistryHasBinding(t *testing.T) {
 	}
 }
 
-// TestKeyRegistryBindingsCount verifies the count method.
-func TestKeyRegistryBindingsCount(t *testing.T) {
-	r := NewKeyRegistry()
-
-	if r.BindingsCount() != 0 {
-		t.Errorf("BindingsCount on empty: expected 0, got %d", r.BindingsCount())
-	}
-
-	noopHandler := func(m Model, msg tea.KeyMsg) (Model, bool) { return m, true }
-	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "j", Handler: noopHandler})
-	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "k", Handler: noopHandler})
-	r.RegisterBinding(KeyBinding{Focus: focusBoard, Key: "l", Handler: noopHandler})
-
-	if r.BindingsCount() != 3 {
-		t.Errorf("BindingsCount after adding 3: expected 3, got %d", r.BindingsCount())
-	}
-}
-
-// TestKeyRegistryClear verifies the Clear method removes all bindings.
-func TestKeyRegistryClear(t *testing.T) {
-	r := NewKeyRegistry()
-
-	noopHandler := func(m Model, msg tea.KeyMsg) (Model, bool) { return m, true }
-	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "j", Handler: noopHandler})
-	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "k", Handler: noopHandler})
-
-	if r.BindingsCount() != 2 {
-		t.Fatalf("Setup: expected 2 bindings, got %d", r.BindingsCount())
-	}
-
-	r.Clear()
-
-	if r.BindingsCount() != 0 {
-		t.Errorf("Clear: expected 0 bindings, got %d", r.BindingsCount())
-	}
-	if r.HasBinding(focusList, "j") {
-		t.Error("Clear: bindings should be removed")
-	}
-}
-
-// TestKeyRegistryOverwrite verifies that re-registering a key overwrites
-// the previous handler.
-func TestKeyRegistryOverwrite(t *testing.T) {
-	r := NewKeyRegistry()
-
-	callOrder := []string{}
-
-	handler1 := func(m Model, msg tea.KeyMsg) (Model, bool) {
-		callOrder = append(callOrder, "handler1")
-		return m, true
-	}
-	handler2 := func(m Model, msg tea.KeyMsg) (Model, bool) {
-		callOrder = append(callOrder, "handler2")
-		return m, true
-	}
-
-	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "j", Handler: handler1})
-	r.RegisterBinding(KeyBinding{Focus: focusList, Key: "j", Handler: handler2}) // Overwrite
-
-	m := Model{}
-	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")}
-	r.Dispatch(focusList, "j", m, msg)
-
-	if len(callOrder) != 1 {
-		t.Fatalf("Expected exactly 1 handler call, got %d", len(callOrder))
-	}
-	if callOrder[0] != "handler2" {
-		t.Errorf("Expected handler2 to be called (overwritten), got %s", callOrder[0])
-	}
-}
-
-// TestKeyRegistryRegisterView verifies bulk registration via RegisterView.
-func TestKeyRegistryRegisterView(t *testing.T) {
-	r := NewKeyRegistry()
-
-	noopHandler := func(m Model, msg tea.KeyMsg) (Model, bool) { return m, true }
-
-	bindings := []KeyBinding{
-		{Key: "j", Desc: "Down", Category: "Nav", Handler: noopHandler},
-		{Key: "k", Desc: "Up", Category: "Nav", Handler: noopHandler},
-		{Key: "enter", Desc: "Select", Category: "Actions", Handler: noopHandler},
-	}
-
-	r.RegisterView(focusList, bindings)
-
-	if r.BindingsCount() != 3 {
-		t.Errorf("RegisterView: expected 3 bindings, got %d", r.BindingsCount())
-	}
-
-	// Verify all bindings have correct focus
-	allBindings := r.AllBindingsForFocus(focusList)
-	for _, b := range allBindings {
-		if b.Focus != focusList {
-			t.Errorf("RegisterView: expected focus=%v, got %v", focusList, b.Focus)
+// TestKeyBindingDocs_EveryContextResolves guards the Context strings in
+// GetKeyBindingDocs: a typo there would silently drop the key from every
+// sidebar and from the README parity check.
+func TestKeyBindingDocs_EveryContextResolves(t *testing.T) {
+	for _, doc := range GetKeyBindingDocs() {
+		if len(focusesForBindingDoc(doc)) == 0 {
+			t.Errorf("key %q has context %q which resolves to no focus", doc.Key, doc.Context)
 		}
 	}
 }
@@ -277,7 +106,7 @@ func TestNewModelRegistersDocumentedBindings(t *testing.T) {
 	if m.keyRegistry == nil {
 		t.Fatal("expected NewModel to initialize keyRegistry")
 	}
-	if m.keyRegistry.BindingsCount() == 0 {
+	if len(m.keyRegistry.AllBindings()) == 0 {
 		t.Fatal("expected NewModel to populate keyRegistry from documented bindings")
 	}
 
@@ -290,6 +119,17 @@ func TestNewModelRegistersDocumentedBindings(t *testing.T) {
 		{focus: focusBoard, key: "h"},
 		{focus: focusGraph, key: "PgDn"},
 		{focus: focusHistory, key: "v"},
+		// Keys that were handled but undocumented before bv-3n9s.8.
+		{focus: focusList, key: "E"},
+		{focus: focusList, key: "f"},
+		{focus: focusList, key: "!"},
+		{focus: focusList, key: "w"},
+		{focus: focusList, key: "s"},
+		{focus: focusList, key: "S"},
+		{focus: focusBoard, key: "H"},
+		{focus: focusBoard, key: "L"},
+		{focus: focusBoard, key: "s"},
+		{focus: focusTree, key: "E"},
 	}
 
 	for _, tc := range tests {
@@ -381,6 +221,91 @@ func TestKeyDispatch_BoardNavigation(t *testing.T) {
 			t.Logf("focus=%v key=%s expected=%s actual=focus:%v", focusBoard, tc.key, tc.expected, result.focused)
 		})
 	}
+}
+
+// TestKeyDispatch_DocumentedKeysChangeState drives the keys documented by
+// bv-3n9s.8 through Update and asserts the state each one is documented to
+// change, so the sidebar never advertises a key the view ignores.
+func TestKeyDispatch_DocumentedKeysChangeState(t *testing.T) {
+	t.Run("s cycles the list sort mode", func(t *testing.T) {
+		m := setupTestModel(t)
+		before := m.sortMode
+		updated, _ := m.Update(keyMsg("s"))
+		m = updated.(*Model)
+		if m.sortMode == before {
+			t.Fatalf("sort mode did not change from %v", before)
+		}
+	})
+
+	t.Run("S applies the triage recipe", func(t *testing.T) {
+		m := setupTestModel(t)
+		if m.activeRecipe != nil && m.activeRecipe.Name == "triage" {
+			t.Fatal("triage recipe must not be active before S")
+		}
+		updated, _ := m.Update(keyMsg("S"))
+		m = updated.(*Model)
+		if m.activeRecipe == nil || m.activeRecipe.Name != "triage" {
+			t.Fatalf("expected the built-in triage recipe to be active, got %+v", m.activeRecipe)
+		}
+	})
+
+	t.Run("w without workspace mode explains itself", func(t *testing.T) {
+		m := setupTestModel(t)
+		updated, _ := m.Update(keyMsg("w"))
+		m = updated.(*Model)
+		if !strings.Contains(m.statusMsg, "workspace mode") {
+			t.Fatalf("expected a workspace-mode status message, got %q", m.statusMsg)
+		}
+	})
+
+	t.Run("H and L jump to the first and last board column", func(t *testing.T) {
+		m := setupTestModel(t)
+		updated, _ := m.Update(keyMsg("b"))
+		m = updated.(*Model)
+		if m.focused != focusBoard {
+			t.Fatalf("expected board focus, got %v", m.focused)
+		}
+		updated, _ = m.Update(keyMsg("L"))
+		m = updated.(*Model)
+		last := len(m.board.activeColIdx) - 1
+		if last < 1 {
+			t.Skipf("fixture yields %d populated columns; need two to observe a jump", last+1)
+		}
+		if m.board.focusedCol != last {
+			t.Fatalf("L: focusedCol=%d, want %d", m.board.focusedCol, last)
+		}
+		updated, _ = m.Update(keyMsg("H"))
+		m = updated.(*Model)
+		if m.board.focusedCol != 0 {
+			t.Fatalf("H: focusedCol=%d, want 0", m.board.focusedCol)
+		}
+	})
+
+	t.Run("s cycles the board swimlane mode", func(t *testing.T) {
+		m := setupTestModel(t)
+		updated, _ := m.Update(keyMsg("b"))
+		m = updated.(*Model)
+		before := m.board.GetSwimLaneModeName()
+		updated, _ = m.Update(keyMsg("s"))
+		m = updated.(*Model)
+		if got := m.board.GetSwimLaneModeName(); got == before {
+			t.Fatalf("swimlane mode did not change from %q", before)
+		}
+	})
+
+	t.Run("E leaves the tree view", func(t *testing.T) {
+		m := setupTestModel(t)
+		updated, _ := m.Update(keyMsg("E"))
+		m = updated.(*Model)
+		if m.focused != focusTree {
+			t.Fatalf("expected tree focus after E, got %v", m.focused)
+		}
+		updated, _ = m.Update(keyMsg("E"))
+		m = updated.(*Model)
+		if m.focused != focusList {
+			t.Fatalf("expected list focus after second E, got %v", m.focused)
+		}
+	})
 }
 
 // TestKeyDispatch_GraphNavigation tests graph view key handling.
@@ -638,6 +563,7 @@ func TestKeyDispatch_Regression_HistorySearchConsumesGlobalKeys(t *testing.T) {
 	if m.focused != focusHistory || !m.isHistoryView {
 		t.Fatalf("Expected history view after 'h', got focused=%v isHistoryView=%v", m.focused, m.isHistoryView)
 	}
+	makeHistoryReportCurrent(m, createTestHistoryReport())
 
 	updated, _ = m.Update(keyMsg("/"))
 	m = updated.(*Model)
@@ -712,6 +638,7 @@ func TestKeyDispatch_Regression_HistorySearchEnterKeepsFilter(t *testing.T) {
 	if m.focused != focusHistory || !m.isHistoryView {
 		t.Fatalf("Expected history view after 'h', got focused=%v isHistoryView=%v", m.focused, m.isHistoryView)
 	}
+	makeHistoryReportCurrent(m, createTestHistoryReport())
 
 	updated, _ = m.Update(keyMsg("/"))
 	m = updated.(*Model)
@@ -737,6 +664,7 @@ func TestKeyDispatch_Regression_HistoryFileTreeEscStaysInHistory(t *testing.T) {
 	m.isHistoryView = true
 	m.focused = focusHistory
 	m.historyView = NewHistoryModel(createTestHistoryReportWithFiles(), testTheme())
+	makeHistoryReportCurrent(m, createTestHistoryReportWithFiles())
 	m.historyView.ToggleFileTree()
 	m.historyView.SetFileTreeFocus(true)
 

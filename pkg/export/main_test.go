@@ -17,6 +17,9 @@ func TestMain(m *testing.M) {
 	// before any test runs (bv-142 follow-up).
 	os.Unsetenv("CLOUDFLARE_API_TOKEN")
 	os.Unsetenv("CLOUDFLARE_ACCOUNT_ID")
+	// Tests override HOME to hide the real wrangler OAuth config, but
+	// checkWranglerConfigFile also reads $XDG_CONFIG_HOME/.wrangler.
+	os.Unsetenv("XDG_CONFIG_HOME")
 
 	os.Exit(m.Run())
 }

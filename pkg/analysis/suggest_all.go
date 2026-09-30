@@ -64,6 +64,13 @@ func DefaultSuggestAllConfig() SuggestAllConfig {
 
 // GenerateAllSuggestions runs all suggestion detectors and returns aggregated results
 func GenerateAllSuggestions(issues []model.Issue, config SuggestAllConfig, dataHash string) SuggestionSet {
+	return GenerateAllSuggestionsAt(issues, config, dataHash, time.Now())
+}
+
+// GenerateAllSuggestionsAt runs all suggestion detectors using one reference
+// instant for every serialized timestamp. This is used by reproducible robot
+// output while the convenience API above retains wall-clock behavior.
+func GenerateAllSuggestionsAt(issues []model.Issue, config SuggestAllConfig, dataHash string, now time.Time) SuggestionSet {
 	var allSuggestions []Suggestion
 
 	// Run enabled detectors
@@ -108,9 +115,30 @@ func GenerateAllSuggestions(issues []model.Issue, config SuggestAllConfig, dataH
 		filtered = append(filtered, sug)
 	}
 
-	// Sort by confidence (highest first)
+	// Sort by confidence (highest first), then by stable semantic fields. Some
+	// detectors build candidates through maps, so confidence alone would leave
+	// equal-score output dependent on Go's randomized map iteration order.
 	sort.Slice(filtered, func(i, j int) bool {
-		return filtered[i].Confidence > filtered[j].Confidence
+		left, right := filtered[i], filtered[j]
+		if left.Confidence != right.Confidence {
+			return left.Confidence > right.Confidence
+		}
+		if left.Type != right.Type {
+			return left.Type < right.Type
+		}
+		if left.TargetBead != right.TargetBead {
+			return left.TargetBead < right.TargetBead
+		}
+		if left.RelatedBead != right.RelatedBead {
+			return left.RelatedBead < right.RelatedBead
+		}
+		if left.Summary != right.Summary {
+			return left.Summary < right.Summary
+		}
+		if left.Reason != right.Reason {
+			return left.Reason < right.Reason
+		}
+		return left.ActionCommand < right.ActionCommand
 	})
 
 	// Apply max limit
@@ -118,7 +146,10 @@ func GenerateAllSuggestions(issues []model.Issue, config SuggestAllConfig, dataH
 		filtered = filtered[:config.MaxSuggestions]
 	}
 
-	return NewSuggestionSet(filtered, dataHash)
+	for i := range filtered {
+		filtered[i].GeneratedAt = now
+	}
+	return NewSuggestionSetAt(filtered, dataHash, now)
 }
 
 // RobotSuggestOutput is the JSON output structure for --robot-suggest
@@ -139,10 +170,17 @@ type SuggestFilter struct {
 
 // GenerateRobotSuggestOutput creates the full robot-suggest output
 func GenerateRobotSuggestOutput(issues []model.Issue, config SuggestAllConfig, dataHash string) RobotSuggestOutput {
-	set := GenerateAllSuggestions(issues, config, dataHash)
+	return GenerateRobotSuggestOutputAt(issues, config, dataHash, time.Now().UTC())
+}
+
+// GenerateRobotSuggestOutputAt creates robot-suggest output at a caller-owned
+// reference instant so nested suggestion timestamps match the outer envelope.
+func GenerateRobotSuggestOutputAt(issues []model.Issue, config SuggestAllConfig, dataHash string, now time.Time) RobotSuggestOutput {
+	now = now.UTC()
+	set := GenerateAllSuggestionsAt(issues, config, dataHash, now)
 
 	return RobotSuggestOutput{
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		GeneratedAt: now.Format(time.RFC3339),
 		DataHash:    dataHash,
 		Filters: SuggestFilter{
 			Type:          string(config.FilterType),

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,7 +13,49 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	toon "github.com/Dicklesworthstone/toon-go"
 )
+
+func TestRobotNextSchemaRequiredFieldsMatchActualOutcomes(t *testing.T) {
+	t.Setenv("BEADS_DIR", t.TempDir())
+	t.Setenv("BEADS_DB", "")
+	schema := generateRobotSchemas().Commands["robot-next"]
+	for _, name := range []string{"empty", "unbound", "partial", "bound"} {
+		t.Run(name, func(t *testing.T) {
+			issues := []model.Issue{{ID: "test-1", Title: "Inspect ready work", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1}}
+			if name == "empty" {
+				issues = nil
+			} else if name == "bound" {
+				// Explicit synthetic origin tests handler/schema agreement only;
+				// real loader/executable routing belongs to the live E2E suite.
+				issues[0].Origin = &model.IssueOrigin{LocalID: "test-1", WorkingDirectory: "/fixture", TrackerDirectory: "/fixture/.beads",
+					Database: "/fixture/.beads/beads.db", Tracker: "br", Executable: "/fixture/br", SupportsClaim: true}
+			}
+			source := RobotSourceReport{Status: "loaded", Valid: len(issues), Visible: len(issues)}
+			if name == "partial" {
+				source.Errors = 1
+			}
+			var out bytes.Buffer
+			ctx := RobotContext{Issues: issues, SourceAuthority: newRobotSourceAuthority([]RobotSourceReport{source}), Encoder: json.NewEncoder(&out)}
+			if err := handleRobotNext(ctx, phaseThreeRobotHandlerConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(out.Bytes(), &fields); err != nil {
+				t.Fatal(err)
+			}
+			for _, field := range schema["required"].([]string) {
+				if _, ok := fields[field]; !ok {
+					t.Errorf("documented required field %q is absent in actual %s response: %s", field, name, out.String())
+				}
+			}
+			var actionable bool
+			if err := json.Unmarshal(fields["actionable"], &actionable); err != nil || actionable != (name == "bound") {
+				t.Fatalf("wrong handler branch: actionable%v err%v output%s", actionable, err, out.String())
+			}
+		})
+	}
+}
 
 // TestRobotPlanAndPriorityIncludeMetadata runs the built binary against a tiny fixture project
 // to assert that robot-plan and robot-priority include data_hash, analysis_config, and status.
@@ -100,12 +144,55 @@ func buildTestBinary(t *testing.T) string {
 	return exe
 }
 
+func requireTOONTestEncoder(t *testing.T) string {
+	t.Helper()
+	encoder, err := toon.TruPath()
+	if err != nil {
+		t.Skipf("toon_rust encoder unavailable through production discovery: %v; real encoding assertions not run", err)
+	}
+	encoder, err = filepath.Abs(encoder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Fixture commands use another working directory. Preserve the encoder
+	// selected by production discovery, including relative configured paths.
+	t.Setenv("TOON_TRU_BIN", encoder)
+	t.Logf("production TOON encoder: %s", encoder)
+	return encoder
+}
+
+func runTOONTestCommand(t *testing.T, cmd *exec.Cmd) ([]byte, string) {
+	t.Helper()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if stderr.Len() > 0 {
+		t.Logf("%v stderr:\n%s", cmd.Args, stderr.String())
+	}
+	if err != nil {
+		t.Fatalf("%v: %v\nstdout:\n%s\nstderr:\n%s", cmd.Args, err, out, stderr.String())
+	}
+	return out, stderr.String()
+}
+
+func decodeTOONTestOutput(t *testing.T, encoder string, out []byte, stderr string) map[string]any {
+	t.Helper()
+	if len(bytes.TrimSpace(out)) == 0 || json.Valid(out) || strings.Contains(stderr, "falling back to JSON") {
+		t.Fatalf("expected actual TOON, not empty output or JSON fallback\nstdout:\n%s\nstderr:\n%s", out, stderr)
+	}
+	cmd := exec.Command(encoder, "--decode")
+	cmd.Stdin = bytes.NewReader(out)
+	decoded, decodeStderr := runTOONTestCommand(t, cmd)
+	var payload map[string]any
+	if err := json.Unmarshal(decoded, &payload); err != nil || len(payload) == 0 {
+		t.Fatalf("decoded TOON must be a nonempty JSON object: %v\nstdout:\n%s\nstderr:\n%s", err, decoded, decodeStderr)
+	}
+	return payload
+}
+
 // TestTOONOutputFormat verifies that --format=toon produces valid TOON output (bd-2lmf)
 func TestTOONOutputFormat(t *testing.T) {
-	// Check if tru binary is available
-	if _, err := exec.LookPath("tru"); err != nil {
-		t.Skip("tru binary not available, skipping TOON tests")
-	}
+	encoder := requireTOONTestEncoder(t)
 
 	dir := t.TempDir()
 	beadsDir := filepath.Join(dir, ".beads")
@@ -123,16 +210,10 @@ func TestTOONOutputFormat(t *testing.T) {
 	// Test TOON output for robot-next
 	cmd := exec.Command(exe, "--robot-next", "--format=toon")
 	cmd.Dir = dir
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("robot-next with toon failed: %v", err)
-	}
+	out, stderr := runTOONTestCommand(t, cmd)
+	decodeTOONTestOutput(t, encoder, out, stderr)
 
-	// TOON output should not start with { (that's JSON)
 	toonOut := string(out)
-	if len(toonOut) > 0 && toonOut[0] == '{' {
-		t.Fatalf("TOON output looks like JSON, expected TOON format: %s", toonOut[:min(100, len(toonOut))])
-	}
 
 	// Should contain key: value pattern typical of TOON
 	if !containsKeyValuePattern(toonOut) {
@@ -185,7 +266,14 @@ func TestRobotNextFailClosedWhenNoClaimableItem(t *testing.T) {
 	}
 }
 
-func TestRobotNextEmitsClaimOnlyForSafeTopPick(t *testing.T) {
+func TestRobotNextPreservesSafeUnboundTopPick(t *testing.T) {
+	// This metadata-free input tests diagnostic readiness. Actual command
+	// emission belongs to TestRobotActionRoutesLiveTrackers, which initializes
+	// and inspects real trackers; ordinary Go tests need no installed br.
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_DB", "")
+	t.Setenv("BD_DB", "")
+	t.Setenv("BV_NO_GITIGNORE", "1")
 	dir := t.TempDir()
 	beadsDir := filepath.Join(dir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
@@ -194,13 +282,14 @@ func TestRobotNextEmitsClaimOnlyForSafeTopPick(t *testing.T) {
 
 	beads := `{"id":"READY-1","title":"Ready work","status":"open","priority":1,"issue_type":"task"}
 `
-	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(beads), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(beads), 0o644); err != nil {
 		t.Fatalf("write beads: %v", err)
 	}
 
 	exe := buildTestBinary(t)
 	cmd := exec.Command(exe, "--robot-next", "--format=json")
 	cmd.Dir = dir
+	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("robot-next failed: %v", err)
@@ -210,15 +299,23 @@ func TestRobotNextEmitsClaimOnlyForSafeTopPick(t *testing.T) {
 	if err := json.Unmarshal(out, &payload); err != nil {
 		t.Fatalf("robot-next json: %v\n%s", err, out)
 	}
-	if got := payload["actionable"]; got != true {
-		t.Fatalf("actionable = %v, want true; payload=%v", got, payload)
+	if payload["actionable"] != false || payload["id"] != nil || payload["claim_command"] != nil || payload["show_command"] != nil {
+		t.Fatalf("unbound issue emitted a live tracker command: %s", out)
 	}
-	if got := payload["id"]; got != "READY-1" {
-		t.Fatalf("id = %v, want READY-1; payload=%v", got, payload)
+	diagnostic, ok := payload["diagnostic_top_pick"].(map[string]any)
+	if !ok || diagnostic["id"] != "READY-1" || diagnostic["title"] != "Ready work" {
+		t.Fatalf("ready issue must remain the useful diagnostic candidate: %s", out)
 	}
-	claim, ok := payload["claim_command"].(string)
-	if !ok || !strings.Contains(claim, "READY-1") {
-		t.Fatalf("safe robot-next missing claim command for READY-1: %s", out)
+	authority, ok := payload["source_authority"].(map[string]any)
+	if !ok || authority["claim_safe"] != true {
+		t.Fatalf("unbound route must not erase complete graph authority: %s", out)
+	}
+	actions, ok := payload["actions"].(map[string]any)
+	if !ok || actions["claim"] != nil || actions["show"] != nil {
+		t.Fatalf("unbound route must explicitly withhold nested commands: %s", out)
+	}
+	if reason, ok := actions["unavailable_reason"].(string); !ok || reason == "" {
+		t.Fatalf("unbound route must explain why commands are unavailable: %s", out)
 	}
 	if _, ok := payload["status"].(map[string]any); !ok {
 		t.Fatalf("robot-next missing metric status: %s", out)
@@ -239,7 +336,7 @@ func TestRobotNextClaimablePickRejectsAssignedTopPick(t *testing.T) {
 		Assignee:  " cc11 ",
 	}}
 
-	_, diagnostic, reasons, ok := robotNextClaimablePick(picks, issues, time.Time{})
+	_, diagnostic, reasons, ok := robotNextClaimablePick(picks, issues, nil, time.Time{})
 	if ok {
 		t.Fatalf("assigned top pick must not be claimable")
 	}
@@ -253,17 +350,16 @@ func TestRobotNextClaimablePickRejectsAssignedTopPick(t *testing.T) {
 
 // TestTOONRoundTrip verifies that TOON output can be decoded back to JSON (bd-2lmf)
 func TestTOONRoundTrip(t *testing.T) {
-	// Check if tru binary is available
-	truPath, err := exec.LookPath("tru")
-	if err != nil {
-		t.Skip("tru binary not available, skipping TOON round-trip test")
-	}
+	encoder := requireTOONTestEncoder(t)
 
 	dir := t.TempDir()
 	beadsDir := filepath.Join(dir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
 		t.Fatalf("mkdir beads: %v", err)
 	}
+	t.Setenv("BEADS_DIR", beadsDir)
+	t.Setenv("BEADS_DB", "")
+	t.Setenv("BD_DB", "")
 
 	beads := `{"id":"TEST-1","title":"Round Trip Test","status":"open","priority":2,"issue_type":"task"}`
 	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(beads), 0o644); err != nil {
@@ -275,43 +371,44 @@ func TestTOONRoundTrip(t *testing.T) {
 	// Get TOON output
 	cmd := exec.Command(exe, "--robot-next", "--format=toon")
 	cmd.Dir = dir
-	toonOut, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("robot-next with toon failed: %v", err)
-	}
+	toonOut, stderr := runTOONTestCommand(t, cmd)
+	payload := decodeTOONTestOutput(t, encoder, toonOut, stderr)
 
-	// Decode TOON back to JSON using tru --decode
-	decodeCmd := exec.Command(truPath, "--decode")
-	decodeCmd.Stdin = strings.NewReader(string(toonOut))
-	jsonOut, err := decodeCmd.Output()
-	if err != nil {
-		t.Fatalf("tru --decode failed: %v", err)
+	// The source is complete but has no live tracker metadata. Encoding must
+	// preserve the useful candidate and the explicit refusal to claim it.
+	if payload["actionable"] != false || payload["id"] != nil || payload["title"] != nil || payload["claim_command"] != nil || payload["show_command"] != nil {
+		t.Fatalf("metadata-free issue emitted a proven pick or tracker command: %+v", payload)
 	}
-
-	// Verify the decoded JSON is valid and contains expected fields
-	var payload map[string]interface{}
-	if err := json.Unmarshal(jsonOut, &payload); err != nil {
-		t.Fatalf("decoded JSON is invalid: %v, content: %s", err, string(jsonOut))
+	diagnostic, ok := payload["diagnostic_top_pick"].(map[string]any)
+	if !ok || diagnostic["id"] != "TEST-1" || diagnostic["title"] != "Round Trip Test" {
+		t.Fatalf("decoded diagnostic lost the fixture issue: %+v", payload)
 	}
-
-	// Check required fields are present
-	if _, ok := payload["id"]; !ok {
-		t.Error("decoded payload missing 'id' field")
+	authority, ok := payload["source_authority"].(map[string]any)
+	if !ok || authority["claim_safe"] != true {
+		t.Fatalf("metadata-free route must retain complete graph authority: %+v", payload)
 	}
-	if _, ok := payload["title"]; !ok {
-		t.Error("decoded payload missing 'title' field")
+	actions, ok := payload["actions"].(map[string]any)
+	if !ok || actions["claim"] != nil || actions["show"] != nil {
+		t.Fatalf("metadata-free route emitted a nested tracker action: %+v", payload)
 	}
-	if _, ok := payload["generated_at"]; !ok {
-		t.Error("decoded payload missing 'generated_at' field")
+	if reason, ok := actions["unavailable_reason"].(string); !ok || reason == "" {
+		t.Fatalf("missing explanation for unavailable actions: %+v", payload)
+	}
+	generatedAt, ok := payload["generated_at"].(string)
+	if !ok {
+		t.Fatalf("decoded payload missing generated_at: %+v", payload)
+	}
+	if _, err := time.Parse(time.RFC3339, generatedAt); err != nil {
+		t.Fatalf("invalid generated_at %q: %v", generatedAt, err)
+	}
+	if payload["output_format"] != "toon" {
+		t.Fatalf("decoded payload lost requested output format: %+v", payload)
 	}
 }
 
 // TestTOONTokenStats verifies that --stats produces token statistics on stderr (bd-2lmf)
 func TestTOONTokenStats(t *testing.T) {
-	// Check if tru binary is available
-	if _, err := exec.LookPath("tru"); err != nil {
-		t.Skip("tru binary not available, skipping TOON stats test")
-	}
+	encoder := requireTOONTestEncoder(t)
 
 	dir := t.TempDir()
 	beadsDir := filepath.Join(dir, ".beads")
@@ -329,45 +426,67 @@ func TestTOONTokenStats(t *testing.T) {
 	// Test --stats flag with TOON output
 	cmd := exec.Command(exe, "--robot-next", "--format=toon", "--stats")
 	cmd.Dir = dir
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	_, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("robot-next with stats failed: %v", err)
+	out, stderr := runTOONTestCommand(t, cmd)
+	decodeTOONTestOutput(t, encoder, out, stderr)
+	stats := ""
+	for _, line := range strings.Split(stderr, "\n") {
+		if strings.HasPrefix(line, "[stats]") {
+			stats = line
+		}
 	}
-
-	stderrStr := stderr.String()
-	// Should contain token statistics
-	if !strings.Contains(stderrStr, "tok") || !strings.Contains(stderrStr, "savings") {
-		t.Errorf("--stats should produce token statistics on stderr, got: %s", stderrStr)
+	var jsonTokens, toonTokens int
+	if n, err := fmt.Sscanf(stats, "[stats] JSON≈%d tok, TOON≈%d tok", &jsonTokens, &toonTokens); err != nil || n != 2 || jsonTokens <= 0 || toonTokens <= 0 {
+		t.Fatalf("--stats must report both positive token estimates: %q (%v)", stats, err)
+	}
+	switch {
+	case strings.Contains(stats, "% smaller)"):
+		if toonTokens >= jsonTokens {
+			t.Fatalf("smaller contradicts token estimates: %q", stats)
+		}
+	case strings.Contains(stats, "% larger;"):
+		if toonTokens <= jsonTokens {
+			t.Fatalf("larger contradicts token estimates: %q", stats)
+		}
+	case strings.Contains(stats, "same size"):
+		difference := toonTokens - jsonTokens
+		if difference < 0 {
+			difference = -difference
+		}
+		if difference*100 >= jsonTokens {
+			t.Fatalf("same size exceeds the displayed whole-percent precision: %q", stats)
+		}
+	default:
+		t.Fatalf("--stats must state smaller, larger, or same size: %q", stats)
+	}
+	if strings.Contains(stats, "0% savings") {
+		t.Fatalf("--stats reports misleading zero savings: %q", stats)
 	}
 }
 
 // TestTOONSchemaOutput verifies that --robot-schema works with TOON format (bd-2lmf)
 func TestTOONSchemaOutput(t *testing.T) {
-	// Check if tru binary is available
-	if _, err := exec.LookPath("tru"); err != nil {
-		t.Skip("tru binary not available, skipping TOON schema test")
-	}
+	encoder := requireTOONTestEncoder(t)
 
 	exe := buildTestBinary(t)
 
 	// Test --robot-schema with TOON format
 	cmd := exec.Command(exe, "--robot-schema", "--format=toon")
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("robot-schema with toon failed: %v", err)
+	out, stderr := runTOONTestCommand(t, cmd)
+	payload := decodeTOONTestOutput(t, encoder, out, stderr)
+	if schemaVersion, ok := payload["schema_version"].(string); !ok || schemaVersion == "" {
+		t.Fatalf("decoded schema lacks its version: %+v", payload)
 	}
-
-	toonOut := string(out)
-	// Should produce valid TOON output
-	if len(toonOut) > 0 && toonOut[0] == '{' {
-		t.Fatalf("TOON output looks like JSON, expected TOON format")
+	if envelope, ok := payload["envelope"].(map[string]any); !ok || envelope["type"] != "object" {
+		t.Fatalf("decoded schema lacks the envelope contract: %+v", payload)
 	}
-
-	// Should contain schema_version key
-	if !strings.Contains(toonOut, "schema_version") {
-		t.Error("TOON schema output missing schema_version")
+	commands, ok := payload["commands"].(map[string]any)
+	if !ok {
+		t.Fatalf("decoded schema lacks command definitions: %+v", payload)
+	}
+	for _, name := range []string{"robot-next", "robot-triage", "robot-plan", "robot-insights"} {
+		if schema, ok := commands[name].(map[string]any); !ok || schema["type"] != "object" {
+			t.Errorf("decoded schema missing %s object contract: %+v", name, commands[name])
+		}
 	}
 }
 

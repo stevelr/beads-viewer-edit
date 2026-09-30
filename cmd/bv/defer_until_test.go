@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +19,10 @@ import (
 // bead whose defer_until is still in the future — the closest bv analog to
 // `br ready` — while an elapsed or absent deferral keeps it visible.
 func TestApplyRecipeFilters_ActionableHonoursDeferUntil(t *testing.T) {
-	now := time.Now()
+	// The fixture and CLI must share a clock even when the build environment
+	// supplies SOURCE_DATE_EPOCH (as Nix does).
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	t.Setenv("SOURCE_DATE_EPOCH", strconv.FormatInt(now.Unix(), 10))
 	future := now.Add(90 * 24 * time.Hour)
 	elapsed := now.Add(-time.Minute)
 	// RFC3339 with a non-UTC offset, parsed the way JSONL records arrive.
@@ -35,15 +39,15 @@ func TestApplyRecipeFilters_ActionableHonoursDeferUntil(t *testing.T) {
 	}
 
 	r := &recipe.Recipe{Filters: recipe.FilterConfig{Actionable: ptrBool(true)}}
-	requireIssueIDs(t, applyRecipeFilters(issues, r), "ELAPSED", "PLAIN")
+	requireIssueIDs(t, mustApplyRecipe(t, issues, r), "ELAPSED", "PLAIN")
 
 	// Without the actionable gate the deferred beads are plain open issues.
 	r.Filters.Actionable = nil
-	requireIssueIDs(t, applyRecipeFilters(issues, r), "FUTURE", "ELAPSED", "PLAIN", "OFFSET")
+	requireIssueIDs(t, mustApplyRecipe(t, issues, r), "FUTURE", "ELAPSED", "PLAIN", "OFFSET")
 
 	// has_blockers is strictly about blockers; deferral does not count as one.
 	r.Filters.HasBlockers = ptrBool(false)
-	requireIssueIDs(t, applyRecipeFilters(issues, r), "FUTURE", "ELAPSED", "PLAIN", "OFFSET")
+	requireIssueIDs(t, mustApplyRecipe(t, issues, r), "FUTURE", "ELAPSED", "PLAIN", "OFFSET")
 }
 
 func TestRobotNextClaimablePickSkipsDeferredTopPick(t *testing.T) {
@@ -58,7 +62,7 @@ func TestRobotNextClaimablePickSkipsDeferredTopPick(t *testing.T) {
 		{ID: "READY-1", Title: "Ready", Status: model.StatusOpen, IssueType: model.TypeTask},
 	}
 
-	top, diagnostic, reasons, ok := robotNextClaimablePick(picks, issues, now)
+	top, diagnostic, reasons, ok := robotNextClaimablePick(picks, issues, nil, now)
 	if !ok || top.ID != "READY-1" {
 		t.Fatalf("expected READY-1 to be the claimable pick, got ok=%v top=%+v reasons=%v", ok, top, reasons)
 	}
@@ -67,7 +71,7 @@ func TestRobotNextClaimablePickSkipsDeferredTopPick(t *testing.T) {
 	}
 
 	// Only the deferred bead on offer: no claim, with an explicit deferral reason.
-	_, _, reasons, ok = robotNextClaimablePick(picks[:1], issues, now)
+	_, _, reasons, ok = robotNextClaimablePick(picks[:1], issues, nil, now)
 	if ok {
 		t.Fatal("deferred top pick must not be claimable")
 	}
@@ -77,7 +81,7 @@ func TestRobotNextClaimablePickSkipsDeferredTopPick(t *testing.T) {
 	}
 
 	// At the deferral instant the bead is claimable again.
-	top, _, _, ok = robotNextClaimablePick(picks[:1], issues, future)
+	top, _, _, ok = robotNextClaimablePick(picks[:1], issues, nil, future)
 	if !ok || top.ID != "DEFERRED-1" {
 		t.Fatalf("expected DEFERRED-1 claimable once defer_until is reached, got ok=%v top=%+v", ok, top)
 	}
@@ -119,17 +123,18 @@ func TestRobotCommandsHonourDeferUntilEndToEnd(t *testing.T) {
 		return out
 	}
 
-	// --robot-next: READY-1 (P2) wins over the parked P0 and the P3.
-	var next struct {
-		Actionable bool   `json:"actionable"`
-		ID         string `json:"id"`
-	}
+	// READY-1 (P2) wins over the parked P0 and the P3. This JSONL-only
+	// fixture proves readiness ordering; it has no verified live tracker route.
+	var next robotNextOutput
 	nextOut := run("--robot-next")
 	if err := json.Unmarshal(nextOut, &next); err != nil {
 		t.Fatalf("robot-next json: %v\n%s", err, nextOut)
 	}
-	if !next.Actionable || next.ID != "READY-1" {
-		t.Fatalf("robot-next = %+v, want READY-1; payload=%s", next, nextOut)
+	if next.DiagnosticTopPick == nil || next.DiagnosticTopPick.ID != "READY-1" || next.SourceAuthority == nil || !next.SourceAuthority.ClaimSafe {
+		t.Fatalf("robot-next = %+v, want complete readiness with diagnostic READY-1; payload=%s", next, nextOut)
+	}
+	if next.Actionable || next.ID != "" || next.ClaimCmd != "" || (next.Actions != nil && next.Actions.Claim != nil) {
+		t.Fatalf("JSONL-only fixture emitted a live claim: %s", nextOut)
 	}
 
 	// --robot-triage: top picks exclude FUTURE-1; its recommendation carries

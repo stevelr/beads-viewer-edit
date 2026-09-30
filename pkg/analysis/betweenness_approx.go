@@ -268,6 +268,17 @@ type BetweennessResult struct {
 //   - "A Faster Algorithm for Betweenness Centrality" (Brandes, 2001)
 //   - "Approximating Betweenness Centrality" (Bader et al., 2007)
 func ApproxBetweenness(g graph.Directed, sampleSize int, seed int64) BetweennessResult {
+	return approxBetweenness(g, sampleSize, seed, runtime.GOMAXPROCS(0))
+}
+
+// approxBetweennessDeterministic performs the same seeded sampling while
+// computing and reducing pivot contributions serially. Both paths reduce in
+// sample order, so worker scheduling cannot change their floating-point scores.
+func approxBetweennessDeterministic(g graph.Directed, sampleSize int, seed int64) BetweennessResult {
+	return approxBetweenness(g, sampleSize, seed, 1)
+}
+
+func approxBetweenness(g graph.Directed, sampleSize int, seed int64, workers int) BetweennessResult {
 	start := time.Now()
 	nodes := pooledNodesOf(g.Nodes())
 	defer putPooledNodes(nodes)
@@ -288,6 +299,10 @@ func ApproxBetweenness(g graph.Directed, sampleSize int, seed int64) Betweenness
 	}
 
 	if n == 0 {
+		// SampleSize reports pivots actually used, not the caller's requested
+		// size. An empty graph has no valid pivot even though non-empty graphs
+		// clamp a non-positive request to one.
+		result.SampleSize = 0
 		result.Elapsed = time.Since(start)
 		return result
 	}
@@ -313,36 +328,51 @@ func ApproxBetweenness(g graph.Directed, sampleSize int, seed int64) Betweenness
 	// Sample k random pivot indices
 	pivots := sampleIndices(n, sampleSize, seed)
 
-	// Compute partial betweenness from sampled pivots in parallel
+	// Compute partial betweenness from sampled pivots.
 	partialBC := make([]float64, n)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
-	// Limit concurrency to avoid excessive goroutines
-	sem := make(chan struct{}, runtime.NumCPU())
-
-	for _, pivot := range pivots {
-		wg.Add(1)
-		go func(sourceIdx int) {
-			defer wg.Done()
-			sem <- struct{}{} // Acquire token
-			defer func() { <-sem }()
-
-			buf := brandesPool.Get().(*brandesBuffers)
-			defer brandesPool.Put(buf)
-
-			// Compute local contribution into pooled buffers (buf.bc)
-			singleSourceBetweennessDense(adj, sourceIdx, buf)
-
-			// Merge into global result using visited nodes only.
-			mu.Lock()
+	workers = max(1, min(workers, len(pivots)))
+	if workers == 1 {
+		buf := brandesPool.Get().(*brandesBuffers)
+		for _, pivot := range pivots {
+			singleSourceBetweennessDense(adj, pivot, buf)
 			for _, w := range buf.stack {
 				partialBC[w] += buf.bc[w]
 			}
-			mu.Unlock()
-		}(pivot)
+		}
+		brandesPool.Put(buf)
+	} else {
+		// Bound each batch to one contribution buffer per worker. Even if an
+		// early pivot is slow, later results cannot accumulate O(sampleSize*n)
+		// storage. Buffers are reused only after the whole batch is reduced.
+		buffers := make([]*brandesBuffers, workers)
+		for worker := range buffers {
+			buffers[worker] = brandesPool.Get().(*brandesBuffers)
+		}
+		defer func() {
+			for _, buf := range buffers {
+				brandesPool.Put(buf)
+			}
+		}()
+		var wg sync.WaitGroup
+		for first := 0; first < len(pivots); first += workers {
+			count := min(workers, len(pivots)-first)
+			wg.Add(count)
+			for worker := 0; worker < count; worker++ {
+				go func(buf *brandesBuffers, pivot int) {
+					defer wg.Done()
+					singleSourceBetweennessDense(adj, pivot, buf)
+				}(buffers[worker], pivots[first+worker])
+			}
+			wg.Wait()
+			// Strict sample order matches the serial path, including sparse
+			// visited-node accumulation; floating-point addition is not associative.
+			for _, buf := range buffers[:count] {
+				for _, w := range buf.stack {
+					partialBC[w] += buf.bc[w]
+				}
+			}
+		}
 	}
-	wg.Wait()
 
 	// Scale up: BC_approx = BC_partial * (n / k)
 	// This extrapolates from the sample to the full graph
@@ -458,6 +488,9 @@ func singleSourceBetweennessDense(adj cachedAdjacency, sourceIdx int, buf *brand
 // Note: edgeCount is accepted for future density-aware heuristics but currently unused.
 func RecommendSampleSize(nodeCount, edgeCount int) int {
 	_ = edgeCount // Reserved for future density-aware sampling heuristics
+	if nodeCount <= 0 {
+		return 0
+	}
 	switch {
 	case nodeCount < 100:
 		// Small graph: use exact algorithm

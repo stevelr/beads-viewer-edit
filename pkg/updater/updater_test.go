@@ -108,25 +108,29 @@ func TestCompareVersions_EdgeCases(t *testing.T) {
 }
 
 func TestCompareVersions_InvalidVersions(t *testing.T) {
-	// When parsing fails, it falls back to lexicographic comparison
+	// Invalid input must fail closed. Lexical ordering can turn malformed release
+	// metadata into a false update notification.
 	tests := []struct {
 		name     string
 		v1       string
 		v2       string
 		expected int
 	}{
-		// Non-numeric versions (fallback to lexicographic)
-		{"alpha vs beta", "alpha", "beta", -1},
-		{"beta vs alpha", "beta", "alpha", 1},
+		// Non-numeric versions
+		{"alpha vs beta", "alpha", "beta", 0},
+		{"beta vs alpha", "beta", "alpha", 0},
 		{"same string", "alpha", "alpha", 0},
+		{"four core components", "v1.2.3.4", "v1.2.3", 0},
+		{"invalid core component", "v1.x.3", "v1.2.3", 0},
+		{"empty prerelease", "v1.2.3-", "v1.2.3", 0},
 
 		// Version with extra parts (semver with pre-release)
 		{"prerelease lower", "1.0.0-alpha", "1.0.0", -1}, // prerelease should be lower
 
 		// Empty strings
 		{"empty vs empty", "", "", 0},
-		{"empty vs version", "", "v1.0.0", -1},
-		{"version vs empty", "v1.0.0", "", 1},
+		{"empty vs version", "", "v1.0.0", 0},
+		{"version vs empty", "v1.0.0", "", 0},
 	}
 
 	for _, tt := range tests {
@@ -136,6 +140,53 @@ func TestCompareVersions_InvalidVersions(t *testing.T) {
 				t.Errorf("compareVersions(%q, %q) = %d; want %d", tt.v1, tt.v2, got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestCompareVersions_BuildMetadataDoesNotAffectPrecedence(t *testing.T) {
+	tests := []struct {
+		v1, v2 string
+		want   int
+	}{
+		{"v1.2.3+remote", "v1.2.3+local", 0},
+		{"v1.2.3", "v1.2.3+dirty", 0},
+		{"v1.2.4", "v1.2.3+dirty", 1},
+		{"v1.2.3-alpha+build.2", "v1.2.3-alpha+build.1", 0},
+	}
+	for _, tt := range tests {
+		if got := compareVersions(tt.v1, tt.v2); got != tt.want {
+			t.Errorf("compareVersions(%q, %q) = %d; want %d", tt.v1, tt.v2, got, tt.want)
+		}
+	}
+}
+
+func TestIsNewerVersionRejectsMalformedVersions(t *testing.T) {
+	tests := []struct {
+		name      string
+		candidate string
+		current   string
+	}{
+		{"malformed candidate", "v2.0.0.1", "v1.0.0"},
+		{"arbitrary candidate", "latest", "v1.0.0"},
+		{"arbitrary current", "v2.0.0", "banana"},
+		{"marker prefix is not automatically development", "v2.0.0", "github"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if newer, err := isNewerVersion(tt.candidate, tt.current); err == nil {
+				t.Fatalf("isNewerVersion(%q, %q) = %v, nil; want error", tt.candidate, tt.current, newer)
+			}
+		})
+	}
+}
+
+func TestIsNewerVersionUnparseableDevelopmentBuildFailsClosed(t *testing.T) {
+	newer, err := isNewerVersion("v99.0.0", "git-abc123")
+	if err != nil {
+		t.Fatalf("isNewerVersion returned error for development build: %v", err)
+	}
+	if newer {
+		t.Fatal("development build should not receive an automatic update prompt")
 	}
 }
 
@@ -236,6 +287,8 @@ func TestCompareVersions_DevBuilds(t *testing.T) {
 		{"v0.11.2-nightly should not update to v0.11.2", "v0.11.2", "v0.11.2-nightly", -1},
 		{"v0.11.2-snapshot should not update to v0.11.2", "v0.11.2", "v0.11.2-snapshot", -1},
 		{"v0.11.2-git.abc123 should not update to v0.11.2", "v0.11.2", "v0.11.2-git.abc123", -1},
+		{"v0.11.2-git-abc123 should not update to v0.11.2", "v0.11.2", "v0.11.2-git-abc123", -1},
+		{"v0.11.2-dev123 should not update to v0.11.2", "v0.11.2", "v0.11.2-dev123", -1},
 
 		// Dev builds with lower base version SHOULD prompt for update
 		{"v0.11.3 should update from v0.11.2-dirty", "v0.11.3", "v0.11.2-dirty", 1},
@@ -248,6 +301,8 @@ func TestCompareVersions_DevBuilds(t *testing.T) {
 		{"v0.11.2-alpha is lower than v0.11.2", "v0.11.2", "v0.11.2-alpha", 1},
 		{"v0.11.2-beta is lower than v0.11.2", "v0.11.2", "v0.11.2-beta", 1},
 		{"v0.11.2-rc1 is lower than v0.11.2", "v0.11.2", "v0.11.2-rc1", 1},
+		{"v0.11.2-device is a normal prerelease", "v0.11.2", "v0.11.2-device", 1},
+		{"v0.11.2-github is a normal prerelease", "v0.11.2", "v0.11.2-github", 1},
 	}
 
 	for _, tt := range tests {
@@ -277,7 +332,7 @@ func TestRelease_Fields(t *testing.T) {
 	// Test that Release struct can be properly instantiated
 	rel := Release{
 		TagName: "v0.9.0",
-		HTMLURL: "https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.9.0",
+		HTMLURL: "https://github.com/stevelr/beads-viewer-edit/releases/tag/v0.9.0",
 	}
 
 	if rel.TagName != "v0.9.0" {

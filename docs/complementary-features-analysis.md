@@ -1,3 +1,6 @@
+> **Status (2026-09-02): historical analysis**
+> The Agent Swarm Protocol (`--robot-agents/-claim/-release/-conflicts/-partition`, `WorkClaim`) and the query language proposed here were never built and are not planned; agent coordination is delegated to MCP Agent Mail (see AGENTS.md). The alert type list here predates the current catalogue in README "Alerts System".
+
 # Complementary Features Analysis
 
 ## Current State: 9 Open Epics

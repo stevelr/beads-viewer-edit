@@ -16,6 +16,7 @@ func TestEventType_String(t *testing.T) {
 		{EventClosed, "closed"},
 		{EventReopened, "reopened"},
 		{EventModified, "modified"},
+		{EventDeleted, "deleted"},
 	}
 	for _, tt := range tests {
 		if got := tt.e.String(); got != tt.want {
@@ -34,6 +35,7 @@ func TestEventType_IsValid(t *testing.T) {
 		{EventClosed, true},
 		{EventReopened, true},
 		{EventModified, true},
+		{EventDeleted, true},
 		{EventType("invalid"), false},
 		{EventType(""), false},
 	}

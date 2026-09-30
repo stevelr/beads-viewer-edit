@@ -108,7 +108,10 @@ func (ic *IncrementalCorrelator) GenerateReportWithDetails(beads []BeadInfo, opt
 
 	// Cache miss - try incremental update if we have a cached report with same beads
 	existingReport := ic.findExistingReport(beads, opts)
-	if existingReport != nil && existingReport.LatestCommitSHA != "" {
+	// The incremental merger appends through live HEAD and carries lifecycle
+	// events only. Revision-bound or full causal evidence needs the ordinary
+	// complete extraction below; same-key cache hits above remain usable.
+	if existingReport != nil && existingReport.LatestCommitSHA != "" && opts.Revision == "" && opts.CausalityBeadID == "" {
 		result, err := ic.tryIncrementalUpdate(existingReport, beads, opts)
 		if err == nil && result != nil {
 			ic.recordIncrementalUpdate()
@@ -185,18 +188,18 @@ func (ic *IncrementalCorrelator) findExistingReport(beads []BeadInfo, opts Corre
 // tryIncrementalUpdate attempts to update an existing report incrementally
 func (ic *IncrementalCorrelator) tryIncrementalUpdate(existing *HistoryReport, beads []BeadInfo, opts CorrelatorOptions) (*IncrementalUpdateResult, error) {
 	// Find new commits since the existing report
-	newCommits, err := getCommitsSince(ic.ctx, ic.cache.repoPath, existing.LatestCommitSHA)
+	newCommitSHAs, err := getCommitsSince(ic.ctx, ic.cache.repoPath, existing.LatestCommitSHA)
 	if err != nil {
 		return nil, fmt.Errorf("finding new commits: %w", err)
 	}
 
 	// If too many new commits, fall back to full refresh
-	if len(newCommits) > IncrementalThreshold {
-		return nil, fmt.Errorf("too many new commits (%d > %d)", len(newCommits), IncrementalThreshold)
+	if len(newCommitSHAs) > IncrementalThreshold {
+		return nil, fmt.Errorf("too many new commits (%d > %d)", len(newCommitSHAs), IncrementalThreshold)
 	}
 
 	// If no new commits, the existing report is still valid
-	if len(newCommits) == 0 {
+	if len(newCommitSHAs) == 0 {
 		return &IncrementalUpdateResult{
 			Report:         existing,
 			WasIncremental: true,
@@ -205,7 +208,7 @@ func (ic *IncrementalCorrelator) tryIncrementalUpdate(existing *HistoryReport, b
 	}
 
 	extractor := ic.incrementalExtractor()
-	newEvents, err := extractEventsFromCommits(extractor, newCommits, opts.BeadID)
+	newEvents, err := extractEventsFromCommits(extractor, newCommitSHAs, opts.BeadID)
 	if err != nil {
 		return nil, fmt.Errorf("extracting new events: %w", err)
 	}
@@ -219,12 +222,12 @@ func (ic *IncrementalCorrelator) tryIncrementalUpdate(existing *HistoryReport, b
 	}
 
 	// Merge new data with existing report
-	merged := mergeReports(existing, beads, newEvents, newCorrelatedCommits)
+	merged := mergeReportsThrough(existing, beads, newEvents, newCorrelatedCommits, newCommitSHAs[len(newCommitSHAs)-1])
 
 	return &IncrementalUpdateResult{
 		Report:            merged,
 		WasIncremental:    true,
-		NewCommitCount:    len(newCommits),
+		NewCommitCount:    len(newCommitSHAs),
 		MergedEventCount:  len(newEvents),
 		MergedCommitCount: len(newCorrelatedCommits),
 	}, nil
@@ -332,23 +335,72 @@ func extractEventsFromCommits(extractor *Extractor, commitSHAs []string, filterB
 
 // mergeReports creates a new report by merging existing data with new events/commits
 func mergeReports(existing *HistoryReport, beads []BeadInfo, newEvents []BeadEvent, newCommits []CorrelatedCommit) *HistoryReport {
+	return mergeReportsThrough(existing, beads, newEvents, newCommits, "")
+}
+
+func cloneBeadEvent(event *BeadEvent) *BeadEvent {
+	if event == nil {
+		return nil
+	}
+	cloned := *event
+	return &cloned
+}
+
+func cloneBeadMilestones(milestones BeadMilestones) BeadMilestones {
+	return BeadMilestones{
+		Created:  cloneBeadEvent(milestones.Created),
+		Claimed:  cloneBeadEvent(milestones.Claimed),
+		Closed:   cloneBeadEvent(milestones.Closed),
+		Reopened: cloneBeadEvent(milestones.Reopened),
+	}
+}
+
+func cloneDuration(duration *time.Duration) *time.Duration {
+	if duration == nil {
+		return nil
+	}
+	cloned := *duration
+	return &cloned
+}
+
+func cloneCycleTime(cycleTime *CycleTime) *CycleTime {
+	if cycleTime == nil {
+		return nil
+	}
+	return &CycleTime{
+		ClaimToClose:  cloneDuration(cycleTime.ClaimToClose),
+		CreateToClose: cloneDuration(cycleTime.CreateToClose),
+		CreateToClaim: cloneDuration(cycleTime.CreateToClaim),
+	}
+}
+
+func cloneCorrelatedCommits(commits []CorrelatedCommit) []CorrelatedCommit {
+	cloned := make([]CorrelatedCommit, len(commits))
+	for i := range commits {
+		cloned[i] = commits[i]
+		if commits[i].Files != nil {
+			cloned[i].Files = append([]FileChange(nil), commits[i].Files...)
+		}
+	}
+	return cloned
+}
+
+func mergeReportsThrough(existing *HistoryReport, beads []BeadInfo, newEvents []BeadEvent, newCommits []CorrelatedCommit, latestProcessedSHA string) *HistoryReport {
 	// Create a deep copy of existing histories
 	histories := make(map[string]BeadHistory, len(existing.Histories))
 	for id, h := range existing.Histories {
 		// Deep copy the history
 		eventsCopy := make([]BeadEvent, len(h.Events))
 		copy(eventsCopy, h.Events)
-		commitsCopy := make([]CorrelatedCommit, len(h.Commits))
-		copy(commitsCopy, h.Commits)
 
 		histories[id] = BeadHistory{
 			BeadID:     h.BeadID,
 			Title:      h.Title,
 			Status:     h.Status,
 			Events:     eventsCopy,
-			Milestones: h.Milestones,
-			Commits:    commitsCopy,
-			CycleTime:  h.CycleTime,
+			Milestones: cloneBeadMilestones(h.Milestones),
+			Commits:    cloneCorrelatedCommits(h.Commits),
+			CycleTime:  cloneCycleTime(h.CycleTime),
 			LastAuthor: h.LastAuthor,
 		}
 	}
@@ -394,11 +446,11 @@ func mergeReports(existing *HistoryReport, beads []BeadInfo, newEvents []BeadEve
 	// Merge new commits
 	commitsByBead := make(map[string][]CorrelatedCommit)
 	for _, commit := range newCommits {
-		// Find which bead(s) this commit relates to
-		for _, event := range newEvents {
-			if event.CommitSHA == commit.SHA {
-				commitsByBead[event.BeadID] = append(commitsByBead[event.BeadID], commit)
-			}
+		// Match full report assembly: the correlation itself owns bead linkage.
+		// Same-SHA lifecycle events can belong to multiple beads and must not
+		// cross-associate their distinct correlation records.
+		if commit.BeadID != "" {
+			commitsByBead[commit.BeadID] = append(commitsByBead[commit.BeadID], commit)
 		}
 	}
 
@@ -413,28 +465,26 @@ func mergeReports(existing *HistoryReport, beads []BeadInfo, newEvents []BeadEve
 		}
 	}
 
-	// Build new commit index
-	commitIndex := make(CommitIndex)
-	for beadID, h := range histories {
-		for _, commit := range h.Commits {
-			commitIndex[commit.SHA] = append(commitIndex[commit.SHA], beadID)
-		}
-	}
+	// Build a stable reverse index; HistoryReport exposes these map-derived
+	// values as arrays in robot JSON.
+	commitIndex := BuildCommitIndex(histories)
 
 	// Calculate new stats
 	stats := calculateMergedStats(histories, newCommits)
 
-	// Find latest commit SHA
+	// Find latest commit SHA when a direct caller did not supply the rev-list
+	// cursor. Incremental callers always use the newest processed SHA so code-only
+	// commits and non-monotonic author timestamps still advance the cache cursor.
 	var latestTime time.Time
-	var latestSHA string
+	latestSHA := latestProcessedSHA
 	for _, event := range newEvents {
-		if event.Timestamp.After(latestTime) {
+		if latestProcessedSHA == "" && event.Timestamp.After(latestTime) {
 			latestTime = event.Timestamp
 			latestSHA = event.CommitSHA
 		}
 	}
 	for _, commit := range newCommits {
-		if commit.Timestamp.After(latestTime) {
+		if latestProcessedSHA == "" && commit.Timestamp.After(latestTime) {
 			latestTime = commit.Timestamp
 			latestSHA = commit.SHA
 		}
@@ -474,7 +524,12 @@ func calculateMergedStats(histories map[string]BeadHistory, newCommits []Correla
 		for _, commit := range h.Commits {
 			uniqueCommits[commit.SHA] = true
 			authors[commit.Author] = true
-			stats.MethodDistribution[commit.Method.String()]++
+			for _, method := range commit.AllMethods() {
+				stats.MethodDistribution[method]++
+			}
+			if commit.Confirmed {
+				stats.MethodDistribution[MethodDistributionConfirmedByFeedback]++
+			}
 		}
 
 		for _, event := range h.Events {

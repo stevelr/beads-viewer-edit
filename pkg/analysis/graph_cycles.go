@@ -7,17 +7,24 @@ import (
 	"gonum.org/v1/gonum/graph/topo"
 )
 
+type cycleDetectionResult struct {
+	cycles    [][]graph.Node
+	total     int
+	truncated bool
+}
+
 // findCyclesSafe finds a limited number of cycles in the graph without exponential blowup.
 // It uses Tarjan's SCC algorithm to identify cyclic components and extracts one cycle per component.
-func findCyclesSafe(g graph.Directed, limit int) [][]graph.Node {
+// The result retains the pre-limit representative count so callers can report
+// truncation without implying that every simple cycle in an SCC was enumerated.
+func findCyclesSafe(g graph.Directed, limit int) cycleDetectionResult {
+	if limit <= 0 {
+		return cycleDetectionResult{}
+	}
 	sccs := topo.TarjanSCC(g)
 	var cycles [][]graph.Node
 
 	for _, scc := range sccs {
-		if len(cycles) >= limit {
-			break
-		}
-
 		if len(scc) == 1 {
 			// Check for self-loop
 			n := scc[0]
@@ -51,7 +58,13 @@ func findCyclesSafe(g graph.Directed, limit int) [][]graph.Node {
 		return false
 	})
 
-	return cycles
+	result := cycleDetectionResult{total: len(cycles)}
+	if len(cycles) > limit {
+		result.truncated = true
+		cycles = cycles[:limit]
+	}
+	result.cycles = cycles
+	return result
 }
 
 // findOneCycleInSCC finds a single cycle within a Strongly Connected Component.

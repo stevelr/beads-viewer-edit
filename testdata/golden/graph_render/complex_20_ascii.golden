@@ -1,13 +1,13 @@
                      ▲ BLOCKED BY (must complete first) ▲                     
                  ╭────────────────────╮╭────────────────────╮                 
-                 │     🔵 task-12     ││     🔵 task-13     │                 
+                 │    ◆ 🔵 task-12    ││     🔵 task-13     │                 
                  │      task-12       ││      task-13       │                 
                  ╰────────────────────╯╰────────────────────╯                 
                                       │                                       
                                     ├─┼─┤                                     
                                       ▼                                       
                   ╔═══════════════════════════════════════╗                   
-                  ║           🔵 ⚡ 📝 task-14            ║                   
+                  ║          ◆ 🔵 ⚡ 📝 task-14           ║                   
                   ║                task-14                ║                   
                   ║                ⬆2  ⬇1                 ║                   
                   ╚═══════════════════════════════════════╝                   
@@ -15,7 +15,7 @@
                                       │                                       
                                       ▼                                       
                             ╭────────────────────╮                            
-                            │     🔵 task-16     │                            
+                            │    ◆ 🔵 task-16    │                            
                             │      task-16       │                            
                             ╰────────────────────╯                            
                          ▼ BLOCKS (waiting on this) ▼                         
@@ -36,6 +36,5 @@
   In-Degree             1 █░░░░░ #11
   Out-Degree            2 ██████ #2
 
-█ relative score │ #N rank of 20 issues                                   
-
-j/k: navigate • enter: view details • g: back to list
+task-14 • collapsed • column 1/1 • row 1/2                                    
+H/L: pan • J/K: scroll • space: expand • j/k: select • enter: detail • ◆ criti

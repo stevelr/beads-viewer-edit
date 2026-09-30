@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -556,3 +557,78 @@ func containsStr(s, substr string) bool {
 	}
 	return false
 }
+
+// asModelPtr unwraps the tea.Model returned by Update so tests can inspect
+// internal state.
+func asModelPtr(t *testing.T, tm tea.Model) *Model {
+	t.Helper()
+	m, ok := tm.(*Model)
+	if !ok {
+		t.Fatalf("Update returned %T, want *Model", tm)
+	}
+	return m
+}
+
+func TestModel_PKeyOpensActiveSprintAndEscCloses(t *testing.T) {
+	now := time.Now().UTC()
+	issues := []model.Issue{{ID: "A", Title: "Issue A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, UpdatedAt: now}}
+	m := NewModel(issues, nil, "")
+	m.sprints = []model.Sprint{
+		{ID: "old", Name: "Old Sprint", StartDate: now.AddDate(0, 0, -20), EndDate: now.AddDate(0, 0, -10), BeadIDs: []string{"A"}},
+		{ID: "cur", Name: "Current Sprint", StartDate: now.AddDate(0, 0, -2), EndDate: now.AddDate(0, 0, 5), BeadIDs: []string{"A"}},
+	}
+	m.focused = focusList
+
+	got := asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("P")})))
+	if !got.isSprintView || got.focused != focusSprint {
+		t.Fatalf("after P: isSprintView=%v focused=%v; want sprint view focused", got.isSprintView, got.focused)
+	}
+	if got.selectedSprint == nil || got.selectedSprint.ID != "cur" {
+		t.Fatalf("after P: selectedSprint=%+v; want the sprint active today", got.selectedSprint)
+	}
+	if !strings.Contains(got.sprintViewText, "Current Sprint") {
+		t.Fatalf("sprint dashboard text missing sprint name:\n%s", got.sprintViewText)
+	}
+	if view := got.View(); !strings.Contains(view, "Current Sprint") {
+		t.Fatalf("View() should render the sprint dashboard while it is open")
+	}
+
+	got = asModelPtr(t, must2(got.Update(tea.KeyMsg{Type: tea.KeyEsc})))
+	if got.isSprintView || got.focused != focusList {
+		t.Fatalf("after esc: isSprintView=%v focused=%v; want list", got.isSprintView, got.focused)
+	}
+}
+
+func TestModel_PKeyWithoutSprintsReportsStatus(t *testing.T) {
+	issues := []model.Issue{{ID: "A", Title: "Issue A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask}}
+	m := NewModel(issues, nil, "")
+	m.focused = focusList
+
+	got := asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("P")})))
+	if got.isSprintView {
+		t.Fatalf("P with no sprints must not open the sprint view")
+	}
+	if got.statusMsg != noSprintsStatus {
+		t.Fatalf("statusMsg=%q; want %q", got.statusMsg, noSprintsStatus)
+	}
+	if got.statusIsError {
+		t.Fatalf("missing sprints is informational, not an error")
+	}
+}
+
+func TestModel_PKeyIgnoredOutsideListAndDetail(t *testing.T) {
+	now := time.Now().UTC()
+	issues := []model.Issue{{ID: "A", Title: "Issue A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask}}
+	m := NewModel(issues, nil, "")
+	m.sprints = []model.Sprint{{ID: "cur", Name: "Current Sprint", StartDate: now.AddDate(0, 0, -2), EndDate: now.AddDate(0, 0, 5), BeadIDs: []string{"A"}}}
+	m.isBoardView = true
+	m.focused = focusBoard
+
+	got := asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("P")})))
+	if got.isSprintView {
+		t.Fatalf("P from the board view must not open the sprint dashboard")
+	}
+}
+
+// must2 drops the tea.Cmd half of an Update result.
+func must2(tm tea.Model, _ tea.Cmd) tea.Model { return tm }

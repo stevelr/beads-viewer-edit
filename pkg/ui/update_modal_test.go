@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/updater"
+
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -34,6 +36,18 @@ func TestNewUpdateModal_InitialState(t *testing.T) {
 	}
 	if m.IsInProgress() {
 		t.Error("expected IsInProgress() to return false")
+	}
+}
+
+func TestValidateConfirmedRelease(t *testing.T) {
+	if err := validateConfirmedRelease(&updater.Release{TagName: "v1.2.3"}, "v1.2.3"); err != nil {
+		t.Fatalf("matching release rejected: %v", err)
+	}
+	if err := validateConfirmedRelease(&updater.Release{TagName: "v1.2.4"}, "v1.2.3"); err == nil {
+		t.Fatal("changed release accepted without renewed confirmation")
+	}
+	if err := validateConfirmedRelease(nil, "v1.2.3"); err == nil {
+		t.Fatal("nil release accepted")
 	}
 }
 
@@ -189,6 +203,8 @@ func TestUpdateModal_Update_QuickConfirmY(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Error("expected command to be returned for update")
+	} else {
+		requireUpdateCommandBatch(t, cmd, updated.startTime)
 	}
 	if updated.startTime.IsZero() {
 		t.Error("expected startTime to be set")
@@ -207,6 +223,29 @@ func TestUpdateModal_Update_QuickConfirmUpperY(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Error("expected command to be returned")
+	} else {
+		requireUpdateCommandBatch(t, cmd, updated.startTime)
+	}
+}
+
+func requireUpdateCommandBatch(t *testing.T, cmd tea.Cmd, wantStart time.Time) {
+	t.Helper()
+
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("update confirmation returned %T, want tea.BatchMsg", msg)
+	}
+	if len(batch) != 2 {
+		t.Fatalf("update confirmation scheduled %d commands, want update plus repaint tick", len(batch))
+	}
+	tickResult := batch[1]()
+	tick, ok := tickResult.(updateTickMsg)
+	if !ok {
+		t.Fatalf("second update command returned %T, want updateTickMsg", tickResult)
+	}
+	if tick.startedAt != wantStart {
+		t.Fatal("initial repaint tick was not bound to the current update run")
 	}
 }
 
@@ -239,6 +278,8 @@ func TestUpdateModal_Update_EnterConfirmsUpdate(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Error("expected command to be returned")
+	} else {
+		requireUpdateCommandBatch(t, cmd, updated.startTime)
 	}
 }
 
@@ -270,6 +311,37 @@ func TestUpdateModal_Update_IgnoresKeysWhenInProgress(t *testing.T) {
 
 	if updated.state != UpdateStateDownloading {
 		t.Errorf("expected state to remain Downloading, got %v", updated.state)
+	}
+}
+
+func TestUpdateModalTickContinuesOnlyWhileUpdateIsInProgress(t *testing.T) {
+	theme := DefaultTheme(lipgloss.NewRenderer(nil))
+	m := NewUpdateModal("v1.0.0", "", theme)
+	m.state = UpdateStateDownloading
+	m.startTime = time.Now()
+
+	updated, cmd := m.Update(updateTickMsg{startedAt: m.startTime})
+	if cmd == nil {
+		t.Fatal("in-progress update tick did not schedule the next repaint")
+	}
+
+	updated.state = UpdateStateSuccess
+	_, cmd = updated.Update(updateTickMsg{startedAt: updated.startTime})
+	if cmd != nil {
+		t.Fatal("completed update continued scheduling repaint ticks")
+	}
+}
+
+func TestUpdateModalIgnoresTickFromPreviousRun(t *testing.T) {
+	theme := DefaultTheme(lipgloss.NewRenderer(nil))
+	m := NewUpdateModal("v1.0.0", "", theme)
+	m.state = UpdateStateDownloading
+	m.startTime = time.Now()
+
+	staleStart := m.startTime.Add(-time.Second)
+	_, cmd := m.Update(updateTickMsg{startedAt: staleStart})
+	if cmd != nil {
+		t.Fatal("stale tick joined the current update's repaint loop")
 	}
 }
 
@@ -433,8 +505,11 @@ func TestUpdateModal_View_DownloadingState(t *testing.T) {
 	if !strings.Contains(view, "Updating") {
 		t.Error("expected 'Updating' in view")
 	}
-	if !strings.Contains(view, "Downloading") {
-		t.Error("expected 'Downloading' in view")
+	if !strings.Contains(view, "Applying") {
+		t.Error("expected 'Applying' in view")
+	}
+	if strings.Contains(view, "[                    ]") {
+		t.Error("view rendered a permanently empty progress bar without progress data")
 	}
 }
 
@@ -575,6 +650,34 @@ func TestUpdateModal_RenderProgressBar_Complete(t *testing.T) {
 
 	if !strings.Contains(bar, "100%") {
 		t.Errorf("expected 100%% in progress bar, got %s", bar)
+	}
+}
+
+func TestUpdateModal_RenderProgressBar_ClampsOutOfRangeProgress(t *testing.T) {
+	theme := DefaultTheme(lipgloss.NewRenderer(nil))
+
+	tests := []struct {
+		name       string
+		downloaded int64
+		total      int64
+		want       string
+	}{
+		{name: "negative downloaded bytes", downloaded: -1, total: 100, want: "0%"},
+		{name: "download exceeds total", downloaded: 101, total: 100, want: "100%"},
+		{name: "negative total is indeterminate", downloaded: 1, total: -1, want: "[                    ]"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewUpdateModal("v1.0.0", "", theme)
+			m.progress.BytesDownloaded = tt.downloaded
+			m.progress.TotalBytes = tt.total
+
+			bar := m.renderProgressBar()
+			if !strings.Contains(bar, tt.want) {
+				t.Fatalf("progress bar %q does not contain %q", bar, tt.want)
+			}
+		})
 	}
 }
 

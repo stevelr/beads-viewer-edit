@@ -1,3 +1,6 @@
+> **Status (2026-09-02): historical plan, superseded by the shipped History view**
+> Shipped keys differ from this plan: `h` opens the view, `f` toggles file mode, `o` opens the commit, `t` toggles the timeline; `--commit-bead`, `--history-closed-since`, and `history.id_patterns` were never built (custom ids use `--id-pattern`). See README "History View".
+
 # Bead History & Code Correlation Feature Plan
 
 > **Purpose**: This document contains the comprehensive implementation plan for the bead-to-commit correlation feature, organized as a hierarchy of beads with detailed specifications, dependencies, and rationale.

@@ -1,6 +1,7 @@
 package cass
 
 import (
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -377,14 +378,15 @@ func TestCache_Len(t *testing.T) {
 func TestCache_WithResults(t *testing.T) {
 	c := NewCache()
 
-	results := []SearchResult{
-		{SourcePath: "/session1.json", Score: 0.9},
-		{SourcePath: "/session2.json", Score: 0.7},
+	results := []ScoredResult{
+		{SearchResult: SearchResult{SourcePath: "/session1.json", Score: 0.9}, FinalScore: 140, BaseScore: 50, Strategy: StrategyKeywords, Keywords: []string{"oauth"}},
+		{SearchResult: SearchResult{SourcePath: "/session2.json", Score: 0.7}, FinalScore: 100, BaseScore: 50, Strategy: StrategyKeywords, Keywords: []string{"authentication"}},
 	}
 
 	hint := &CorrelationHint{
 		BeadID:      "bv-test",
 		Results:     results,
+		Keywords:    []string{"oauth", "authentication"},
 		ResultCount: 2,
 	}
 
@@ -399,6 +401,46 @@ func TestCache_WithResults(t *testing.T) {
 	}
 	if got.Results[0].Score != 0.9 {
 		t.Errorf("Results[0].Score = %f, want 0.9", got.Results[0].Score)
+	}
+	if !reflect.DeepEqual(got, hint) {
+		t.Errorf("cache changed correlation data: got %#v, want %#v", got, hint)
+	}
+}
+
+func TestCache_CorrelationDataIsIndependent(t *testing.T) {
+	c := NewCache()
+	newHint := func() *CorrelationHint {
+		return &CorrelationHint{
+			BeadID: "bv-copy", QueryUsed: string(StrategyKeywords), ResultCount: 7,
+			Keywords: []string{"oauth", "authentication"},
+			Results: []ScoredResult{{
+				SearchResult: SearchResult{SourcePath: "/archive/session.jsonl", Score: 26.75},
+				BaseScore:    50, FinalScore: 140, Strategy: StrategyKeywords,
+				Keywords: []string{"oauth", "authentication"},
+			}},
+		}
+	}
+	for _, operation := range []string{"insert", "update"} {
+		t.Run(operation, func(t *testing.T) {
+			hint := newHint()
+			want := newHint()
+			c.Set("bv-copy", hint)
+			hint.QueryUsed = "mutated"
+			hint.Keywords[0] = "mutated"
+			hint.Results[0].FinalScore = -1
+			hint.Results[0].Keywords[0] = "mutated"
+			got := c.Get("bv-copy")
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("caller mutated stored correlation: got %#v, want %#v", got, want)
+			}
+			got.QueryUsed = "mutated"
+			got.Keywords[0] = "mutated"
+			got.Results[0].FinalScore = -1
+			got.Results[0].Keywords[0] = "mutated"
+			if next := c.Get("bv-copy"); !reflect.DeepEqual(next, want) {
+				t.Errorf("reader mutated stored correlation: got %#v, want %#v", next, want)
+			}
+		})
 	}
 }
 

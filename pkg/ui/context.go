@@ -113,12 +113,13 @@ func (m Model) CurrentContext() Context {
 
 	// === Views (based on focus or view flags) ===
 
+	// Attention view (bv-117) is its own focus, opened with ]
+	if m.focused == focusAttention {
+		return ContextAttention
+	}
+
 	// Insights panel
 	if m.focused == focusInsights {
-		// Check if in attention sub-view
-		if m.showAttentionView {
-			return ContextAttention
-		}
 		return ContextInsights
 	}
 

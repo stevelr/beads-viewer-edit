@@ -3,25 +3,31 @@ package analysis
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	json "github.com/goccy/go-json"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/xfetch"
 )
 
 const (
-	robotAnalysisDiskCacheVersion = 3
+	// v5 changes cycle semantics to ignore closed/tombstoned issues. Reject v4
+	// entries so an upgrade cannot resurrect historical cycles from disk.
+	robotAnalysisDiskCacheVersion = 5
 	// robotAnalysisDiskCacheSubdirName holds one file per cache entry. The
 	// pre-v3 layout kept every entry in a single analysis_cache.json, which
 	// made each lookup decode — and each store rewrite + fsync — the entire
@@ -80,25 +86,35 @@ func (c *Cache) GetByHash(hash string) (*GraphStats, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if c.stats == nil {
+	if !graphStatsReadyForCache(c.stats) {
 		return nil, false
 	}
 
-	if hash == c.dataHash && time.Since(c.computedAt) < c.ttl {
+	now := time.Now()
+	if hash == c.dataHash && cacheTimestampIsFresh(c.computedAt, now, c.ttl) {
 		return c.stats, true
 	}
 	return nil, false
 }
 
-// Set stores analysis results in the cache.
+func cacheTimestampIsFresh(timestamp, now time.Time, maxAge time.Duration) bool {
+	return !timestamp.IsZero() && !timestamp.After(now) && now.Sub(timestamp) < maxAge
+}
+
+// Set stores complete analysis results in the cache. Incomplete Phase 2
+// results are ignored so cancellation cannot poison a later live analysis.
 func (c *Cache) Set(issues []model.Issue, stats *GraphStats) {
 	// Compute hash outside the lock (expensive operation)
 	hash := ComputeDataHash(issues)
 	c.SetByHash(hash, stats)
 }
 
-// SetByHash stores analysis results with a pre-computed hash.
+// SetByHash stores complete analysis results with a pre-computed hash.
 func (c *Cache) SetByHash(hash string, stats *GraphStats) {
+	if !graphStatsReadyForCache(stats) {
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -142,178 +158,48 @@ func (c *Cache) Stats() (hash string, age time.Duration, hasData bool) {
 	return c.dataHash, time.Since(c.computedAt), true
 }
 
-// ComputeDataHash generates a deterministic hash of issue data.
-// The hash includes issue IDs, content hashes, and dependency relationships.
-// Issues are sorted by ID to ensure consistent hashing regardless of input order.
+// ComputeDataHash generates a deterministic, collision-resistant hash of all
+// modeled issue data. Per-issue fingerprints provide one canonical encoding for
+// both snapshot diffs and the aggregate data hash. Valid input has unique IDs,
+// so sorting by ID keeps its hash independent of input order. Malformed duplicate
+// IDs retain encounter order because ID-keyed graph consumers otherwise observe
+// last-record-wins semantics.
 func ComputeDataHash(issues []model.Issue) string {
 	if len(issues) == 0 {
 		return "empty"
 	}
 
-	// Sort issues by ID for deterministic ordering
-	sorted := make([]model.Issue, len(issues))
-	copy(sorted, issues)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].ID < sorted[j].ID
+	type orderedFingerprint struct {
+		IssueFingerprint
+		position int
+	}
+	h := newFingerprintWriter()
+	fingerprints := make([]orderedFingerprint, len(issues))
+	for i := range issues {
+		fingerprints[i] = orderedFingerprint{
+			IssueFingerprint: h.fingerprint(issues[i]),
+			position:         i,
+		}
+	}
+	sort.Slice(fingerprints, func(i, j int) bool {
+		if fingerprints[i].ID != fingerprints[j].ID {
+			return fingerprints[i].ID < fingerprints[j].ID
+		}
+		// Valid datasets have unique IDs and remain order-independent. For
+		// malformed duplicate IDs, preserve encounter order because analyzers use
+		// last-record-wins maps and therefore observe that order semantically.
+		return fingerprints[i].position < fingerprints[j].position
 	})
 
-	h := sha256.New()
-	for _, issue := range sorted {
-		// Core identity
-		h.Write([]byte(issue.ID))
-		h.Write([]byte{0})
-
-		// Important scalar fields
-		h.Write([]byte(issue.Title))
-		h.Write([]byte{0})
-		h.Write([]byte(issue.Description))
-		h.Write([]byte{0})
-		h.Write([]byte(issue.Notes))
-		h.Write([]byte{0})
-		h.Write([]byte(issue.Design))
-		h.Write([]byte{0})
-		h.Write([]byte(issue.AcceptanceCriteria))
-		h.Write([]byte{0})
-		h.Write([]byte(issue.Assignee))
-		h.Write([]byte{0})
-		h.Write([]byte(issue.SourceRepo))
-		h.Write([]byte{0})
-		if issue.ExternalRef != nil {
-			h.Write([]byte(*issue.ExternalRef))
-		}
-		h.Write([]byte{0})
-
-		h.Write([]byte(issue.Status))
-		h.Write([]byte{0})
-		h.Write([]byte(issue.IssueType))
-		h.Write([]byte{0})
-
-		// Numeric fields
-		h.Write([]byte(strconv.Itoa(issue.Priority)))
-		h.Write([]byte{0})
-		if issue.EstimatedMinutes != nil {
-			h.Write([]byte(strconv.Itoa(*issue.EstimatedMinutes)))
-		}
-		h.Write([]byte{0})
-		h.Write([]byte(issue.CreatedAt.UTC().Format(time.RFC3339Nano)))
-		h.Write([]byte{0})
-		h.Write([]byte(issue.UpdatedAt.UTC().Format(time.RFC3339Nano)))
-		h.Write([]byte{0})
-		if issue.ClosedAt != nil {
-			h.Write([]byte(issue.ClosedAt.UTC().Format(time.RFC3339Nano)))
-		}
-		h.Write([]byte{0})
-		// defer_until gates actionability (issue #191), so (un)deferring a bead
-		// is a data change agents must be able to observe via data_hash.
-		if issue.DeferUntil != nil {
-			h.Write([]byte(issue.DeferUntil.UTC().Format(time.RFC3339Nano)))
-		}
-		h.Write([]byte{0})
-
-		// Labels (sorted for determinism)
-		if len(issue.Labels) > 0 {
-			labels := append([]string(nil), issue.Labels...)
-			sort.Strings(labels)
-			for _, lbl := range labels {
-				h.Write([]byte(lbl))
-				h.Write([]byte{0})
-			}
-		}
-		h.Write([]byte{0})
-
-		// Dependencies (sorted)
-		if len(issue.Dependencies) > 0 {
-			type depKey struct {
-				dependsOn string
-				depType   string
-				createdAt string
-				createdBy string
-			}
-			deps := make([]depKey, 0, len(issue.Dependencies))
-			for _, dep := range issue.Dependencies {
-				if dep == nil {
-					continue
-				}
-				deps = append(deps, depKey{
-					dependsOn: dep.DependsOnID,
-					depType:   string(dep.Type),
-					createdAt: dep.CreatedAt.UTC().Format(time.RFC3339Nano),
-					createdBy: dep.CreatedBy,
-				})
-			}
-			sort.Slice(deps, func(i, j int) bool {
-				if deps[i].dependsOn != deps[j].dependsOn {
-					return deps[i].dependsOn < deps[j].dependsOn
-				}
-				if deps[i].depType != deps[j].depType {
-					return deps[i].depType < deps[j].depType
-				}
-				if deps[i].createdAt != deps[j].createdAt {
-					return deps[i].createdAt < deps[j].createdAt
-				}
-				return deps[i].createdBy < deps[j].createdBy
-			})
-			for _, dep := range deps {
-				h.Write([]byte(dep.dependsOn))
-				h.Write([]byte{0})
-				h.Write([]byte(dep.depType))
-				h.Write([]byte{0})
-				h.Write([]byte(dep.createdAt))
-				h.Write([]byte{0})
-				h.Write([]byte(dep.createdBy))
-				h.Write([]byte{0})
-			}
-		}
-		h.Write([]byte{0})
-
-		// Comments (sorted)
-		if len(issue.Comments) > 0 {
-			type commentKey struct {
-				id        string
-				author    string
-				text      string
-				createdAt string
-			}
-			comments := make([]commentKey, 0, len(issue.Comments))
-			for _, comment := range issue.Comments {
-				if comment == nil {
-					continue
-				}
-				comments = append(comments, commentKey{
-					id:        comment.ID,
-					author:    comment.Author,
-					text:      comment.Text,
-					createdAt: comment.CreatedAt.UTC().Format(time.RFC3339Nano),
-				})
-			}
-			sort.Slice(comments, func(i, j int) bool {
-				if comments[i].id != comments[j].id {
-					return comments[i].id < comments[j].id
-				}
-				if comments[i].createdAt != comments[j].createdAt {
-					return comments[i].createdAt < comments[j].createdAt
-				}
-				if comments[i].author != comments[j].author {
-					return comments[i].author < comments[j].author
-				}
-				return comments[i].text < comments[j].text
-			})
-			for _, comment := range comments {
-				h.Write([]byte(comment.id))
-				h.Write([]byte{0})
-				h.Write([]byte(comment.author))
-				h.Write([]byte{0})
-				h.Write([]byte(comment.text))
-				h.Write([]byte{0})
-				h.Write([]byte(comment.createdAt))
-				h.Write([]byte{0})
-			}
-		}
-
-		h.Write([]byte{1}) // issue separator
+	h.reset()
+	writeUintHash(h, uint64(len(fingerprints)))
+	for _, fingerprint := range fingerprints {
+		writeStringHash(h, fingerprint.ID)
+		writeStringHash(h, fingerprint.ContentHash)
+		writeStringHash(h, fingerprint.DependencyHash)
 	}
 
-	return hex.EncodeToString(h.Sum(nil))[:16] // Use first 16 chars for brevity
+	return h.sumHex()
 }
 
 // IssueFingerprint represents a per-issue hash split across content and dependencies.
@@ -332,35 +218,55 @@ type IssueDiff struct {
 	ContentChanged    []string
 	DependencyChanged []string
 	Unchanged         []string
+	HasDuplicateIDs   bool
 }
 
 // ComputeIssueFingerprint returns the fingerprint for a single issue.
 func ComputeIssueFingerprint(issue model.Issue) IssueFingerprint {
+	return newFingerprintWriter().fingerprint(issue)
+}
+
+// fingerprint reuses call-owned scratch space. Each returned hash is an owned
+// string, so resetting the writer cannot change an earlier fingerprint.
+func (h *fingerprintWriter) fingerprint(issue model.Issue) IssueFingerprint {
 	return IssueFingerprint{
 		ID:             issue.ID,
-		ContentHash:    computeIssueContentHash(issue),
-		DependencyHash: computeIssueDependencyHash(issue),
+		ContentHash:    computeIssueContentHash(h, issue),
+		DependencyHash: computeIssueDependencyHash(h, issue),
 	}
 }
 
 // ComputeIssueDiff compares old and new issue slices and returns an IssueDiff.
 func ComputeIssueDiff(oldIssues, newIssues []model.Issue) IssueDiff {
+	h := newFingerprintWriter()
 	oldFP := make(map[string]IssueFingerprint, len(oldIssues))
+	oldCounts := make(map[string]int, len(oldIssues))
 	for i := range oldIssues {
-		fp := ComputeIssueFingerprint(oldIssues[i])
+		fp := h.fingerprint(oldIssues[i])
 		oldFP[fp.ID] = fp
+		oldCounts[fp.ID]++
 	}
 	newFP := make(map[string]IssueFingerprint, len(newIssues))
+	newCounts := make(map[string]int, len(newIssues))
 	for i := range newIssues {
-		fp := ComputeIssueFingerprint(newIssues[i])
+		fp := h.fingerprint(newIssues[i])
 		newFP[fp.ID] = fp
+		newCounts[fp.ID]++
 	}
 
 	var diff IssueDiff
 	for id, newIssue := range newFP {
+		if newCounts[id] > 1 {
+			diff.HasDuplicateIDs = true
+		}
 		oldIssue, exists := oldFP[id]
 		if !exists {
 			diff.Added = append(diff.Added, id)
+			continue
+		}
+		if oldCounts[id] > 1 || newCounts[id] > 1 {
+			diff.HasDuplicateIDs = true
+			diff.Modified = append(diff.Modified, id)
 			continue
 		}
 		contentChanged := oldIssue.ContentHash != newIssue.ContentHash
@@ -381,6 +287,9 @@ func ComputeIssueDiff(oldIssues, newIssues []model.Issue) IssueDiff {
 	for id := range oldFP {
 		if _, exists := newFP[id]; !exists {
 			diff.Removed = append(diff.Removed, id)
+			if oldCounts[id] > 1 {
+				diff.HasDuplicateIDs = true
+			}
 		}
 	}
 
@@ -393,8 +302,8 @@ func ComputeIssueDiff(oldIssues, newIssues []model.Issue) IssueDiff {
 	return diff
 }
 
-func computeIssueContentHash(issue model.Issue) string {
-	h := sha256.New()
+func computeIssueContentHash(h *fingerprintWriter, issue model.Issue) string {
+	h.reset()
 
 	writeStringHash(h, issue.Title)
 	writeStringHash(h, issue.Description)
@@ -423,14 +332,16 @@ func computeIssueContentHash(issue model.Issue) string {
 	if len(issue.Labels) > 0 {
 		labels := append([]string(nil), issue.Labels...)
 		sort.Strings(labels)
+		writeUintHash(h, uint64(len(labels)))
 		for _, label := range labels {
 			writeStringHash(h, label)
 		}
+	} else {
+		writeUintHash(h, 0)
 	}
-	writeStringHash(h, "")
 
+	comments := make([]*model.Comment, 0, len(issue.Comments))
 	if len(issue.Comments) > 0 {
-		comments := make([]*model.Comment, 0, len(issue.Comments))
 		for _, comment := range issue.Comments {
 			if comment != nil {
 				comments = append(comments, comment)
@@ -451,24 +362,25 @@ func computeIssueContentHash(issue model.Issue) string {
 			}
 			return comments[i].Text < comments[j].Text
 		})
-		for _, comment := range comments {
-			writeStringHash(h, comment.ID)
-			writeStringHash(h, comment.IssueID)
-			writeStringHash(h, comment.Author)
-			writeStringHash(h, comment.Text)
-			writeTimeHash(h, comment.CreatedAt)
-		}
 	}
-	writeStringHash(h, "")
+	writeUintHash(h, uint64(len(comments)))
+	for _, comment := range comments {
+		writeStringHash(h, comment.ID)
+		writeStringHash(h, comment.IssueID)
+		writeStringHash(h, comment.Author)
+		writeStringHash(h, comment.Text)
+		writeTimeHash(h, comment.CreatedAt)
+	}
 
-	return hex.EncodeToString(h.Sum(nil))[:16]
+	return h.sumHex()
 }
 
-func computeIssueDependencyHash(issue model.Issue) string {
+func computeIssueDependencyHash(h *fingerprintWriter, issue model.Issue) string {
 	if len(issue.Dependencies) == 0 {
 		return "none"
 	}
 	type depKey struct {
+		issueID   string
 		dependsOn string
 		depType   string
 		createdAt string
@@ -480,6 +392,7 @@ func computeIssueDependencyHash(issue model.Issue) string {
 			continue
 		}
 		deps = append(deps, depKey{
+			issueID:   dep.IssueID,
 			dependsOn: dep.DependsOnID,
 			depType:   string(dep.Type),
 			createdAt: dep.CreatedAt.UTC().Format(time.RFC3339Nano),
@@ -490,6 +403,9 @@ func computeIssueDependencyHash(issue model.Issue) string {
 		return "none"
 	}
 	sort.Slice(deps, func(i, j int) bool {
+		if deps[i].issueID != deps[j].issueID {
+			return deps[i].issueID < deps[j].issueID
+		}
 		if deps[i].dependsOn != deps[j].dependsOn {
 			return deps[i].dependsOn < deps[j].dependsOn
 		}
@@ -502,64 +418,119 @@ func computeIssueDependencyHash(issue model.Issue) string {
 		return deps[i].createdBy < deps[j].createdBy
 	})
 
-	h := sha256.New()
+	h.reset()
+	writeUintHash(h, uint64(len(deps)))
 	for _, dep := range deps {
+		writeStringHash(h, dep.issueID)
 		writeStringHash(h, dep.dependsOn)
 		writeStringHash(h, dep.depType)
 		writeStringHash(h, dep.createdAt)
 		writeStringHash(h, dep.createdBy)
 	}
-	return hex.EncodeToString(h.Sum(nil))[:16]
+	return h.sumHex()
 }
 
-func writeStringHash(w io.Writer, v string) {
-	if v != "" {
-		_, _ = io.WriteString(w, v)
+// fingerprintWriter streams the canonical encoding through one small buffer.
+// In particular, long descriptions never allocate a temporary []byte, and
+// scalar fields do not each allocate a slice merely to cross io.Writer.
+// This changes only write batching; field bytes and SHA256 remain unchanged.
+type fingerprintWriter struct {
+	hash   hash.Hash
+	buffer [256]byte
+	used   int
+}
+
+func newFingerprintWriter() *fingerprintWriter {
+	return &fingerprintWriter{hash: sha256.New()}
+}
+
+func (w *fingerprintWriter) reset() {
+	w.hash.Reset()
+	w.used = 0
+}
+
+func (w *fingerprintWriter) flush() {
+	if w.used > 0 {
+		_, _ = w.hash.Write(w.buffer[:w.used])
+		w.used = 0
 	}
-	_, _ = w.Write([]byte{0})
 }
 
-func writeStringPtrHash(w io.Writer, v *string) {
+func (w *fingerprintWriter) writeByte(v byte) {
+	if w.used == len(w.buffer) {
+		w.flush()
+	}
+	w.buffer[w.used] = v
+	w.used++
+}
+
+func (w *fingerprintWriter) sumHex() string {
+	w.flush()
+	return hex.EncodeToString(w.hash.Sum(nil))
+}
+
+func writeStringHash(w *fingerprintWriter, v string) {
+	writeUintHash(w, uint64(len(v)))
+	for len(v) > 0 {
+		if w.used == len(w.buffer) {
+			w.flush()
+		}
+		n := copy(w.buffer[w.used:], v)
+		w.used += n
+		v = v[n:]
+	}
+}
+
+func writeStringPtrHash(w *fingerprintWriter, v *string) {
 	if v == nil {
-		_, _ = w.Write([]byte{0})
+		w.writeByte(0)
 		return
 	}
-	_, _ = w.Write([]byte{1})
+	w.writeByte(1)
 	writeStringHash(w, *v)
 }
 
-func writeIntHash(w io.Writer, v int) {
-	_, _ = io.WriteString(w, strconv.Itoa(v))
-	_, _ = w.Write([]byte{0})
+func writeIntHash(w *fingerprintWriter, v int) {
+	writeInt64Hash(w, int64(v))
 }
 
-func writeIntPtrHash(w io.Writer, v *int) {
+func writeIntPtrHash(w *fingerprintWriter, v *int) {
 	if v == nil {
-		_, _ = w.Write([]byte{0})
+		w.writeByte(0)
 		return
 	}
-	_, _ = w.Write([]byte{1})
+	w.writeByte(1)
 	writeIntHash(w, *v)
 }
 
-func writeInt64Hash(w io.Writer, v int64) {
-	_, _ = io.WriteString(w, strconv.FormatInt(v, 10))
-	_, _ = w.Write([]byte{0})
-}
-
-func writeTimeHash(w io.Writer, t time.Time) {
-	if !t.IsZero() {
-		_, _ = io.WriteString(w, t.UTC().Format(time.RFC3339Nano))
+func writeInt64Hash(w *fingerprintWriter, v int64) {
+	if len(w.buffer)-w.used < binary.MaxVarintLen64 {
+		w.flush()
 	}
-	_, _ = w.Write([]byte{0})
+	w.used += binary.PutVarint(w.buffer[w.used:], v)
 }
 
-func writeTimePtrHash(w io.Writer, t *time.Time) {
+func writeUintHash(w *fingerprintWriter, v uint64) {
+	if len(w.buffer)-w.used < binary.MaxVarintLen64 {
+		w.flush()
+	}
+	w.used += binary.PutUvarint(w.buffer[w.used:], v)
+}
+
+func writeTimeHash(w *fingerprintWriter, t time.Time) {
+	formatted := ""
+	if !t.IsZero() {
+		formatted = t.UTC().Format(time.RFC3339Nano)
+	}
+	writeStringHash(w, formatted)
+}
+
+func writeTimePtrHash(w *fingerprintWriter, t *time.Time) {
 	if t == nil {
-		_, _ = w.Write([]byte{0})
+		w.writeByte(0)
 		return
 	}
-	_, _ = w.Write([]byte{1})
+	w.writeByte(1)
 	writeTimeHash(w, *t)
 }
 
@@ -571,7 +542,7 @@ func ComputeConfigHash(config *AnalysisConfig) string {
 	h := sha256.New()
 	// Using %#v is stable enough for configuration struct
 	h.Write([]byte(fmt.Sprintf("%#v", *config)))
-	return hex.EncodeToString(h.Sum(nil))[:16]
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // CachedAnalyzer wraps an Analyzer with caching support.
@@ -610,24 +581,35 @@ func (ca *CachedAnalyzer) SetConfig(config *AnalysisConfig) {
 	ca.configHash = ComputeConfigHash(config)
 }
 
+// cacheDisabled reports whether the analyzer config opts out of caching.
+func (ca *CachedAnalyzer) cacheDisabled() bool {
+	return ca.Analyzer.config != nil && ca.Analyzer.config.DisableCache
+}
+
+// cacheKey is the combined in-memory cache key: dataHash|configHash.
+func (ca *CachedAnalyzer) cacheKey() string {
+	return ca.dataHash + "|" + ca.configHash
+}
+
 // AnalyzeAsync returns cached stats if available, otherwise computes and caches.
 func (ca *CachedAnalyzer) AnalyzeAsync(ctx context.Context) *GraphStats {
-	if ca.Analyzer.config != nil && ca.Analyzer.config.DisableCache {
+	if ca.cacheDisabled() {
 		ca.cacheHit = false
 		return ca.Analyzer.AnalyzeAsync(ctx)
 	}
 
-	// Combined key: dataHash|configHash
-	fullHash := ca.dataHash + "|" + ca.configHash
+	fullHash := ca.cacheKey()
 
 	// Check cache first
 	if stats, ok := ca.cache.GetByHash(fullHash); ok {
 		ca.cacheHit = true
+		metrics.GraphCache.Hit()
 		return stats
 	}
 
 	// Cache miss - compute fresh
 	ca.cacheHit = false
+	metrics.GraphCache.Miss()
 	stats := ca.Analyzer.AnalyzeAsync(ctx)
 
 	// Store in cache when Phase 2 completes
@@ -645,6 +627,14 @@ func (ca *CachedAnalyzer) AnalyzeAsync(ctx context.Context) *GraphStats {
 func (ca *CachedAnalyzer) Analyze() GraphStats {
 	stats := ca.AnalyzeAsync(context.Background())
 	stats.WaitForPhase2()
+	// AnalyzeAsync publishes to the cache from a goroutine once Phase 2 is
+	// done; a synchronous caller must not race it, so a fresh computation is
+	// stored here before returning (SetByHash is idempotent and still refuses
+	// incomplete results). Otherwise a second Analyze started immediately
+	// after this one would recompute instead of hitting the cache.
+	if !ca.cacheHit && !ca.cacheDisabled() {
+		ca.cache.SetByHash(ca.cacheKey(), stats)
+	}
 	return GraphStats{
 		OutDegree:         stats.OutDegree,
 		InDegree:          stats.InDegree,
@@ -720,6 +710,39 @@ type graphStatsCacheBlob struct {
 	Slack             map[string]float64 `json:"slack"`
 	Cycles            [][]string         `json:"cycles"`
 	Status            MetricStatus       `json:"status"`
+	decoded           bool
+}
+
+// UnmarshalJSON is the inverse of statusEntry.MarshalJSON. statusEntry's
+// Elapsed field is intentionally emitted as fractional milliseconds under the
+// wire name "ms"; without a matching decoder every disk-cache hit silently
+// reset all metric timings to zero.
+func (s *statusEntry) UnmarshalJSON(data []byte) error {
+	type statusEntryWire struct {
+		State   string  `json:"state"`
+		Reason  string  `json:"reason,omitempty"`
+		Sample  int     `json:"sample,omitempty"`
+		Elapsed float64 `json:"ms,omitempty"`
+	}
+
+	var wire statusEntryWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	elapsedNanos := wire.Elapsed * float64(time.Millisecond)
+	// float64(1<<63) is exact. Reject that boundary before converting to
+	// time.Duration: the largest int64 itself rounds up to 1<<63 as a float64,
+	// and an out-of-range float-to-int conversion is implementation-dependent.
+	if math.IsNaN(wire.Elapsed) || math.IsInf(wire.Elapsed, 0) || wire.Elapsed < 0 ||
+		elapsedNanos >= float64(1<<63) || math.Round(elapsedNanos) >= float64(1<<63) {
+		return fmt.Errorf("invalid metric elapsed time %gms", wire.Elapsed)
+	}
+
+	s.State = wire.State
+	s.Reason = wire.Reason
+	s.Sample = wire.Sample
+	s.Elapsed = time.Duration(math.Round(elapsedNanos))
+	return nil
 }
 
 // graphStatsCacheSoA is the on-disk (serialized) form of graphStatsCacheBlob.
@@ -755,50 +778,51 @@ type graphStatsCacheSoA struct {
 	NodeCount        int            `json:"node_count"`
 	EdgeCount        int            `json:"edge_count"`
 	Config           AnalysisConfig `json:"config"`
+	RunToCompletion  bool           `json:"run_to_completion,omitempty"`
 	Articulation     []string       `json:"articulation"`
 	Cycles           [][]string     `json:"cycles"`
 	Status           MetricStatus   `json:"status"`
 
 	// Float metrics (positional, aligned to Nodes unless *Idx present).
 	PageRankSet bool      `json:"pr_set,omitempty"`
-	PageRankIdx []int32   `json:"pr_idx,omitempty"`
+	PageRankIdx []int32   `json:"pr_idx"`
 	PageRank    []float64 `json:"pr,omitempty"`
 
 	BetweennessSet bool      `json:"bt_set,omitempty"`
-	BetweennessIdx []int32   `json:"bt_idx,omitempty"`
+	BetweennessIdx []int32   `json:"bt_idx"`
 	Betweenness    []float64 `json:"bt,omitempty"`
 
 	EigenvectorSet bool      `json:"ev_set,omitempty"`
-	EigenvectorIdx []int32   `json:"ev_idx,omitempty"`
+	EigenvectorIdx []int32   `json:"ev_idx"`
 	Eigenvector    []float64 `json:"ev,omitempty"`
 
 	HubsSet bool      `json:"hub_set,omitempty"`
-	HubsIdx []int32   `json:"hub_idx,omitempty"`
+	HubsIdx []int32   `json:"hub_idx"`
 	Hubs    []float64 `json:"hub,omitempty"`
 
 	AuthoritiesSet bool      `json:"auth_set,omitempty"`
-	AuthoritiesIdx []int32   `json:"auth_idx,omitempty"`
+	AuthoritiesIdx []int32   `json:"auth_idx"`
 	Authorities    []float64 `json:"auth,omitempty"`
 
 	CriticalPathScoreSet bool      `json:"cp_set,omitempty"`
-	CriticalPathScoreIdx []int32   `json:"cp_idx,omitempty"`
+	CriticalPathScoreIdx []int32   `json:"cp_idx"`
 	CriticalPathScore    []float64 `json:"cp,omitempty"`
 
 	SlackSet bool      `json:"sl_set,omitempty"`
-	SlackIdx []int32   `json:"sl_idx,omitempty"`
+	SlackIdx []int32   `json:"sl_idx"`
 	Slack    []float64 `json:"sl,omitempty"`
 
 	// Int metrics (positional, aligned to Nodes unless *Idx present).
 	OutDegreeSet bool    `json:"od_set,omitempty"`
-	OutDegreeIdx []int32 `json:"od_idx,omitempty"`
+	OutDegreeIdx []int32 `json:"od_idx"`
 	OutDegree    []int   `json:"od,omitempty"`
 
 	InDegreeSet bool    `json:"id_set,omitempty"`
-	InDegreeIdx []int32 `json:"id_idx,omitempty"`
+	InDegreeIdx []int32 `json:"id_idx"`
 	InDegree    []int   `json:"id,omitempty"`
 
 	CoreNumberSet bool    `json:"kc_set,omitempty"`
-	CoreNumberIdx []int32 `json:"kc_idx,omitempty"`
+	CoreNumberIdx []int32 `json:"kc_idx"`
 	CoreNumber    []int   `json:"kc,omitempty"`
 }
 
@@ -841,6 +865,7 @@ func (b graphStatsCacheBlob) MarshalJSON() ([]byte, error) {
 		NodeCount:        b.NodeCount,
 		EdgeCount:        b.EdgeCount,
 		Config:           b.Config,
+		RunToCompletion:  b.Config.RunToCompletion,
 		Articulation:     b.Articulation,
 		Cycles:           b.Cycles,
 		Status:           b.Status,
@@ -867,12 +892,16 @@ func (b *graphStatsCacheBlob) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &soa); err != nil {
 		return err
 	}
+	if err := soa.validate(); err != nil {
+		return fmt.Errorf("invalid graph stats cache payload: %w", err)
+	}
 
 	b.TopologicalOrder = soa.TopologicalOrder
 	b.Density = soa.Density
 	b.NodeCount = soa.NodeCount
 	b.EdgeCount = soa.EdgeCount
 	b.Config = soa.Config
+	b.Config.RunToCompletion = soa.RunToCompletion
 	b.Articulation = soa.Articulation
 	b.Cycles = soa.Cycles
 	b.Status = soa.Status
@@ -888,7 +917,291 @@ func (b *graphStatsCacheBlob) UnmarshalJSON(data []byte) error {
 	b.OutDegree = expandInt(soa.OutDegreeSet, soa.OutDegreeIdx, soa.OutDegree, soa.Nodes)
 	b.InDegree = expandInt(soa.InDegreeSet, soa.InDegreeIdx, soa.InDegree, soa.Nodes)
 	b.CoreNumber = expandInt(soa.CoreNumberSet, soa.CoreNumberIdx, soa.CoreNumber, soa.Nodes)
+	b.decoded = true
 
+	return nil
+}
+
+func (s graphStatsCacheSoA) validate() error {
+	if s.Version != robotAnalysisDiskCacheVersion {
+		return fmt.Errorf("version %d, want %d", s.Version, robotAnalysisDiskCacheVersion)
+	}
+	if s.NodeCount < 0 || s.EdgeCount < 0 {
+		return fmt.Errorf("negative graph size nodes=%d edges=%d", s.NodeCount, s.EdgeCount)
+	}
+	if len(s.Nodes) != s.NodeCount {
+		return fmt.Errorf("node dictionary length %d does not match node_count %d", len(s.Nodes), s.NodeCount)
+	}
+	// Self-loops add edges without adding ordered node pairs, so a legitimate
+	// writer can produce density above 1 (density = e / (n * (n - 1))). Only
+	// reject values that no writer can produce: negative or non-finite.
+	if math.IsNaN(s.Density) || math.IsInf(s.Density, 0) || s.Density < 0 {
+		return fmt.Errorf("density %g is negative or non-finite", s.Density)
+	}
+	nodeSet := make(map[string]struct{}, len(s.Nodes))
+	for i, node := range s.Nodes {
+		if node == "" {
+			return fmt.Errorf("empty node ID at dictionary index %d", i)
+		}
+		if i > 0 && s.Nodes[i-1] >= node {
+			return fmt.Errorf("node dictionary is not strictly sorted at index %d", i)
+		}
+		nodeSet[node] = struct{}{}
+	}
+
+	columns := []struct {
+		name     string
+		set      bool
+		idx      []int32
+		valueLen int
+	}{
+		{name: "page_rank", set: s.PageRankSet, idx: s.PageRankIdx, valueLen: len(s.PageRank)},
+		{name: "betweenness", set: s.BetweennessSet, idx: s.BetweennessIdx, valueLen: len(s.Betweenness)},
+		{name: "eigenvector", set: s.EigenvectorSet, idx: s.EigenvectorIdx, valueLen: len(s.Eigenvector)},
+		{name: "hubs", set: s.HubsSet, idx: s.HubsIdx, valueLen: len(s.Hubs)},
+		{name: "authorities", set: s.AuthoritiesSet, idx: s.AuthoritiesIdx, valueLen: len(s.Authorities)},
+		{name: "critical_path_score", set: s.CriticalPathScoreSet, idx: s.CriticalPathScoreIdx, valueLen: len(s.CriticalPathScore)},
+		{name: "slack", set: s.SlackSet, idx: s.SlackIdx, valueLen: len(s.Slack)},
+		{name: "out_degree", set: s.OutDegreeSet, idx: s.OutDegreeIdx, valueLen: len(s.OutDegree)},
+		{name: "in_degree", set: s.InDegreeSet, idx: s.InDegreeIdx, valueLen: len(s.InDegree)},
+		{name: "core_number", set: s.CoreNumberSet, idx: s.CoreNumberIdx, valueLen: len(s.CoreNumber)},
+	}
+	for _, column := range columns {
+		if err := validateGraphStatsCacheColumn(column.name, column.set, column.idx, column.valueLen, len(s.Nodes)); err != nil {
+			return err
+		}
+	}
+	// Phase 1 degree maps are initialized densely for every graph, including
+	// the empty graph. They are also the authoritative columns used below to
+	// verify the persisted node/edge counts and density.
+	if !s.OutDegreeSet || s.OutDegreeIdx != nil || !s.InDegreeSet || s.InDegreeIdx != nil {
+		return fmt.Errorf("phase-1 degree columns must both be present and dense")
+	}
+	if err := s.validateGraphShape(); err != nil {
+		return err
+	}
+	if len(s.TopologicalOrder) != 0 && len(s.TopologicalOrder) != s.NodeCount {
+		return fmt.Errorf("topological order length %d is neither zero nor node_count %d", len(s.TopologicalOrder), s.NodeCount)
+	}
+	seenTopo := make(map[string]struct{}, len(s.TopologicalOrder))
+	for _, node := range s.TopologicalOrder {
+		if _, exists := nodeSet[node]; !exists {
+			return fmt.Errorf("topological order references unknown node %q", node)
+		}
+		if _, duplicate := seenTopo[node]; duplicate {
+			return fmt.Errorf("topological order repeats node %q", node)
+		}
+		seenTopo[node] = struct{}{}
+	}
+	seenArticulation := make(map[string]struct{}, len(s.Articulation))
+	for _, node := range s.Articulation {
+		if _, exists := nodeSet[node]; !exists {
+			return fmt.Errorf("articulation list references unknown node %q", node)
+		}
+		if _, duplicate := seenArticulation[node]; duplicate {
+			return fmt.Errorf("articulation list repeats node %q", node)
+		}
+		seenArticulation[node] = struct{}{}
+	}
+	for cycleIndex, cycle := range s.Cycles {
+		if len(cycle) < 2 {
+			return fmt.Errorf("cycle %d has length %d; want a closed path", cycleIndex, len(cycle))
+		}
+		if cycle[0] != cycle[len(cycle)-1] {
+			return fmt.Errorf("cycle %d is not closed", cycleIndex)
+		}
+		seenCycleNode := make(map[string]struct{}, len(cycle)-1)
+		for position, node := range cycle {
+			if _, exists := nodeSet[node]; !exists {
+				return fmt.Errorf("cycle %d references unknown node %q", cycleIndex, node)
+			}
+			if position == len(cycle)-1 {
+				continue
+			}
+			if _, duplicate := seenCycleNode[node]; duplicate {
+				return fmt.Errorf("cycle %d repeats interior node %q", cycleIndex, node)
+			}
+			seenCycleNode[node] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func (s graphStatsCacheSoA) validateGraphShape() error {
+	maxEdges := int64(s.NodeCount) * int64(s.NodeCount)
+	if int64(s.EdgeCount) > maxEdges {
+		return fmt.Errorf("edge_count %d exceeds maximum %d for %d nodes", s.EdgeCount, maxEdges, s.NodeCount)
+	}
+
+	var outSum, inSum int64
+	for i, degree := range s.OutDegree {
+		if degree < 0 || degree > s.NodeCount {
+			return fmt.Errorf("out_degree[%d]=%d is outside [0,%d]", i, degree, s.NodeCount)
+		}
+		outSum += int64(degree)
+	}
+	for i, degree := range s.InDegree {
+		if degree < 0 || degree > s.NodeCount {
+			return fmt.Errorf("in_degree[%d]=%d is outside [0,%d]", i, degree, s.NodeCount)
+		}
+		inSum += int64(degree)
+	}
+	if outSum != int64(s.EdgeCount) || inSum != int64(s.EdgeCount) {
+		return fmt.Errorf("degree sums out=%d in=%d do not both match edge_count %d", outSum, inSum, s.EdgeCount)
+	}
+
+	wantDensity := 0.0
+	if s.NodeCount > 1 {
+		wantDensity = float64(s.EdgeCount) / (float64(s.NodeCount) * float64(s.NodeCount-1))
+	}
+	tolerance := 1e-12 * math.Max(1, math.Abs(wantDensity))
+	if math.IsNaN(s.Density) || math.IsInf(s.Density, 0) || s.Density < 0 || math.Abs(s.Density-wantDensity) > tolerance {
+		return fmt.Errorf("density %g does not match node/edge counts (want %g)", s.Density, wantDensity)
+	}
+	return nil
+}
+
+// validateForCacheHit checks invariants that are specific to completed analyzer
+// output. The generic SoA codec deliberately supports nil metric maps for exact
+// round-trip tests, but the analyzer always installs these six maps before it
+// marks phase 2 ready and writes a disk entry. Omitting any of them must
+// therefore degrade to a miss rather than fabricate a phase2Ready GraphStats.
+func (b graphStatsCacheBlob) validateForCacheHit() error {
+	if !b.decoded {
+		return fmt.Errorf("result payload was not decoded")
+	}
+	requiredMaps := []struct {
+		name    string
+		present bool
+	}{
+		{name: "page_rank", present: b.PageRank != nil},
+		{name: "betweenness", present: b.Betweenness != nil},
+		{name: "eigenvector", present: b.Eigenvector != nil},
+		{name: "hubs", present: b.Hubs != nil},
+		{name: "authorities", present: b.Authorities != nil},
+		{name: "critical_path_score", present: b.CriticalPathScore != nil},
+	}
+	for _, metric := range requiredMaps {
+		if !metric.present {
+			return fmt.Errorf("completed result is missing %s", metric.name)
+		}
+	}
+
+	statuses := []struct {
+		name  string
+		entry statusEntry
+	}{
+		{name: "page_rank", entry: b.Status.PageRank},
+		{name: "betweenness", entry: b.Status.Betweenness},
+		{name: "eigenvector", entry: b.Status.Eigenvector},
+		{name: "hits", entry: b.Status.HITS},
+		{name: "critical", entry: b.Status.Critical},
+		{name: "cycles", entry: b.Status.Cycles},
+		{name: "k_core", entry: b.Status.KCore},
+		{name: "articulation", entry: b.Status.Articulation},
+		{name: "slack", entry: b.Status.Slack},
+	}
+	for _, metric := range statuses {
+		switch metric.entry.State {
+		case "computed", "approx", "skipped":
+		default:
+			return fmt.Errorf("completed result has invalid %s status %q", metric.name, metric.entry.State)
+		}
+		if metric.entry.Sample < 0 || metric.entry.Elapsed < 0 {
+			return fmt.Errorf("completed result has invalid %s status metadata", metric.name)
+		}
+	}
+
+	// PageRank and betweenness are the two claim-critical triage inputs. Bind
+	// their status to the persisted config so a corrupt entry cannot mark a
+	// disabled or incomplete metric "computed" and bypass robot-next's
+	// fail-closed status check.
+	if err := validateConfiguredCacheMetricStatus("page_rank", b.Config.ComputePageRank, b.Status.PageRank); err != nil {
+		return err
+	}
+	if err := validateConfiguredCacheMetricStatus("betweenness", b.Config.ComputeBetweenness, b.Status.Betweenness); err != nil {
+		return err
+	}
+
+	// The producer emits PageRank for every node both on success and on timeout
+	// (the timeout fallback is uniform). A merely non-nil sparse/empty map is
+	// therefore not a completed enabled result. Disabled metric maps are
+	// initialized non-nil but remain empty.
+	if b.Config.ComputePageRank {
+		if len(b.PageRank) != b.NodeCount {
+			return fmt.Errorf("enabled page_rank has %d values, want node_count %d", len(b.PageRank), b.NodeCount)
+		}
+		pageRankSum := 0.0
+		for node, value := range b.PageRank {
+			if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+				return fmt.Errorf("page_rank[%q]=%g is not finite and nonnegative", node, value)
+			}
+			pageRankSum += value
+		}
+		wantSum := 0.0
+		if b.NodeCount > 0 {
+			wantSum = 1
+		}
+		if math.IsNaN(pageRankSum) || math.IsInf(pageRankSum, 0) || math.Abs(pageRankSum-wantSum) > 1e-9 {
+			return fmt.Errorf("page_rank sum %g does not match normalized total %g", pageRankSum, wantSum)
+		}
+	} else if len(b.PageRank) != 0 {
+		return fmt.Errorf("disabled page_rank unexpectedly has %d values", len(b.PageRank))
+	}
+	if !b.Config.ComputeBetweenness && len(b.Betweenness) != 0 {
+		return fmt.Errorf("disabled betweenness unexpectedly has %d values", len(b.Betweenness))
+	}
+	if b.Config.ComputeBetweenness {
+		for node, value := range b.Betweenness {
+			if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+				return fmt.Errorf("betweenness[%q]=%g is not finite and nonnegative", node, value)
+			}
+		}
+	}
+	return nil
+}
+
+func validateConfiguredCacheMetricStatus(name string, enabled bool, entry statusEntry) error {
+	if enabled {
+		switch entry.State {
+		case "computed":
+			return nil
+		default:
+			return fmt.Errorf("enabled %s has status %q", name, entry.State)
+		}
+	}
+	if entry.State != "skipped" {
+		return fmt.Errorf("disabled %s has status %q", name, entry.State)
+	}
+	return nil
+}
+
+func validateGraphStatsCacheColumn(name string, set bool, idx []int32, valueLen, nodeCount int) error {
+	if !set {
+		if idx != nil || valueLen != 0 {
+			return fmt.Errorf("%s has data while its set flag is false", name)
+		}
+		return nil
+	}
+	if idx == nil {
+		if valueLen != nodeCount {
+			return fmt.Errorf("%s dense value length %d does not match node count %d", name, valueLen, nodeCount)
+		}
+		return nil
+	}
+	if len(idx) != valueLen {
+		return fmt.Errorf("%s sparse index/value lengths differ: %d/%d", name, len(idx), valueLen)
+	}
+	previous := int32(-1)
+	for i, nodeIndex := range idx {
+		if nodeIndex < 0 || int(nodeIndex) >= nodeCount {
+			return fmt.Errorf("%s sparse index %d at position %d is outside [0,%d)", name, nodeIndex, i, nodeCount)
+		}
+		if nodeIndex <= previous {
+			return fmt.Errorf("%s sparse indexes are not strictly increasing at position %d", name, i)
+		}
+		previous = nodeIndex
+	}
 	return nil
 }
 
@@ -1039,7 +1352,7 @@ func (b graphStatsCacheBlob) toGraphStats() *GraphStats {
 }
 
 func robotDiskCacheEnabled() bool {
-	return os.Getenv("BV_ROBOT") == "1" && os.Getenv("BV_NO_CACHE") != "1"
+	return env.Robot.Bool() && !env.NoCache.Bool()
 }
 
 // beadsDirModTime returns the most recent modification time of the .beads/
@@ -1050,7 +1363,7 @@ func robotDiskCacheEnabled() bool {
 func beadsDirModTime() time.Time {
 	// Check BEADS_DB first, then BEADS_DIR, then cwd/.beads
 	beadsDir := ""
-	if dbPath := os.Getenv("BEADS_DB"); dbPath != "" {
+	if dbPath := env.BeadsDB.Get(); dbPath != "" {
 		info, err := os.Stat(dbPath)
 		if err == nil {
 			if !info.IsDir() {
@@ -1063,7 +1376,7 @@ func beadsDirModTime() time.Time {
 	}
 
 	if beadsDir == "" {
-		beadsDir = os.Getenv("BEADS_DIR")
+		beadsDir = env.BeadsDir.Get()
 		if beadsDir == "" {
 			cwd, err := os.Getwd()
 			if err != nil {
@@ -1132,7 +1445,7 @@ func beadsTreeModTime(beadsDir string) time.Time {
 // robotAnalysisDiskCacheDir resolves (and optionally creates) the directory
 // holding the per-entry cache files.
 func robotAnalysisDiskCacheDir(create bool) (string, error) {
-	base := os.Getenv("BV_CACHE_DIR")
+	base := env.CacheDir.Get()
 	if base == "" {
 		dir, err := os.UserCacheDir()
 		if err != nil {
@@ -1215,6 +1528,12 @@ func pruneAndEvictRobotDiskCacheDir(dir string, now time.Time) {
 // The xfetchRefresh flag uses probabilistic early refresh to prevent cache stampedes:
 // if true, the caller should consider recomputing in the background while still using the cached result.
 func getRobotDiskCachedStats(fullKey string) (stats *GraphStats, xfetchRefresh bool, cacheHit bool) {
+	return getRobotDiskCachedStatsWithClock(fullKey, time.Now)
+}
+
+// Inject the read-time clock to verify expiry boundaries without sleeps or
+// replacing the real on-disk cache writer, reader and validation path.
+func getRobotDiskCachedStatsWithClock(fullKey string, clock func() time.Time) (stats *GraphStats, xfetchRefresh bool, cacheHit bool) {
 	if !robotDiskCacheEnabled() {
 		return nil, false, false
 	}
@@ -1230,24 +1549,53 @@ func getRobotDiskCachedStats(fullKey string) (stats *GraphStats, xfetchRefresh b
 	// never a torn write. Decoding touches exactly one entry — the whole point
 	// of the v3 layout (issue #192): the v2 single file made every lookup
 	// decode every entry for every repo this user runs bv in.
-	raw, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
+		return nil, false, false
+	}
+	info, statErr := f.Stat()
+	if statErr != nil {
+		_ = f.Close()
+		return nil, false, false
+	}
+	if info.Size() > robotAnalysisDiskCacheMaxEntrySize {
+		_ = f.Close()
+		removeRobotDiskCacheEntryIfSame(path, info)
+		return nil, false, false
+	}
+	raw, readErr := io.ReadAll(io.LimitReader(f, robotAnalysisDiskCacheMaxEntrySize+1))
+	closeErr := f.Close()
+	if readErr != nil || closeErr != nil {
+		return nil, false, false
+	}
+	if len(raw) > robotAnalysisDiskCacheMaxEntrySize {
+		removeRobotDiskCacheEntryIfSame(path, info)
 		return nil, false, false
 	}
 
 	var entry robotAnalysisDiskCacheEntry
-	if err := json.Unmarshal(raw, &entry); err != nil ||
+	decodeErr := json.Unmarshal(raw, &entry)
+	var resultErr error
+	if decodeErr == nil {
+		resultErr = entry.Result.validateForCacheHit()
+	}
+	now := clock().UTC()
+	if decodeErr != nil ||
 		entry.Version != robotAnalysisDiskCacheVersion ||
-		entry.Key != fullKey {
+		entry.Key != fullKey ||
+		entry.DataHash+"|"+entry.ConfigHash != fullKey ||
+		ComputeConfigHash(&entry.Result.Config) != entry.ConfigHash ||
+		entry.CreatedAt.IsZero() || entry.CreatedAt.After(now) ||
+		entry.ComputeDuration < 0 || entry.ComputeDuration > robotAnalysisDiskCacheMaxAge ||
+		resultErr != nil {
 		// Corrupt, foreign, or filename-collision content can never satisfy a
 		// lookup; drop the regenerable file so it stops costing reads.
-		_ = os.Remove(path)
+		removeRobotDiskCacheEntryIfSame(path, info)
 		return nil, false, false
 	}
 
-	now := time.Now()
-	if entry.CreatedAt.IsZero() || now.Sub(entry.CreatedAt) > robotAnalysisDiskCacheMaxAge {
-		_ = os.Remove(path)
+	if now.Sub(entry.CreatedAt) > robotAnalysisDiskCacheMaxAge {
+		removeRobotDiskCacheEntryIfSame(path, info)
 		return nil, false, false
 	}
 
@@ -1257,25 +1605,55 @@ func getRobotDiskCachedStats(fullKey string) (stats *GraphStats, xfetchRefresh b
 	// case the cached GraphStats are stale and must be recomputed.
 	dirMtime := beadsDirModTime()
 	if !dirMtime.IsZero() && dirMtime.After(entry.CreatedAt) {
-		_ = os.Remove(path)
+		removeRobotDiskCacheEntryIfSame(path, info)
 		return nil, false, false
 	}
 
 	// XFetch: probabilistically suggest early refresh to prevent cache stampedes.
 	// Do not refresh again before at least one prior compute-duration window has
-	// elapsed, otherwise newly written entries can get selected immediately.
-	shouldXFetchRefresh := entry.ComputeDuration > 0 &&
+	// elapsed, otherwise newly written entries can get selected immediately. A
+	// reproducible run must never turn the same warm hit into a random recompute.
+	shouldXFetchRefresh := !entry.Result.Config.RunToCompletion &&
+		entry.ComputeDuration > 0 &&
 		!now.Before(entry.CreatedAt.Add(entry.ComputeDuration)) &&
-		xfetch.ShouldRefresh(entry.CreatedAt, entry.ComputeDuration, 1.0, now)
+		xfetch.ShouldRefresh(entry.CreatedAt.Add(robotAnalysisDiskCacheMaxAge), entry.ComputeDuration, 1.0, now)
 
 	return entry.Result.toGraphStats(), shouldXFetchRefresh, true
+}
+
+// removeRobotDiskCacheEntryIfSame reaps only the inode this reader inspected.
+// Cleanup opportunistically takes the same directory lock as writers so the
+// identity check and Remove are one critical section. If a writer is active,
+// cleanup is skipped: deleting a regenerable corrupt entry is never important
+// enough to block the read/miss path behind a slow fsync or prune.
+func removeRobotDiskCacheEntryIfSame(path string, openedInfo os.FileInfo) {
+	if openedInfo == nil {
+		return
+	}
+	lockPath := filepath.Join(filepath.Dir(path), ".lock")
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return
+	}
+	defer lock.Close()
+	locked, err := tryLockFile(lock)
+	if err != nil || !locked {
+		return
+	}
+	defer func() { _ = unlockFile(lock) }()
+
+	currentInfo, err := os.Stat(path)
+	if err != nil || !os.SameFile(openedInfo, currentInfo) {
+		return
+	}
+	_ = os.Remove(path)
 }
 
 func putRobotDiskCachedStats(fullKey, dataHash, configHash string, stats *GraphStats, computeDuration time.Duration) {
 	if !robotDiskCacheEnabled() {
 		return
 	}
-	if stats == nil || !stats.IsPhase2Ready() {
+	if !graphStatsReadyForCache(stats) {
 		return
 	}
 
@@ -1329,17 +1707,18 @@ func putRobotDiskCachedStats(fullKey, dataHash, configHash string, stats *GraphS
 		return
 	}
 
-	// Serialize writers and evictions across processes with a directory-level
-	// lock file; readers stay lock-free (atomic rename gives them a complete
-	// entry either way). This bounds the cost of a store to this one entry —
-	// under v2 every store rewrote and fsynced the entire multi-entry file.
+	// Serialize writers and evictions across processes without waiting for a
+	// busy writer: this regenerable cache must not delay Phase 2 completion or
+	// a robot response. Readers stay lock-free; atomic rename gives them a
+	// complete entry even when another caller skips publication under contention.
 	lockPath := filepath.Join(dir, ".lock")
 	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return
 	}
 	defer lf.Close()
-	if err := lockFile(lf); err != nil {
+	locked, err := tryLockFile(lf)
+	if err != nil || !locked {
 		return
 	}
 	defer func() { _ = unlockFile(lf) }()
@@ -1350,12 +1729,15 @@ func putRobotDiskCachedStats(fullKey, dataHash, configHash string, stats *GraphS
 	}
 	tmpName := tmp.Name()
 	_, werr := tmp.Write(raw)
-	serr := tmp.Sync()
 	cerr := tmp.Close()
-	if werr != nil || serr != nil || cerr != nil {
+	if werr != nil || cerr != nil {
 		_ = os.Remove(tmpName)
 		return
 	}
+	// Cache entries are regenerable, not durable user data. Closing before
+	// rename preserves complete publication to readers without forcing a disk
+	// flush on the robot response path. A lost or corrupt entry after a crash
+	// is rejected by getRobotDiskCachedStats and recomputed from the source.
 	final := filepath.Join(dir, robotAnalysisEntryFileName(fullKey))
 	if err := os.Rename(tmpName, final); err != nil {
 		// Windows cannot rename onto a file another process holds open; retry

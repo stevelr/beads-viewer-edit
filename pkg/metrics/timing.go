@@ -17,9 +17,10 @@
 package metrics
 
 import (
-	"os"
 	"sync/atomic"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
 
 // enabled controls whether metrics are collected.
@@ -28,7 +29,7 @@ import (
 var enabled atomic.Bool
 
 func init() {
-	enabled.Store(os.Getenv("BV_METRICS") != "0")
+	enabled.Store(env.Metrics.Get() != "0")
 }
 
 // Enabled returns whether metrics collection is enabled.
@@ -210,6 +211,11 @@ var (
 	HITSCompute        = newTimingMetric("hits_compute")
 	GraphLoad          = newTimingMetric("graph_load")
 	UIRender           = newTimingMetric("ui_render")
+
+	// Fed by pkg/loader and pkg/analysis on every load and analysis.
+	LoaderParse    = newTimingMetric("loader.parse")
+	AnalysisPhase1 = newTimingMetric("analysis.phase1")
+	AnalysisPhase2 = newTimingMetric("analysis.phase2")
 )
 
 // AllTimingMetrics returns all registered timing metrics.
@@ -226,6 +232,9 @@ func AllTimingMetrics() []*TimingMetric {
 		HITSCompute,
 		GraphLoad,
 		UIRender,
+		LoaderParse,
+		AnalysisPhase1,
+		AnalysisPhase2,
 	}
 }
 

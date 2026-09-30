@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/xfetch"
 	"golang.org/x/sync/singleflight"
 )
@@ -22,11 +23,16 @@ type CacheKey struct {
 	HeadSHA   string // Current git HEAD
 	BeadsHash string // Hash of beads content
 	Options   string // Serialized options
+	Feedback  string // FeedbackStore fingerprint ("" when no store is attached)
 }
 
 // String returns a string representation of the cache key
 func (k CacheKey) String() string {
-	return k.HeadSHA + ":" + k.BeadsHash + ":" + k.Options
+	s := k.HeadSHA + ":" + k.BeadsHash + ":" + k.Options
+	if k.Feedback != "" {
+		s += ":" + k.Feedback
+	}
+	return s
 }
 
 // CacheEntry holds a cached report with metadata
@@ -338,15 +344,19 @@ func hashBeads(beads []BeadInfo) string {
 func hashOptions(opts CorrelatorOptions) string {
 	// Serialize options to JSON for consistent hashing
 	data, err := json.Marshal(struct {
-		BeadID string
-		Since  *time.Time
-		Until  *time.Time
-		Limit  int
+		Revision        string
+		BeadID          string
+		Since           *time.Time
+		Until           *time.Time
+		Limit           int
+		CausalityBeadID string
 	}{
-		BeadID: opts.BeadID,
-		Since:  opts.Since,
-		Until:  opts.Until,
-		Limit:  opts.Limit,
+		Revision:        opts.Revision,
+		BeadID:          opts.BeadID,
+		Since:           opts.Since,
+		Until:           opts.Until,
+		Limit:           opts.Limit,
+		CausalityBeadID: opts.CausalityBeadID,
 	})
 	if err != nil {
 		return "default"
@@ -393,10 +403,30 @@ func NewCachedCorrelatorWithOptions(repoPath string, maxAge time.Duration, maxSi
 	}
 }
 
+// WithFeedbackStore attaches the confirm/reject store to the underlying
+// correlator; the store's fingerprint becomes part of the in-memory cache key
+// so a new decision is never served a stale pre-feedback report.
+func (c *CachedCorrelator) WithFeedbackStore(store *FeedbackStore) *CachedCorrelator {
+	c.correlator.WithFeedbackStore(store)
+	return c
+}
+
+// buildKey is BuildCacheKey plus the feedback fingerprint of the wrapped
+// correlator (reports are assembled against the store, so the store's state
+// is a report input).
+func (c *CachedCorrelator) buildKey(beads []BeadInfo, opts CorrelatorOptions) (CacheKey, error) {
+	key, err := BuildCacheKey(c.cache.repoPath, beads, opts)
+	if err != nil {
+		return CacheKey{}, err
+	}
+	key.Feedback = c.correlator.feedbackFingerprint()
+	return key, nil
+}
+
 // GenerateReport generates a history report, using cache when possible
 func (c *CachedCorrelator) GenerateReport(beads []BeadInfo, opts CorrelatorOptions) (*HistoryReport, error) {
 	// Build cache key
-	key, err := BuildCacheKey(c.cache.repoPath, beads, opts)
+	key, err := c.buildKey(beads, opts)
 	if err != nil {
 		// If we can't build a cache key, fall back to uncached
 		return c.generate(beads, opts)
@@ -412,7 +442,7 @@ func (c *CachedCorrelator) GenerateReport(beads []BeadInfo, opts CorrelatorOptio
 		if c.shouldRefreshFn != nil {
 			shouldRefresh = c.shouldRefreshFn
 		}
-		if computeDuration > 0 && shouldRefresh(createdAt, computeDuration, 1.0, time.Now()) {
+		if computeDuration > 0 && shouldRefresh(createdAt.Add(c.cache.maxAge), computeDuration, 1.0, time.Now()) {
 			refreshBeads, refreshOpts := cloneCorrelatorInputs(beads, opts)
 			// Trigger background refresh (non-blocking)
 			go func() {
@@ -530,19 +560,21 @@ func (c *CachedCorrelator) generate(beads []BeadInfo, opts CorrelatorOptions) (*
 }
 
 func (c *CachedCorrelator) recordHit() {
+	metrics.CorrelationCache.Hit()
 	c.mu.Lock()
 	c.hits++
 	c.mu.Unlock()
 }
 
 func (c *CachedCorrelator) recordMiss() {
+	metrics.CorrelationCache.Miss()
 	c.mu.Lock()
 	c.misses++
 	c.mu.Unlock()
 }
 
 func (c *CachedCorrelator) cacheReportIfCurrent(expectedKey CacheKey, beads []BeadInfo, opts CorrelatorOptions, report *HistoryReport, computeDuration time.Duration) bool {
-	currentKey, err := BuildCacheKey(c.cache.repoPath, beads, opts)
+	currentKey, err := c.buildKey(beads, opts)
 	if err != nil {
 		return false
 	}

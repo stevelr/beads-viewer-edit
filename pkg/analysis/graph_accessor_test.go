@@ -3,6 +3,7 @@ package analysis
 import (
 	"math"
 	"testing"
+	"time"
 )
 
 // createTestGraphStatsForAccessors creates a GraphStats with known test data.
@@ -110,6 +111,87 @@ func TestPageRankAll(t *testing.T) {
 			t.Errorf("expected 0 iterations, got %d", count)
 		}
 	})
+}
+
+func TestGraphStatsIteratorsReleaseLockBeforeCallback(t *testing.T) {
+	tests := []struct {
+		name    string
+		iterate func(*GraphStats, func())
+	}{
+		{
+			name: "pagerank",
+			iterate: func(s *GraphStats, visit func()) {
+				s.PageRankAll(func(string, float64) bool { visit(); return false })
+			},
+		},
+		{
+			name: "betweenness",
+			iterate: func(s *GraphStats, visit func()) {
+				s.BetweennessAll(func(string, float64) bool { visit(); return false })
+			},
+		},
+		{
+			name: "eigenvector",
+			iterate: func(s *GraphStats, visit func()) {
+				s.EigenvectorAll(func(string, float64) bool { visit(); return false })
+			},
+		},
+		{
+			name: "hubs",
+			iterate: func(s *GraphStats, visit func()) {
+				s.HubsAll(func(string, float64) bool { visit(); return false })
+			},
+		},
+		{
+			name: "authorities",
+			iterate: func(s *GraphStats, visit func()) {
+				s.AuthoritiesAll(func(string, float64) bool { visit(); return false })
+			},
+		},
+		{
+			name: "critical_path",
+			iterate: func(s *GraphStats, visit func()) {
+				s.CriticalPathAll(func(string, float64) bool { visit(); return false })
+			},
+		},
+		{
+			name: "core_number",
+			iterate: func(s *GraphStats, visit func()) {
+				s.CoreNumberAll(func(string, int) bool { visit(); return false })
+			},
+		},
+		{
+			name: "slack",
+			iterate: func(s *GraphStats, visit func()) {
+				s.SlackAll(func(string, float64) bool { visit(); return false })
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stats := createTestGraphStatsForAccessors()
+			stats.coreNumber = map[string]int{"issue-1": 2}
+			stats.slack = map[string]float64{"issue-1": 1}
+
+			done := make(chan struct{})
+			go func() {
+				test.iterate(stats, func() {
+					// SAFETY: caller-controlled work must be able to acquire the
+					// write lock; holding RLock across this callback self-deadlocks.
+					stats.mu.Lock()
+					stats.mu.Unlock()
+				})
+				close(done)
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("iterator callback ran while GraphStats lock was held")
+			}
+		})
+	}
 }
 
 // TestPageRank_Isomorphic verifies new accessors return same data as old.
