@@ -1,0 +1,90 @@
+version: 2
+
+project_name: bv
+builds:
+  - main: ./cmd/bv
+    binary: bv
+    # Pure-Go build (modernc sqlite, no cgo): CGO_ENABLED=0 yields fully
+    # static Linux binaries that run on any distro (incl. NixOS) without
+    # patchelf or a matching glibc. Without this, the native linux/amd64
+    # build on the runner links glibc dynamically.
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X github.com/Dicklesworthstone/beads_viewer/pkg/version.version=v{{.Version}}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Os }}_
+      {{- .Arch }}
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: "{{ .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+
+# Homebrew tap publishing
+brews:
+  - name: bv
+    repository:
+      owner: Dicklesworthstone
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: https://github.com/Dicklesworthstone/beads_viewer
+    description: "Graph-aware task management TUI for beads projects"
+    custom_block: |
+      license :cannot_represent
+    skip_upload: true
+    install: |
+      bin.install "bv"
+    test: |
+      system "#{bin}/bv", "--version"
+    caveats: |
+      To get started with bv:
+        1. Initialize beads in your project: br init
+        2. Launch the TUI: bv
+
+      For AI agent integration, use --robot-* flags:
+        bv --robot-triage     # Get prioritized recommendations
+        bv --robot-next       # Get single next action
+
+# Scoop bucket publishing
+scoops:
+  - name: bv
+    repository:
+      owner: Dicklesworthstone
+      name: scoop-bucket
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/Dicklesworthstone/beads_viewer
+    description: "Graph-aware task management TUI for beads projects"
+    license: https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/main/LICENSE
+    skip_upload: true
