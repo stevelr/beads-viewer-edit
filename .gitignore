@@ -41,7 +41,7 @@ test-results/
 # Nested beads state
 pkg/ui/.beads/
 
-# Generated benchmark data, except the frozen release-gate input
+# Generated benchmark data
 tests/testdata/benchmark/*
 !tests/testdata/benchmark/medium.jsonl
 *.prof
@@ -74,9 +74,6 @@ target-*/
 .wrangler/
 # br doctor per-run artifacts
 .doctor/
-
-# Release gate run logs (scripts/release_gate.sh)
-tests/artifacts/release_gate_*.log
 
 # Benchmark run outputs (scripts/benchmark.sh compare rewrites them on every gate run)
 benchmarks/current.txt
