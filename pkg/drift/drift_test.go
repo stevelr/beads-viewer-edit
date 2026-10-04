@@ -2301,10 +2301,11 @@ func TestDrift_NewEmitterSemantics(t *testing.T) {
 					id := fmt.Sprintf("LEAF-%d", i)
 					candidate = append(candidate, model.Issue{ID: id, Status: model.StatusOpen, Priority: 1, UpdatedAt: fresh, Dependencies: []*model.Dependency{blocksOn(id, "HUB")}})
 				}
-				// Pin the probe to the calculator's clock; staleness is age-based.
-				probeAnalyzer := analysis.NewAnalyzer(candidate)
-				probeAnalyzer.SetNow(now)
-				for _, rec := range probeAnalyzer.GenerateRecommendations() {
+				analyzer := analysis.NewAnalyzer(candidate)
+				// Probe with the calculator's clock, so these fresh fixtures
+				// cannot acquire staleness confidence as the calendar advances.
+				analyzer.SetNow(now)
+				for _, rec := range analyzer.GenerateRecommendations() {
 					if rec.IssueID != "HUB" || rec.Direction != "increase" {
 						continue
 					}
